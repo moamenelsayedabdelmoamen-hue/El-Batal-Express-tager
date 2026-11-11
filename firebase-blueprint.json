@@ -1,0 +1,124 @@
+{
+  "entities": {
+    "Merchant": {
+      "title": "Merchant",
+      "description": "Authorized merchant account for restaurant owners in El Batal Express",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Authentication User ID"
+        },
+        "name": {
+          "type": "string",
+          "description": "Merchant business or owner display name"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified Google email of the merchant"
+        },
+        "photoUrl": {
+          "type": "string",
+          "description": "Avatar or Google profile image URL"
+        },
+        "phone": {
+          "type": "string",
+          "description": "Contact telephone number"
+        },
+        "address": {
+          "type": "string",
+          "description": "Merchant physical address"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["approved", "pending", "rejected"],
+          "description": "Administrative approval status"
+        },
+        "isApproved": {
+          "type": "boolean",
+          "description": "True if merchant account is active and approved by administration"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["merchant", "restaurant"],
+          "description": "Role identifier"
+        },
+        "authProvider": {
+          "type": "string",
+          "description": "Authentication provider e.g. google.com"
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of most recent login"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when account was created"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update"
+        }
+      },
+      "required": ["uid", "email"]
+    },
+    "Restaurant": {
+      "title": "Restaurant",
+      "description": "Restaurant profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "address": { "type": "string" },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "ownerId": { "type": "string" }
+      }
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Courier dispatch orders",
+      "type": "object",
+      "properties": {
+        "restaurantId": { "type": "string" },
+        "captainId": { "type": "string" },
+        "status": { "type": "string" },
+        "dispatchStatus": { "type": "string" }
+      }
+    },
+    "Captain": {
+      "title": "Captain",
+      "description": "Delivery captain profile and availability",
+      "type": "object",
+      "properties": {
+        "captainId": { "type": "string" },
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "isOnline": { "type": "boolean" }
+      }
+    }
+  },
+  "firestore": {
+    "/merchants/{merchantId}": {
+      "schema": "Merchant",
+      "description": "Merchant accounts pre-registered and approved by El Batal Express"
+    },
+    "/restaurants/{restaurantId}": {
+      "schema": "Restaurant",
+      "description": "Restaurant store details and location"
+    },
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Orders created by merchants"
+    },
+    "/captains/{captainId}": {
+      "schema": "Captain",
+      "description": "Delivery captains registered in the system"
+    }
+  }
+}

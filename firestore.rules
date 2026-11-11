@@ -1,0 +1,255 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    // Check if user has admin privileges via Custom Claims, email whitelist, or admins collection
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.role == 'admin' ||
+        request.auth.token.admin == true ||
+        request.auth.token.email in ['moamen.elsayed.abdelmoamen@gmail.com', 'admin@elbatalexpress.com'] ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+    
+    // Check if user is the restaurant owner (checks custom claim or auth UID)
+    function isRestaurantOwner(restaurantId) {
+      return isSignedIn() && (
+        (request.auth.token.role == 'restaurant' && request.auth.token.restaurantId == restaurantId) ||
+        request.auth.uid == restaurantId
+      );
+    }
+
+    // Check if user is the merchant owner
+    function isMerchant(merchantId) {
+      return isSignedIn() && (
+        request.auth.uid == merchantId ||
+        (request.auth.token.role == 'merchant' && request.auth.token.merchantId == merchantId) ||
+        isRestaurantOwner(merchantId)
+      );
+    }
+    
+    // Check if user is the captain
+    function isCaptain(captainId) {
+      return isSignedIn() && (
+        (request.auth.token.role == 'captain' && request.auth.token.captainId == captainId) ||
+        request.auth.uid == captainId
+      );
+    }
+
+    // Default deny for unmatched documents
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Admins collection: only admins can read or manage
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Merchants collection:
+    // Only pre-approved merchants or admins can access their own document.
+    // Cross-merchant data access is strictly forbidden.
+    match /merchants/{merchantId} {
+      // Direct document read allowed for Admin or the merchant themselves
+      allow get: if isAdmin() || isMerchant(merchantId);
+
+      // Listing/scraping all merchants is restricted to admins only
+      allow list: if isAdmin();
+
+      // Creation allowed for admin or merchant linking their pre-registered profile
+      allow create: if isAdmin() || (
+        isMerchant(merchantId) &&
+        request.resource.data.uid == request.auth.uid
+      );
+
+      // Updating: Admin has full access. Merchant can update their profile info,
+      // but cannot elevate or modify administrative fields (status, isApproved, role).
+      allow update: if isAdmin() || (
+        isMerchant(merchantId) &&
+        (!('status' in request.resource.data) || request.resource.data.status == resource.data.status) &&
+        (!('isApproved' in request.resource.data) || request.resource.data.isApproved == resource.data.isApproved) &&
+        (!('role' in request.resource.data) || request.resource.data.role == resource.data.role) &&
+        (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid || request.resource.data.uid == request.auth.uid)
+      );
+
+      // Only admins can delete a merchant document
+      allow delete: if isAdmin();
+
+      // Subcollections under merchant (e.g., products, branches)
+      match /{subcollection=**} {
+        allow read, write: if isAdmin() || isMerchant(merchantId);
+      }
+    }
+
+    // Restaurants collection:
+    // Secured specifically for restaurants while granting full access to admins
+    match /restaurants/{restaurantId} {
+      // Direct document read allowed for Admin or the restaurant owner matching restaurantId
+      allow get: if isAdmin() || isRestaurantOwner(restaurantId) || isMerchant(restaurantId);
+      
+      // Listing/scraping all restaurants is restricted to admins only
+      allow list: if isAdmin();
+
+      // Creation allowed for admin or restaurant owner creating their own document
+      allow create: if isAdmin() || (
+        (isRestaurantOwner(restaurantId) || isMerchant(restaurantId)) &&
+        (!('ownerId' in request.resource.data) || request.resource.data.ownerId == request.auth.uid) &&
+        (!('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid)
+      );
+
+      // Updating: Admin has full access. Restaurant owner can update their own profile,
+      // but is strictly forbidden from changing protected administrative & subscription fields.
+      allow update: if isAdmin() || (
+        (isRestaurantOwner(restaurantId) || isMerchant(restaurantId)) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'subscriptionStatus',
+          'subscriptionId',
+          'subscriptionStartDate',
+          'subscriptionEndDate',
+          'rating',
+          'ratingCount',
+          'status'
+        ]) &&
+        (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid || (!('uid' in resource.data) && request.resource.data.uid == request.auth.uid)) &&
+        (!('ownerId' in request.resource.data) || request.resource.data.ownerId == resource.data.ownerId || (!('ownerId' in resource.data) && request.resource.data.ownerId == request.auth.uid)) &&
+        (!('createdAt' in request.resource.data) || request.resource.data.createdAt == resource.data.createdAt || !('createdAt' in resource.data))
+      );
+
+      // Only admins can delete a restaurant document
+      allow delete: if isAdmin();
+      
+      // Subcollections under restaurant (e.g., menu, branches)
+      match /{subcollection=**} {
+        allow read, write: if isAdmin() || isRestaurantOwner(restaurantId) || isMerchant(restaurantId);
+      }
+    }
+
+    // Captains collection
+    // Restaurant/Merchant is strictly forbidden from listing/scraping all captains
+    match /captains/{captainId} {
+      allow get: if isAdmin() || isCaptain(captainId);
+      allow list: if isAdmin();
+      allow create: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+      // Captains can update their availability status, online state, location, and fcmToken.
+      // Captains CANNOT modify their admin approval status or rating.
+      allow update: if isAdmin() || (
+        isCaptain(captainId) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'status',
+          'rating',
+          'ratingCount',
+          'role'
+        ])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Orders collection:
+    // 1. Restaurant/Merchant can NEVER choose or modify captainId.
+    // 2. Initial order creation must have captainId == null, dispatchStatus == 'searching', status == 'pending'.
+    // 3. Selection and assignment are handled atomically by Cloud Functions / backend transactions.
+    match /orders/{orderId} {
+      allow read: if isAdmin() || 
+        (isSignedIn() && (
+          resource.data.restaurantId == request.auth.token.restaurantId ||
+          resource.data.restaurantId == request.auth.uid ||
+          resource.data.merchantId == request.auth.uid ||
+          resource.data.userId == request.auth.uid
+        )) ||
+        (isSignedIn() && (
+          resource.data.captainId == request.auth.token.captainId ||
+          resource.data.captainId == request.auth.uid
+        ));
+      
+      // Restaurant/Merchant creates order with pending status and null captainId
+      allow create: if isAdmin() || (
+        isSignedIn() &&
+        (request.resource.data.restaurantId == request.auth.uid || request.resource.data.merchantId == request.auth.uid || request.resource.data.userId == request.auth.uid) &&
+        request.resource.data.captainId == null &&
+        request.resource.data.dispatchStatus == 'searching' &&
+        request.resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن']
+      );
+
+      // Restaurant/Merchant can update order details or cancel prior to assignment, but CANNOT set captainId or dispatchStatus
+      // Captain can update delivery progress once assigned
+      allow update: if isAdmin() || 
+        (isSignedIn() && (resource.data.restaurantId == request.auth.uid || resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid) &&
+          request.resource.data.captainId == resource.data.captainId &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'dispatchStatus', 'assignedAt'])
+        ) ||
+        (isSignedIn() && (resource.data.captainId == request.auth.uid) &&
+          request.resource.data.captainId == resource.data.captainId
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // Subscriptions collection:
+    // Merchant can read their own subscription document.
+    match /subscriptions/{subscriptionId} {
+      allow read: if isSignedIn();
+      allow create, update: if isAdmin() || (
+        isSignedIn() && (
+          subscriptionId == request.auth.uid ||
+          request.resource.data.merchantId == request.auth.uid ||
+          request.resource.data.restaurantId == request.auth.uid
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Order Codes collection:
+    // Tracks unique 6-digit codes. Allows authenticated merchants to atomically reserve codes during order creation.
+    match /order_codes/{code} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && (
+        request.resource.data.merchantId == request.auth.uid ||
+        isAdmin()
+      );
+      allow update, delete: if isAdmin();
+    }
+
+    // Idempotency keys collection:
+    // Prevents duplicate order creation on network retries.
+    match /idempotency_keys/{keyId} {
+      allow read: if isSignedIn() && (
+        resource == null ||
+        resource.data.merchantId == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.merchantId == request.auth.uid ||
+        isAdmin()
+      );
+      allow update, delete: if isAdmin();
+    }
+
+    // Payments collection
+    match /payments/{paymentId} {
+      allow read: if isAdmin() || 
+        (isSignedIn() && (resource.data.restaurantId == request.auth.token.restaurantId || resource.data.restaurantId == request.auth.uid || resource.data.merchantId == request.auth.uid));
+      allow write: if isAdmin();
+    }
+
+    // Settings collection
+    match /settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Users collection (used for user profile synchronization)
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+    }
+  }
+}
