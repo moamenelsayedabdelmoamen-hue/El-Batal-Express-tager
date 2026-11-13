@@ -49,7 +49,7 @@ service cloud.firestore {
 
     // Admins collection: only admins can read or manage
     match /admins/{adminId} {
-      allow read: if isSignedIn();
+      allow read: if isAdmin();
       allow write: if isAdmin();
     }
 
