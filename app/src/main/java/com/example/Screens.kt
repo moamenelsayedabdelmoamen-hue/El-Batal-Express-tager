@@ -1842,9 +1842,18 @@ fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
                                 android.util.Log.e("PaymentError", "Detailed error creating payment", e)
                                 withContext(Dispatchers.Main) {
                                     isLoading = false
+                                    val serverMessage = (e as? retrofit2.HttpException)
+                                        ?.response()
+                                        ?.errorBody()
+                                        ?.string()
+                                        ?.let { body ->
+                                            runCatching {
+                                                org.json.JSONObject(body).optString("error").takeIf { it.isNotBlank() }
+                                            }.getOrNull()
+                                        }
                                     android.widget.Toast.makeText(
                                         context,
-                                        "خطأ: ${e.message ?: "غير معروف"}",
+                                        serverMessage ?: "تعذر إنشاء عملية الدفع: ${e.localizedMessage ?: "خطأ غير معروف"}",
                                         android.widget.Toast.LENGTH_LONG
                                     ).show()
                                 }
