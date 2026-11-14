@@ -92,7 +92,7 @@ object AutoDispatchManager {
             // Verify restaurant subscription
             val restDoc = firestore.collection("restaurants").document(restaurantId).get().await()
             if (restDoc.exists()) {
-                val subStatus = restDoc.safeString("subscriptionStatus") ?: "active"
+                val subStatus = (restDoc.safeString("subscriptionStatus") ?: "active").trim().lowercase()
                 if (subStatus != "active") {
                     Log.w(TAG, "Restaurant $restaurantId has inactive subscription: $subStatus")
                     orderDocRef.update(
