@@ -1739,9 +1739,9 @@ fun RegistrationSuccessScreen() {
 fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
     val plans = listOf(
         Plan(1, 2, 400, "2 كابتن", "الباقة الأساسية"),
-        Plan(2, 4, 600, "4 كابتن", "الباقة المتوسطة"),
-        Plan(3, 6, 800, "6 كابتن", "الباقة المميزة", true),
-        Plan(4, 8, 1000, "8 كابتن", "الباقة المتقدمة")
+        Plan(2, 4, 800, "4 كابتن", "الباقة المتوسطة"),
+        Plan(3, 6, 1200, "6 كابتن", "الباقة المميزة", true),
+        Plan(4, 8, 1600, "8 كابتن", "الباقة المتقدمة")
     )
     var selectedPlanId by remember { mutableStateOf<Int?>(null) }
     var isLoading by remember { mutableStateOf(false) }
@@ -1801,15 +1801,33 @@ fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
                     if (plan != null) {
                         scope.launch(Dispatchers.IO) {
                             try {
+                                val user = FirebaseAuth.getInstance().currentUser
+                                    ?: throw IllegalStateException("يجب تسجيل الدخول قبل شراء الباقة.")
+                                val email = user.email?.trim().orEmpty()
+                                if (email.isBlank()) {
+                                    throw IllegalStateException("لم يتم العثور على البريد الإلكتروني للحساب.")
+                                }
+                                if (paymentMethod == "wallet" && phoneNumber.trim().isBlank()) {
+                                    throw IllegalStateException("أدخل رقم الهاتف المرتبط بالمحفظة.")
+                                }
+                                val token = user.getIdToken(false).await().token
+                                    ?: throw IllegalStateException("تعذر استخراج رمز التحقق من Firebase.")
+                                val nameParts = user.displayName.orEmpty().trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+                                val firstName = nameParts.firstOrNull() ?: "Merchant"
+                                val lastName = nameParts.drop(1).joinToString(" ").ifBlank { "Owner" }
                                 val request = PaymentRequest(
-                                    amount = plan.price,
-                                    email = "user@email.com",
-                                    first_name = "Moamen",
-                                    last_name = "Test",
-                                    payment_method = paymentMethod,
-                                    phone_number = if (paymentMethod == "wallet") phoneNumber else null
+                                    restaurantId = user.uid,
+                                    captainsCount = plan.captains,
+                                    email = email,
+                                    firstName = firstName,
+                                    lastName = lastName,
+                                    paymentMethod = paymentMethod,
+                                    phoneNumber = if (paymentMethod == "wallet") phoneNumber.trim() else user.phoneNumber
                                 )
-                                val response = RetrofitClient.instance.createPayment(request)
+                                val response = RetrofitClient.instance.createPayment("Bearer $token", request)
+                                if (response.url.isBlank()) {
+                                    throw IllegalStateException("لم يُرجع خادم الدفع رابطًا صالحًا.")
+                                }
                                 withContext(Dispatchers.Main) {
                                     isLoading = false
                                     try {
@@ -1824,9 +1842,18 @@ fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
                                 android.util.Log.e("PaymentError", "Detailed error creating payment", e)
                                 withContext(Dispatchers.Main) {
                                     isLoading = false
+                                    val serverMessage = (e as? retrofit2.HttpException)
+                                        ?.response()
+                                        ?.errorBody()
+                                        ?.string()
+                                        ?.let { body ->
+                                            runCatching {
+                                                org.json.JSONObject(body).optString("error").takeIf { it.isNotBlank() }
+                                            }.getOrNull()
+                                        }
                                     android.widget.Toast.makeText(
                                         context,
-                                        "خطأ: ${e.message ?: "غير معروف"}",
+                                        serverMessage ?: "تعذر إنشاء عملية الدفع: ${e.localizedMessage ?: "خطأ غير معروف"}",
                                         android.widget.Toast.LENGTH_LONG
                                     ).show()
                                 }
