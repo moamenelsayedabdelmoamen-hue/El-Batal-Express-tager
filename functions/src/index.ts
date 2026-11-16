@@ -48,7 +48,7 @@ interface CandidateCaptain {
 
 /**
  * Main auto-dispatch engine function.
- * Given an order ID and data, verifies restaurant subscription, searches for eligible captains,
+ * Given an order ID and data, verifies merchant subscription, searches for eligible captains,
  * sorts by proximity, and attempts an atomic transaction assignment.
  */
 export async function runAutoDispatch(orderId: string, orderData: FirebaseFirestore.DocumentData): Promise<boolean> {
@@ -104,8 +104,8 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
     pickupLat = orderData.pickupLocation.latitude;
     pickupLng = orderData.pickupLocation.longitude;
   } else if (typeof orderData.merchantLatitude === "number" && typeof orderData.merchantLongitude === "number") {
-    pickupLat = orderData.restaurantLatitude;
-    pickupLng = orderData.restaurantLongitude;
+    pickupLat = orderData.merchantLatitude;
+    pickupLng = orderData.merchantLongitude;
   } else if (restData.location && typeof restData.location.latitude === "number") {
     pickupLat = restData.location.latitude;
     pickupLng = restData.location.longitude;
@@ -115,10 +115,10 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   }
 
   if (pickupLat === null || pickupLng === null) {
-    console.warn(`[AutoDispatch] No valid location found for restaurant ${restaurantId}. Order ${orderId} remains in searching.`);
+    console.warn(`[AutoDispatch] No valid location found for merchant ${merchantId}. Order ${orderId} remains in searching.`);
     await db.collection("orders").doc(orderId).update({
       dispatchStatus: "searching",
-      dispatchNote: "في انتظار تحديد إحداثيات المطعم",
+      dispatchNote: "في انتظار تحديد إحداثيات التاجر",
       lastSearchAt: admin.firestore.FieldValue.serverTimestamp()
     });
     return false;
