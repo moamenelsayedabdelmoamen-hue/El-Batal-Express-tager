@@ -441,12 +441,17 @@ object MerchantAuthManager {
         context: Context,
         activity: Activity
     ): MerchantSignInResult {
-        val clientId = try {
-            context.getString(R.string.default_web_client_id)
-        } catch (e: Exception) {
-            Log.e(TAG, "default_web_client_id missing from resources", e)
-            return MerchantSignInResult.Error("إعدادات Google Sign-In غير متوفرة (default_web_client_id)")
+        val clientIdResourceId = context.resources.getIdentifier(
+            "default_web_client_id",
+            "string",
+            context.packageName
+        )
+        if (clientIdResourceId == 0) {
+            Log.e(TAG, "default_web_client_id missing; check app/google-services.json")
+            return MerchantSignInResult.Error("إعدادات Google Sign-In غير مكتملة. يرجى تحديث إعدادات Firebase.")
         }
+        val clientId = context.getString(clientIdResourceId).takeIf { it.isNotBlank() }
+            ?: return MerchantSignInResult.Error("إعدادات Google Sign-In غير مكتملة. يرجى تحديث إعدادات Firebase.")
 
         val credentialManager = CredentialManager.create(context)
         val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = clientId).build()
