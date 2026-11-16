@@ -9,7 +9,13 @@ data class PaymentRequest(
     val last_name: String,
     val payment_method: String,
     val phone_number: String? = null,
-    val captains_count: Int = 2,
+    val captains_count: Int = when (amount) {
+        400, 40000 -> 2
+        800, 80000 -> 4
+        1200, 120000 -> 6
+        1600, 160000 -> 8
+        else -> 0
+    },
     val merchant_id: String? = null
 )
 
