@@ -65,6 +65,15 @@ service cloud.firestore {
         && request.resource.data.accountType == 'merchant'
         && request.resource.data.role == 'merchant'
         && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 150
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 160
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 32
+        && request.resource.data.address is string
+        && request.resource.data.address.size() <= 300
         && request.resource.data.emailVerified == false
         && request.resource.data.status == 'pending'
         && request.resource.data.subscriptionStatus == 'unsubscribed'
@@ -89,6 +98,13 @@ service cloud.firestore {
         && request.resource.data.status == resource.data.status
         && (!('isApproved' in resource.data) || request.resource.data.isApproved == resource.data.isApproved)
         && request.resource.data.email == resource.data.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 150
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 32
+        && request.resource.data.address is string
+        && request.resource.data.address.size() <= 300
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'name', 'phone', 'address', 'category', 'description', 'logo', 'logoUrl',
           'photoUrl', 'imageUrl', 'storagePath', 'location', 'latitude', 'longitude',
