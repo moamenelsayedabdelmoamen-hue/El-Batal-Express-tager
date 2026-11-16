@@ -224,7 +224,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
     if (lastLocUpdate) {
       const updateDate = lastLocUpdate.toDate ? lastLocUpdate.toDate() : new Date(lastLocUpdate);
       const diffMs = nowMs - updateDate.getTime();
-      if (diffMs > maxLocationStaleMs) {
+      if (!Number.isFinite(updateDate.getTime()) || diffMs < -30000 || diffMs > maxLocationStaleMs) {
         console.log(`[AutoDispatch] Captain ${doc.id} skipped due to stale location (${Math.round(diffMs / 1000)}s old).`);
         continue;
       }
