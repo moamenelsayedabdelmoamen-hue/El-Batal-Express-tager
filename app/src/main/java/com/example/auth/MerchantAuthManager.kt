@@ -48,12 +48,7 @@ object MerchantAuthManager {
     private const val ADMIN_ALT_EMAIL = "admin@elbatalexpress.com"
 
     fun getFirestore(context: Context): FirebaseFirestore {
-        return try {
-            val dbId = context.getString(R.string.firestore_database_id)
-            if (dbId.isNotBlank()) FirebaseFirestore.getInstance(dbId) else FirebaseFirestore.getInstance()
-        } catch (_: Exception) {
-            FirebaseFirestore.getInstance()
-        }
+        return FirebaseFirestore.getInstance()
     }
 
     /**
@@ -102,8 +97,46 @@ object MerchantAuthManager {
     }
 
     /**
-     * Verifies merchant pre-registration status.
-     * If not registered, immediately signs out and returns the strict error message.
+     * Strict Email/Password Sign-In for Merchants.
+     * Allows login ONLY if the user is already registered in Firebase Auth AND has a verified/approved
+     * record in the Firestore database (`merchants`, `restaurants`, or `users`).
+     * Never auto-creates accounts or subscriptions on login.
+     */
+    suspend fun signInWithEmailOrProvision(
+        context: Context,
+        rawEmail: String,
+        rawPassword: String
+    ): MerchantSignInResult {
+        val cleanInputEmail = rawEmail.trim().lowercase()
+        if (cleanInputEmail.isEmpty()) {
+            return MerchantSignInResult.Error("يرجى إدخال البريد الإلكتروني")
+        }
+        val cleanInputPassword = rawPassword.trim()
+        if (cleanInputPassword.isEmpty()) {
+            return MerchantSignInResult.Error("يرجى إدخال كلمة المرور")
+        }
+
+        val auth = FirebaseAuth.getInstance()
+
+        val firebaseUser: FirebaseUser = try {
+            val res = kotlinx.coroutines.withTimeout(10000L) {
+                auth.signInWithEmailAndPassword(cleanInputEmail, cleanInputPassword).await()
+            }
+            res.user ?: throw IllegalStateException("تعذر التحقق من بيانات الحساب")
+        } catch (e: Exception) {
+            Log.e(TAG, "Sign-in failed for $cleanInputEmail: ${e.message}", e)
+            return MerchantSignInResult.Error(
+                "لا يمكن تسجيل الدخول: البريد الإلكتروني أو كلمة المرور غير صحيحة، أو أن الحساب غير مسجل"
+            )
+        }
+
+        return verifyAndProvisionMerchant(context, firebaseUser)
+    }
+
+    /**
+     * Strictly verifies that the user is already registered in the Firestore database
+     * (`merchants`, `restaurants`, or `users`) and that their account is verified/approved.
+     * If not registered or not verified, immediately signs out and rejects login.
      */
     suspend fun verifyAndProvisionMerchant(
         context: Context,
@@ -115,9 +148,11 @@ object MerchantAuthManager {
         val displayName = user.displayName.orEmpty()
         val photoUrl = user.photoUrl?.toString().orEmpty()
 
-        val isSystemAdmin = email == ADMIN_WHITELIST_EMAIL.lowercase() || email == ADMIN_ALT_EMAIL.lowercase()
-
         try {
+            try {
+                user.reload().await()
+            } catch (_: Exception) {}
+
             // 1. Check if document exists in 'merchants' by UID
             val merchantDocByUid = try {
                 db.collection("merchants").document(uid).get().await()
@@ -137,7 +172,7 @@ object MerchantAuthManager {
                 }
             } else null
 
-            // 3. Check if document exists in 'restaurants' by UID or email (existing merchant store)
+            // 3. Check if document exists in 'restaurants' by UID or email
             val restaurantDoc = if ((merchantDocByUid == null || !merchantDocByUid.exists()) && (merchantDocByEmail == null || !merchantDocByEmail.exists())) {
                 try {
                     val byUid = db.collection("restaurants").document(uid).get().await()
@@ -151,86 +186,72 @@ object MerchantAuthManager {
                 }
             } else null
 
+            // 4. Check if document exists in 'users' by UID
+            val userDoc = if (merchantDocByUid?.exists() != true && merchantDocByEmail?.exists() != true && restaurantDoc?.exists() != true) {
+                try {
+                    val byUid = db.collection("users").document(uid).get().await()
+                    if (byUid.exists()) byUid else null
+                } catch (e: Exception) {
+                    null
+                }
+            } else null
+
             val existingDoc = merchantDocByUid?.takeIf { it.exists() }
                 ?: merchantDocByEmail?.takeIf { it.exists() }
                 ?: restaurantDoc?.takeIf { it.exists() }
+                ?: userDoc?.takeIf { it.exists() }
 
-            val isPreRegistered = existingDoc != null || isSystemAdmin
-
-            if (!isPreRegistered) {
-                // Requirement 7, 8, 9: Do NOT create a new account. Reject immediately!
-                Log.w(TAG, "Merchant sign in rejected: Account $email (uid: $uid) is not registered as a merchant.")
+            if (existingDoc == null) {
+                Log.w(TAG, "Login rejected: Account $email (uid: $uid) is not registered in Firestore.")
                 signOutMerchant(context)
                 return MerchantSignInResult.NotRegistered(
-                    "هذا الحساب غير مسجل كتاجر في البطل أكسبريس، يرجى التواصل مع الإدارة"
+                    "لا يمكن تسجيل الدخول: هذا الحساب غير مسجل في قاعدة البيانات"
                 )
             }
 
-            // Check if account was explicitly rejected or suspended
-            val status = existingDoc?.getString("status")?.lowercase()
-            val isApprovedField = existingDoc?.getBoolean("isApproved")
-            if (status == "rejected" || status == "suspended" || isApprovedField == false) {
-                Log.w(TAG, "Merchant account is rejected or suspended.")
+            // Verify that the account is confirmed/approved in the database
+            val status = existingDoc.getString("status")?.trim()?.lowercase() ?: ""
+            val isApprovedField = existingDoc.getBoolean("isApproved")
+            val isVerifiedField = existingDoc.getBoolean("isVerified") ?: existingDoc.getBoolean("verified")
+
+            val isExplicitlyBlocked = status in listOf("rejected", "suspended", "pending", "unverified", "inactive", "قيد المراجعة", "مرفوض", "موقوف", "غير مفعل") ||
+                isApprovedField == false ||
+                isVerifiedField == false
+
+            val isConfirmedInDb = (isApprovedField == true) ||
+                (isVerifiedField == true) ||
+                status in listOf("approved", "active", "verified", "معتمد", "مفعل", "نشط")
+
+            if (isExplicitlyBlocked || !isConfirmedInDb) {
+                Log.w(TAG, "Login rejected: Merchant account $email is not verified/approved (status=$status, isApproved=$isApprovedField, isVerified=$isVerifiedField).")
                 signOutMerchant(context)
                 return MerchantSignInResult.NotRegistered(
-                    "حساب التاجر هذا موقوف أو قيد المراجعة، يرجى التواصل مع الإدارة"
+                    "لا يمكن تسجيل الدخول: حسابك غير مؤكد أو لم يتم تفعيله بعد في قاعدة البيانات"
                 )
             }
 
-            // Account is verified! Retrieve existing merchant profile
-            val existingName = existingDoc?.getString("name")?.takeIf { it.isNotBlank() }
-                ?: existingDoc?.getString("restaurantName")?.takeIf { it.isNotBlank() }
-            val existingPhone = existingDoc?.getString("phone")?.takeIf { it.isNotBlank() }.orEmpty()
-            val existingPhoto = existingDoc?.getString("photoUrl")?.takeIf { it.isNotBlank() }
-                ?: existingDoc?.getString("logoUrl")?.takeIf { it.isNotBlank() }.orEmpty()
-            val existingAddress = existingDoc?.getString("address")?.takeIf { it.isNotBlank() }.orEmpty()
+            val existingName = existingDoc.getString("name")?.takeIf { it.isNotBlank() }
+                ?: existingDoc.getString("restaurantName")?.takeIf { it.isNotBlank() }
+            val existingPhone = existingDoc.getString("phone")?.takeIf { it.isNotBlank() }.orEmpty()
+            val existingPhoto = existingDoc.getString("photoUrl")?.takeIf { it.isNotBlank() }
+                ?: existingDoc.getString("logoUrl")?.takeIf { it.isNotBlank() }.orEmpty()
+            val existingAddress = existingDoc.getString("address")?.takeIf { it.isNotBlank() }.orEmpty()
 
-            // CRITICAL: Preserve custom profile data! Only use Google default if merchant hasn't set one yet.
             val finalName = existingName ?: displayName.takeIf { it.isNotBlank() } ?: "تاجر البطل"
             val finalPhoto = if (existingPhoto.isNotBlank()) existingPhoto else photoUrl
             val finalPhone = existingPhone
             val finalAddress = existingAddress
 
-            val merchantPayload = hashMapOf<String, Any>(
-                "uid" to uid,
-                "name" to finalName,
-                "email" to email,
-                "photoUrl" to finalPhoto,
-                "phone" to finalPhone,
-                "address" to finalAddress,
-                "role" to "merchant",
-                "status" to (existingDoc?.getString("status") ?: "approved"),
-                "isApproved" to true,
-                "authProvider" to "google.com",
-                "lastLoginAt" to FieldValue.serverTimestamp(),
-                "updatedAt" to FieldValue.serverTimestamp()
-            )
-
-            // Save in merchants/{uid}
+            // Update lastLoginAt only on existing verified account
             try {
-                db.collection("merchants").document(uid).set(merchantPayload, SetOptions.merge()).await()
-                Log.d(TAG, "Successfully updated merchants/$uid")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error writing to merchants/$uid: ${e.message}")
-            }
-
-            // Also keep restaurants/{uid} synchronized so restaurant orders and dashboard functions continue seamlessly
-            try {
-                val restaurantPayload = hashMapOf<String, Any>(
-                    "uid" to uid,
-                    "ownerId" to uid,
-                    "name" to finalName,
-                    "email" to email,
-                    "phone" to finalPhone,
-                    "photoUrl" to finalPhoto,
-                    "logoUrl" to finalPhoto,
-                    "address" to finalAddress,
-                    "updatedAt" to FieldValue.serverTimestamp()
+                db.collection("merchants").document(uid).set(
+                    mapOf(
+                        "lastLoginAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
                 )
-                db.collection("restaurants").document(uid).set(restaurantPayload, SetOptions.merge()).await()
-            } catch (e: Exception) {
-                Log.w(TAG, "Warning: Syncing restaurants/$uid: ${e.message}")
-            }
+            } catch (_: Exception) {}
 
             val merchantAccount = MerchantAccount(
                 uid = uid,
@@ -239,7 +260,7 @@ object MerchantAuthManager {
                 photoUrl = finalPhoto,
                 phone = finalPhone,
                 address = finalAddress,
-                status = "approved",
+                status = status.ifBlank { "approved" },
                 isApproved = true,
                 role = "merchant"
             )
@@ -249,69 +270,18 @@ object MerchantAuthManager {
         } catch (e: Exception) {
             Log.e(TAG, "Error verifying merchant: ${e.message}", e)
             signOutMerchant(context)
-            return MerchantSignInResult.Error("فشل التحقق من حساب التاجر: ${e.localizedMessage ?: e.message}")
+            return MerchantSignInResult.Error("فشل التحقق من حساب التاجر في قاعدة البيانات: ${e.localizedMessage ?: e.message}")
         }
     }
 
     /**
-     * Restores session if the current Firebase user is an approved merchant.
+     * Restores session ONLY if the current Firebase user exists in the database and is verified/approved.
      */
     suspend fun checkExistingMerchantSession(context: Context): MerchantAccount? {
         val user = Firebase.auth.currentUser ?: return null
-        val db = getFirestore(context)
-        val uid = user.uid
-        val email = user.email.orEmpty().trim().lowercase()
-
-        val isSystemAdmin = email == ADMIN_WHITELIST_EMAIL.lowercase() || email == ADMIN_ALT_EMAIL.lowercase()
-
-        return try {
-            val merchantDoc = db.collection("merchants").document(uid).get().await()
-            if (merchantDoc.exists()) {
-                val status = merchantDoc.getString("status")?.lowercase()
-                val isApproved = merchantDoc.getBoolean("isApproved") != false
-                if (status != "rejected" && isApproved) {
-                    MerchantAccount(
-                        uid = uid,
-                        name = merchantDoc.getString("name") ?: user.displayName.orEmpty(),
-                        email = merchantDoc.getString("email") ?: email,
-                        photoUrl = merchantDoc.getString("photoUrl") ?: user.photoUrl?.toString().orEmpty(),
-                        phone = merchantDoc.getString("phone").orEmpty(),
-                        address = merchantDoc.getString("address").orEmpty(),
-                        status = status ?: "approved",
-                        isApproved = isApproved,
-                        role = "merchant"
-                    )
-                } else null
-            } else if (isSystemAdmin) {
-                MerchantAccount(
-                    uid = uid,
-                    name = user.displayName ?: "مدير النظام",
-                    email = email,
-                    photoUrl = user.photoUrl?.toString().orEmpty(),
-                    status = "approved",
-                    isApproved = true,
-                    role = "admin"
-                )
-            } else {
-                // Check existing restaurants collection for legacy login
-                val resDoc = db.collection("restaurants").document(uid).get().await()
-                if (resDoc.exists()) {
-                    MerchantAccount(
-                        uid = uid,
-                        name = resDoc.getString("name") ?: user.displayName.orEmpty(),
-                        email = resDoc.getString("email") ?: email,
-                        photoUrl = resDoc.getString("photoUrl") ?: resDoc.getString("logoUrl") ?: user.photoUrl?.toString().orEmpty(),
-                        phone = resDoc.getString("phone").orEmpty(),
-                        address = resDoc.getString("address").orEmpty(),
-                        status = "approved",
-                        isApproved = true,
-                        role = "merchant"
-                    )
-                } else null
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error checking merchant session: ${e.message}")
-            null
+        return when (val res = verifyAndProvisionMerchant(context, user)) {
+            is MerchantSignInResult.Success -> res.merchant
+            else -> null
         }
     }
 

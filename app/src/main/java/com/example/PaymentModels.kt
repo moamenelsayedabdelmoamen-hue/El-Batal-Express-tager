@@ -12,7 +12,10 @@ data class PaymentRequest(
 )
 
 data class PaymentResponse(
-    val url: String,
-    val type: String
+    val url: String? = null,
+    val type: String? = null,
+    val status: String? = null,
+    val success: Boolean? = null,
+    val message: String? = null
 )
 

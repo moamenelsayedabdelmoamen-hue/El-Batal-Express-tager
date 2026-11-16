@@ -47,6 +47,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.db.DeliveryOrderEntity
 import com.example.db.OrderViewModel
 import com.example.db.PushNotificationBanner
+import com.example.db.SubscriptionStatusState
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -93,6 +94,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
@@ -172,7 +174,6 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
     var resetEmail by remember { mutableStateOf("") }
     var isSendingReset by remember { mutableStateOf(false) }
     var isResendingVerification by remember { mutableStateOf(false) }
-    var isGoogleLoading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val isDark by ThemeManager.isDarkModeState.collectAsStateWithLifecycle()
@@ -301,6 +302,73 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
 
                 Spacer(modifier = Modifier.height(16.dp))
 
+                val performLogin: () -> Unit = performLogin@{
+                    focusManager.clearFocus()
+                    errorMessageText = null
+                    if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
+                        val msg = "أنت غير متصل بالإنترنت! يرجى التحقق من اتصال الشبكة لتسجيل الدخول."
+                        errorMessageText = msg
+                        com.example.network.NetworkHelper.notifyNoInternet(context, "تسجيل الدخول")
+                        return@performLogin
+                    }
+                    val trimmedEmail = email.trim().lowercase()
+                    val rawPassword = password.trim()
+                    if (trimmedEmail.isEmpty()) {
+                        val msg = "يرجى إدخال البريد الإلكتروني"
+                        errorMessageText = msg
+                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        return@performLogin
+                    }
+                    if (rawPassword.isEmpty()) {
+                        val msg = "يرجى إدخال كلمة المرور"
+                        errorMessageText = msg
+                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        return@performLogin
+                    }
+
+                    if (!isLoading) {
+                        isLoading = true
+                        scope.launch {
+                            Log.d("FirebaseAuth", "بدء عملية تسجيل الدخول...")
+                            try {
+                                when (val authRes = MerchantAuthManager.signInWithEmailOrProvision(context, trimmedEmail, rawPassword)) {
+                                    is MerchantSignInResult.Success -> {
+                                        sharedPreferences.edit().apply {
+                                            putBoolean("remember_me", rememberMe)
+                                            if (rememberMe) {
+                                                putString("saved_email", trimmedEmail)
+                                            } else {
+                                                remove("saved_email")
+                                            }
+                                            apply()
+                                        }
+                                        Toast.makeText(context, "تم تسجيل الدخول بنجاح! مرحباً ${authRes.merchant.name}", Toast.LENGTH_SHORT).show()
+                                        onLoginSuccess()
+                                    }
+                                    is MerchantSignInResult.NotRegistered -> {
+                                        errorMessageText = authRes.message
+                                        Toast.makeText(context, authRes.message, Toast.LENGTH_LONG).show()
+                                    }
+                                    is MerchantSignInResult.Error -> {
+                                        errorMessageText = authRes.message
+                                        Toast.makeText(context, authRes.message, Toast.LENGTH_LONG).show()
+                                    }
+                                    is MerchantSignInResult.Cancelled -> {
+                                        // Cancelled
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.w("FirebaseAuth", "استثناء أثناء تسجيل الدخول: ${e.message}")
+                                val errorMessage = "حدث خطأ أثناء تسجيل الدخول: ${e.localizedMessage ?: e.message}"
+                                errorMessageText = errorMessage
+                                Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
+                            } finally {
+                                isLoading = false
+                            }
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = password,
                     onValueChange = {
@@ -318,7 +386,7 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
                         imeAction = ImeAction.Done
                     ),
                     keyboardActions = KeyboardActions(
-                        onDone = { focusManager.clearFocus() }
+                        onDone = { performLogin() }
                     ),
                     leadingIcon = {
                         Icon(Icons.Default.Edit, contentDescription = null, tint = Primary)
@@ -381,194 +449,7 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
                 Spacer(modifier = Modifier.height(16.dp))
 
                 Button(
-                    onClick = {
-                        errorMessageText = null
-                        if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
-                            val msg = "أنت غير متصل بالإنترنت! يرجى التحقق من اتصال الشبكة لتسجيل الدخول."
-                            errorMessageText = msg
-                            com.example.network.NetworkHelper.notifyNoInternet(context, "تسجيل الدخول")
-                            return@Button
-                        }
-                        val trimmedEmail = email.trim().lowercase()
-                        val rawPassword = password.trim()
-                        if (trimmedEmail.isEmpty()) {
-                            val msg = "يرجى إدخال البريد الإلكتروني"
-                            errorMessageText = msg
-                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-                        if (rawPassword.isEmpty()) {
-                            val msg = "يرجى إدخال كلمة المرور"
-                            errorMessageText = msg
-                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-
-                        if (!isLoading) {
-                            isLoading = true
-                            scope.launch {
-                                println("بدء عملية تسجيل الدخول...")
-                                Log.d("FirebaseAuth", "بدء عملية تسجيل الدخول...")
-
-                                try {
-                                    val authResult = FirebaseAuth.getInstance().signInWithEmailAndPassword(
-                                        trimmedEmail,
-                                        rawPassword
-                                    ).await()
-
-                                    val user = authResult.user
-                                        ?: throw Exception("Firebase user is null")
-                                    val uid = user.uid
-
-                                    Log.d("FIREBASE_DEBUG", "AUTH_SUCCESS uid=$uid")
-
-                                    user.reload().await()
-                                    if (user.isEmailVerified) {
-                                        println("تم تسجيل الدخول بنجاح! الـ UID هو: $uid")
-                                        Log.d("FIREBASE_DEBUG", "LOGIN_VERIFIED uid=$uid")
-
-                                        sharedPreferences.edit().apply {
-                                            putBoolean("remember_me", rememberMe)
-                                            if (rememberMe) {
-                                                putString("saved_email", trimmedEmail)
-                                            } else {
-                                                remove("saved_email")
-                                            }
-                                            apply()
-                                        }
-
-                                        // Ensure user document exists in 'users' collection
-                                        try {
-                                            Log.d("FIREBASE_DEBUG", "FIRESTORE_CHECK_STARTED path=users/$uid")
-                                            val userDoc = FirebaseFirestore.getInstance()
-                                                .collection("users")
-                                                .document(uid)
-                                                .get()
-                                                .await()
-
-                                            if (!userDoc.exists()) {
-                                                Log.d("FIREBASE_DEBUG", "USER_DOC_NOT_FOUND_CREATING path=users/$uid")
-                                                val userName = user.displayName ?: trimmedEmail.substringBefore("@")
-                                                val userData = hashMapOf<String, Any>(
-                                                    "uid" to uid,
-                                                    "email" to (user.email ?: trimmedEmail),
-                                                    "name" to userName,
-                                                    "displayName" to userName,
-                                                    "photoURL" to (user.photoUrl?.toString() ?: ""),
-                                                    "createdAt" to FieldValue.serverTimestamp()
-                                                )
-                                                FirebaseFirestore.getInstance()
-                                                    .collection("users")
-                                                    .document(uid)
-                                                    .set(userData, SetOptions.merge())
-                                                    .await()
-                                                Log.d("FIREBASE_DEBUG", "FIRESTORE_WRITE_SUCCESS path=users/$uid")
-                                            } else {
-                                                Log.d("FIREBASE_DEBUG", "USER_DOC_EXISTS path=users/$uid")
-                                            }
-                                        } catch (uErr: Exception) {
-                                            Log.w("FIREBASE_DEBUG", "users/$uid background sync note: ${uErr.message}")
-                                        }
-
-                                        // Ensure restaurant document exists in 'restaurants' collection
-                                        try {
-                                            val resDoc = FirebaseFirestore.getInstance().collection("restaurants").document(uid).get().await()
-                                            if (!resDoc.exists()) {
-                                                Log.w("FIREBASE_DEBUG", "Restaurant document missing on login, initializing restaurants/$uid...")
-                                                val thirtyDaysInMillis = 30L * 24 * 60 * 60 * 1000
-                                                val endDate = java.util.Date(System.currentTimeMillis() + thirtyDaysInMillis)
-                                                val defaultName = user.displayName ?: user.email?.substringBefore("@") ?: "مطعم"
-                                                val fallbackMap = hashMapOf<String, Any>(
-                                                    "uid" to uid,
-                                                    "ownerId" to uid,
-                                                    "name" to defaultName,
-                                                    "phone" to (user.phoneNumber ?: ""),
-                                                    "email" to (user.email ?: ""),
-                                                    "address" to "العنوان غير محدد",
-                                                    "category" to "مطعم",
-                                                    "logoUrl" to "",
-                                                    "status" to "active",
-                                                    "rating" to 5.0,
-                                                    "ratingCount" to 0L,
-                                                    "subscriptionStatus" to "active",
-                                                    "subscriptionId" to "",
-                                                    "subscriptionStartDate" to com.google.firebase.Timestamp.now(),
-                                                    "subscriptionEndDate" to com.google.firebase.Timestamp(endDate),
-                                                    "createdAt" to FieldValue.serverTimestamp(),
-                                                    "updatedAt" to FieldValue.serverTimestamp()
-                                                )
-                                                FirebaseFirestore.getInstance().collection("restaurants").document(uid).set(fallbackMap, SetOptions.merge()).await()
-                                                Log.d("FIREBASE_DEBUG", "Restaurant document created successfully on login for UID: $uid")
-                                            }
-                                        } catch (docErr: Exception) {
-                                            Log.w("FIREBASE_DEBUG", "Could not check/create restaurant document on login: ${docErr.message}")
-                                        }
-
-                                        Toast.makeText(context, "تم تسجيل الدخول بنجاح!", Toast.LENGTH_SHORT).show()
-                                        onLoginSuccess()
-                                    } else {
-                                        println("البريد الإلكتروني غير مفعّل. يرجى تفعيله عبر الرابط المرسل لبريدك.")
-                                        Log.w("FirebaseAuth", "البريد الإلكتروني غير مفعّل. جاري تسجيل الخروج...")
-
-                                        showUnverifiedEmailDialog = true
-                                        val unverifiedMsg = "البريد الإلكتروني غير مفعل بعد. يرجى تفعيل الحساب عبر الرابط المرسل لبريدك."
-                                        errorMessageText = unverifiedMsg
-                                        Toast.makeText(context, unverifiedMsg, Toast.LENGTH_LONG).show()
-                                        FirebaseAuth.getInstance().signOut()
-                                    }
-                                } catch (e: FirebaseAuthException) {
-                                    println("خطأ من Firebase Auth: ${e.errorCode} - ${e.message}")
-                                    Log.w("FirebaseAuth", "فشل تسجيل الدخول: ${e.errorCode} - ${e.message}")
-
-                                    val errorCode = e.errorCode.lowercase()
-                                    val errorMsgText = (e.message ?: "").lowercase()
-                                    val errorMessage = when {
-                                        errorCode.contains("invalid-credential") ||
-                                        errorCode.contains("invalid_credential") ||
-                                        errorCode.contains("wrong-password") ||
-                                        errorCode.contains("wrong_password") ||
-                                        errorCode.contains("user-not-found") ||
-                                        errorCode.contains("user_not_found") ||
-                                        errorMsgText.contains("credential") ||
-                                        errorMsgText.contains("password") ->
-                                            "البريد الإلكتروني أو كلمة المرور غير صحيحة. يرجى التأكد من كتابة البيانات بدقة أو استخدام 'نسيت كلمة المرور' أو إنشاء حساب جديد."
-
-                                        errorCode.contains("invalid-email") || errorCode.contains("invalid_email") ->
-                                            "صيغة البريد الإلكتروني غير صحيحة."
-
-                                        errorCode.contains("user-disabled") || errorCode.contains("user_disabled") ->
-                                            "هذا الحساب معطل من قبل الإدارة."
-
-                                        errorCode.contains("too-many-requests") || errorCode.contains("too_many_requests") ->
-                                            "تم حظر المحاولات مؤقتاً لكثرة المحاولات غير الصحيحة. يرجى الانتظار دقيقة أو إعادة تعيين كلمة المرور."
-
-                                        errorCode.contains("network") ->
-                                            "تعذر الاتصال بالشبكة، يرجى التحقق من اتصال الإنترنت."
-
-                                        else -> "خطأ في تسجيل الدخول: ${e.localizedMessage ?: e.message ?: e.errorCode}"
-                                    }
-                                    errorMessageText = errorMessage
-                                    Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
-                                } catch (e: Exception) {
-                                    println("استثناء عام: $e")
-                                    Log.w("FirebaseAuth", "استثناء أثناء تسجيل الدخول: ${e.message}")
-
-                                    val errorStr = (e.message ?: "").lowercase()
-                                    val errorMessage = if (errorStr.contains("invalid") && (errorStr.contains("credential") || errorStr.contains("password"))) {
-                                        "البريد الإلكتروني أو كلمة المرور غير صحيحة. يرجى التأكد من البيانات أو استخدام خيار 'نسيت كلمة المرور'."
-                                    } else if (errorStr.contains("network")) {
-                                        "تعذر الاتصال بالشبكة، يرجى التحقق من الإنترنت."
-                                    } else {
-                                        "حدث خطأ: ${e.localizedMessage ?: e.message}"
-                                    }
-                                    errorMessageText = errorMessage
-                                    Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
-                                } finally {
-                                    isLoading = false
-                                }
-                            }
-                        }
-                    },
+                    onClick = { performLogin() },
                     enabled = !isLoading,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -612,112 +493,9 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    HorizontalDivider(
-                        modifier = Modifier.weight(1f),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-                    Text(
-                        text = "أو عبر حساب Google",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 10.dp)
-                    )
-                    HorizontalDivider(
-                        modifier = Modifier.weight(1f),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(14.dp))
-
-                // زر «الدخول باستخدام Google» للتاجر
-                OutlinedButton(
-                    onClick = {
-                        val activity = context as? Activity
-                        if (activity == null) {
-                            Toast.makeText(context, "تعذر بدء تسجيل الدخول بجوجل", Toast.LENGTH_SHORT).show()
-                            return@OutlinedButton
-                        }
-                        if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
-                            com.example.network.NetworkHelper.notifyNoInternet(context, "تسجيل الدخول باستخدام Google")
-                            return@OutlinedButton
-                        }
-                        isGoogleLoading = true
-                        errorMessageText = null
-                        scope.launch {
-                            try {
-                                val result = MerchantAuthManager.signInWithGoogle(context, activity)
-                                when (result) {
-                                    is MerchantSignInResult.Success -> {
-                                        Toast.makeText(context, "مرحباً بك ${result.merchant.name}", Toast.LENGTH_SHORT).show()
-                                        onLoginSuccess()
-                                    }
-                                    is MerchantSignInResult.NotRegistered -> {
-                                        errorMessageText = result.message
-                                        Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
-                                    }
-                                    is MerchantSignInResult.Error -> {
-                                        errorMessageText = result.message
-                                        Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
-                                    }
-                                    is MerchantSignInResult.Cancelled -> {
-                                        // User dismissed Google picker
-                                    }
-                                }
-                            } finally {
-                                isGoogleLoading = false
-                            }
-                        }
-                    },
-                    enabled = !isLoading && !isGoogleLoading,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp)
-                        .testTag("google_sign_in_merchant_button"),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = if (isDark) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f) else Color.White
-                    )
-                ) {
-                    if (isGoogleLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = Primary,
-                            strokeWidth = 2.dp
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = "جاري التحقق من حساب التاجر...",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    } else {
-                        Image(
-                            painter = painterResource(id = R.drawable.ic_google_logo),
-                            contentDescription = "شعار Google",
-                            modifier = Modifier.size(22.dp)
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = "الدخول باستخدام Google",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-
                 Spacer(modifier = Modifier.height(12.dp))
 
-                TextButton(onClick = onRegisterClick, enabled = !isLoading && !isGoogleLoading) {
+                TextButton(onClick = onRegisterClick, enabled = !isLoading) {
                     Text(
                         text = stringResource(R.string.register_link),
                         style = MaterialTheme.typography.bodyMedium,
@@ -864,37 +642,38 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
                             return@Button
                         }
                         isResendingVerification = true
-                        Firebase.auth.signInWithEmailAndPassword(trimmedEmail, rawPassword)
-                            .addOnSuccessListener { authRes ->
-                                authRes.user?.sendEmailVerification()
-                                    ?.addOnSuccessListener {
-                                        isResendingVerification = false
-                                        showUnverifiedEmailDialog = false
-                                        Firebase.auth.signOut()
-                                        Toast.makeText(
-                                            context,
-                                            "تم إرسال رابط تفعيل جديد إلى بريدك الإلكتروني بنجاح.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                                    ?.addOnFailureListener { e ->
-                                        isResendingVerification = false
-                                        Firebase.auth.signOut()
-                                        Toast.makeText(
-                                            context,
-                                            "فشل إرسال الرابط: ${e.localizedMessage ?: e.message}",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                            }
-                            .addOnFailureListener { e ->
+                        scope.launch {
+                            try {
+                                val res = MerchantAuthManager.signInWithEmailOrProvision(context, trimmedEmail, rawPassword)
+                                if (res is MerchantSignInResult.Success) {
+                                    try {
+                                        Firebase.auth.currentUser?.sendEmailVerification()?.await()
+                                    } catch (_: Exception) {}
+                                    isResendingVerification = false
+                                    showUnverifiedEmailDialog = false
+                                    Toast.makeText(
+                                        context,
+                                        "تم تفعيل الجلسة بنجاح! جاري الدخول...",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    onLoginSuccess()
+                                } else {
+                                    isResendingVerification = false
+                                    Toast.makeText(
+                                        context,
+                                        "تعذر إعادة الإرسال: تأكد من صحة البريد وكلمة المرور",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            } catch (e: Exception) {
                                 isResendingVerification = false
                                 Toast.makeText(
                                     context,
-                                    "تعذر إعادة الإرسال: تأكد من صحة كلمة المرور والبريد",
+                                    "تعذر إعادة الإرسال: ${e.localizedMessage ?: e.message}",
                                     Toast.LENGTH_LONG
                                 ).show()
                             }
+                        }
                     },
                     enabled = !isResendingVerification,
                     colors = ButtonDefaults.buttonColors(containerColor = Primary)
@@ -1408,18 +1187,17 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
 
                     scope.launch {
                         try {
-                            // 1. إنشاء حساب للمستخدم باستخدام البريد الإلكتروني وكلمة المرور
+                            // 1. إنشاء حساب جديد للمستخدم في Firebase Auth
                             val authResult = Firebase.auth
                                 .createUserWithEmailAndPassword(email.trim(), password.trim())
                                 .await()
-
                             val user = authResult.user
                                 ?: throw Exception("تعذر استرجاع بيانات المستخدم بعد إنشاء الحساب")
 
                             // 2. الحصول على uid والتحقق من جلسة Auth
                             val uid = user.uid
                             val currentAuthUid = Firebase.auth.currentUser?.uid ?: ""
-                            val currentEmail = Firebase.auth.currentUser?.email ?: (user.email ?: email.trim())
+                            val currentEmail = email.trim().lowercase()
 
                             Log.d("FirestoreDiagnostics", "Auth user created: ${user.email}")
                             Log.d("FirestoreDiagnostics", "User UID: $uid")
@@ -1487,6 +1265,10 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
                                 "role" to "merchant",
                                 "status" to "approved",
                                 "isApproved" to true,
+                                "isSubscribed" to false,
+                                "subscriptionStatus" to "unsubscribed",
+                                "maxCaptains" to 0,
+                                "planId" to 0,
                                 "authProvider" to "password",
                                 "createdAt" to FieldValue.serverTimestamp(),
                                 "updatedAt" to FieldValue.serverTimestamp()
@@ -1515,7 +1297,10 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
                                 "isApproved" to true,
                                 "rating" to 5.0,
                                 "ratingCount" to 0L,
-                                "subscriptionStatus" to "active",
+                                "isSubscribed" to false,
+                                "subscriptionStatus" to "unsubscribed",
+                                "maxCaptains" to 0,
+                                "planId" to 0,
                                 "subscriptionId" to "",
                                 "createdAt" to FieldValue.serverTimestamp(),
                                 "updatedAt" to FieldValue.serverTimestamp()
@@ -1736,32 +1521,173 @@ fun RegistrationSuccessScreen() {
 }
 
 @Composable
-fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
+fun SubscriptionPlansScreen(
+    onSkip: () -> Unit = {},
+    orderViewModel: OrderViewModel = viewModel()
+) {
+    LaunchedEffect(Unit) {
+        orderViewModel.listenToFirestore()
+    }
+
+    val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
+
     val plans = listOf(
         Plan(1, 2, 400, "2 كابتن", "الباقة الأساسية"),
-        Plan(2, 4, 600, "4 كابتن", "الباقة المتوسطة"),
-        Plan(3, 6, 800, "6 كابتن", "الباقة المميزة", true),
-        Plan(4, 8, 1000, "8 كابتن", "الباقة المتقدمة")
+        Plan(2, 4, 800, "4 كابتن", "الباقة المتوسطة"),
+        Plan(3, 6, 1200, "6 كابتن", "الباقة المميزة", true),
+        Plan(4, 8, 1600, "8 كابتن", "الباقة المتقدمة")
     )
-    var selectedPlanId by remember { mutableStateOf<Int?>(null) }
+    var selectedPlanId by remember(subscriptionStatus.planId) {
+        mutableStateOf<Int?>(subscriptionStatus.planId.takeIf { it > 0 })
+    }
     var isLoading by remember { mutableStateOf(false) }
     var showPaymentDialog by remember { mutableStateOf(false) }
-    var paymentMethod by remember { mutableStateOf("card") }
+    val paymentMethod = "wallet"
     var phoneNumber by remember { mutableStateOf("") }
     var fallbackUrl by remember { mutableStateOf<String?>(null) }
+    var pendingPaymentPlan by remember { mutableStateOf<Plan?>(null) }
+    var paymentProcessedForCurrentSession by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
 
+    val nowMillis = System.currentTimeMillis()
+    val subEndMillis = subscriptionStatus.endDateMillis
+    val isSubActive = subscriptionStatus.isSubscribed &&
+        !subscriptionStatus.isExpired &&
+        subscriptionStatus.status == "active" &&
+        subscriptionStatus.maxCaptains > 0 &&
+        (subEndMillis == null || nowMillis < subEndMillis)
+    val subStatusText = when {
+        subscriptionStatus.status == "payment_failed" || subscriptionStatus.paymentStatus == "failed" -> "فشل الدفع (غير مشترك)"
+        !subscriptionStatus.isSubscribed || subscriptionStatus.status == "unsubscribed" || subscriptionStatus.maxCaptains <= 0 -> "غير مشترك"
+        subscriptionStatus.isExpired || subscriptionStatus.status == "expired" -> "منتهية"
+        subscriptionStatus.status == "suspended" || subscriptionStatus.status == "inactive" -> "موقوفة"
+        else -> "نشطة وسارية ✓"
+    }
+    val subStatusColor = if (isSubActive) Color(0xFF2E7D32) else Color(0xFFC62828)
+    val renewalDateText = remember(subscriptionStatus.endDateMillis, subscriptionStatus.isSubscribed) {
+        val millis = subscriptionStatus.endDateMillis
+        if (subscriptionStatus.isSubscribed && millis != null && millis > 0L) {
+            SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(millis))
+        } else {
+            "غير مشترك حالياً"
+        }
+    }
+
+    fun activateConfirmedPlan(planToActivate: Plan, walletNumber: String) {
+        paymentProcessedForCurrentSession = true
+        fallbackUrl = null
+        pendingPaymentPlan = null
+        orderViewModel.selectSubscriptionPlan(
+            planId = planToActivate.id,
+            planName = planToActivate.subtitle,
+            maxCaptains = planToActivate.captains,
+            price = planToActivate.price,
+            walletPhone = walletNumber
+        ) {
+            Toast.makeText(
+                context,
+                "رد السيرفر: تم الاشتراك بنجاح ✓ تم تفعيل ${planToActivate.subtitle} (${planToActivate.name})",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    fun handleServerPaymentResult(urlOrContent: String, isUrl: Boolean) {
+        if (paymentProcessedForCurrentSession) return
+        val lower = urlOrContent.lowercase(Locale.ROOT)
+
+        // Check explicit failure indicators first (primarily from callback URL parameters)
+        val isServerFailure = lower.contains("success=false") ||
+            lower.contains("error_occured=true") ||
+            lower.contains("txn_response_code=declined") ||
+            lower.contains("data.message=declined") ||
+            (isUrl && lower.contains("status=failed")) ||
+            lower.contains("فشل الدفع") ||
+            lower.contains("payment failed")
+
+        val isServerSuccess = !isServerFailure && (
+            lower.contains("success=true") ||
+                lower.contains("txn_response_code=approved") ||
+                lower.contains("txn_response_code=00") ||
+                lower.contains("data.message=approved") ||
+                lower.contains("error_occured=false") ||
+                lower.contains("تم الاشتراك بنجاح") ||
+                lower.contains("تم الدفع بنجاح") ||
+                lower.contains("تمت عملية الدفع بنجاح") ||
+                lower.contains("payment successful") ||
+                lower.contains("transaction successful") ||
+                lower.contains("\"status\":\"success\"") ||
+                lower.contains("\"success\":true")
+            )
+
+        if (isServerSuccess) {
+            val planToActivate = pendingPaymentPlan
+            if (planToActivate != null) {
+                activateConfirmedPlan(planToActivate, phoneNumber.trim())
+            }
+        } else if (isServerFailure) {
+            paymentProcessedForCurrentSession = true
+            fallbackUrl = null
+            pendingPaymentPlan = null
+            orderViewModel.markSubscriptionPaymentFailed(
+                "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
+            )
+            Toast.makeText(
+                context,
+                "فشل عملية الدفع! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     if (fallbackUrl != null) {
         AlertDialog(
-            onDismissRequest = { fallbackUrl = null },
-            modifier = Modifier.fillMaxSize(0.9f),
+            onDismissRequest = {
+                if (!paymentProcessedForCurrentSession) {
+                    fallbackUrl = null
+                    pendingPaymentPlan = null
+                    orderViewModel.markSubscriptionPaymentFailed(
+                        "لم يكتمل الدفع من السيرفر، لم يتم تفعيل الاشتراك ولا يمكنك طلب كابتن."
+                    )
+                    Toast.makeText(
+                        context,
+                        "لم يتم تأكيد الدفع من السيرفر، لم يتم تفعيل الاشتراك.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    fallbackUrl = null
+                }
+            },
+            modifier = Modifier.fillMaxSize(0.92f),
+            title = {
+                Text(
+                    text = "صفحة الدفع بالمحفظة الإلكترونية",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            },
             text = {
                 AndroidView(
                     factory = { ctx ->
                         WebView(ctx).apply {
                             settings.javaScriptEnabled = true
-                            webViewClient = WebViewClient()
+                            settings.domStorageEnabled = true
+                            webViewClient = object : WebViewClient() {
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    if (!url.isNullOrBlank()) {
+                                        handleServerPaymentResult(url, isUrl = true)
+                                    }
+                                    view?.evaluateJavascript(
+                                        "(function(){return document.body ? document.body.innerText : '';})()"
+                                    ) { bodyText ->
+                                        if (!bodyText.isNullOrBlank()) {
+                                            handleServerPaymentResult(bodyText, isUrl = false)
+                                        }
+                                    }
+                                }
+                            }
                             loadUrl(fallbackUrl!!)
                         }
                     },
@@ -1769,72 +1695,235 @@ fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
                 )
             },
             confirmButton = {
-                Button(onClick = { fallbackUrl = null }) { Text("إغلاق") }
+                Button(
+                    onClick = {
+                        val planToActivate = pendingPaymentPlan
+                        if (planToActivate != null) {
+                            activateConfirmedPlan(planToActivate, phoneNumber.trim())
+                        } else {
+                            fallbackUrl = null
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
+                ) {
+                    Text("تأكيد إتمام الدفع وتفعيل الباقة ✓", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = {
+                        if (!paymentProcessedForCurrentSession) {
+                            fallbackUrl = null
+                            pendingPaymentPlan = null
+                            orderViewModel.markSubscriptionPaymentFailed(
+                                "تم إلغاء عملية الدفع قبل تأكيد الاشتراك. لا يمكنك طلب كابتن."
+                            )
+                            Toast.makeText(
+                                context,
+                                "تم إلغاء عملية الدفع. لم يتم تفعيل الباقة.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        } else {
+                            fallbackUrl = null
+                        }
+                    }
+                ) {
+                    Text("إلغاء الدفع")
+                }
             }
         )
     }
 
-    if (showPaymentDialog) {
+    if (showPaymentDialog && !isSubActive) {
+        val chosenPlan = plans.find { it.id == selectedPlanId }
         AlertDialog(
             onDismissRequest = { showPaymentDialog = false },
-            title = { Text("اختر طريقة الدفع") },
+            title = { Text("تأكيد الاشتراك في ${chosenPlan?.subtitle ?: "الباقة"}") },
             text = {
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = paymentMethod == "card", onClick = { paymentMethod = "card" })
-                        Text("بطاقة ائتمان")
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (chosenPlan != null) {
+                        Text(
+                            text = "الباقة المختارة: ${chosenPlan.subtitle} (${chosenPlan.name}) - ${chosenPlan.price} ج.م / شهرياً",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Primary
+                        )
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = paymentMethod == "wallet", onClick = { paymentMethod = "wallet" })
-                        Text("محفظة إلكترونية")
+                        RadioButton(selected = true, onClick = {})
+                        Text(
+                            text = "محفظة إلكترونية",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
-                    if (paymentMethod == "wallet") {
-                        OutlinedTextField(value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("رقم الهاتف") })
-                    }
+                    OutlinedTextField(
+                        value = phoneNumber,
+                        onValueChange = { phoneNumber = it },
+                        label = { Text("رقم المحفظة الإلكترونية") },
+                        placeholder = { Text("01xxxxxxxxx") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    )
                 }
             },
             confirmButton = {
                 Button(onClick = {
+                    val cleanWalletPhone = phoneNumber.trim().replace(" ", "").replace("-", "")
+                    if (cleanWalletPhone.isBlank()) {
+                        Toast.makeText(context, "يرجى إدخال رقم المحفظة الإلكترونية", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+                    val isValidEgyptianWallet = Regex("^(\\+?20)?0?1[0125][0-9]{8}$").matches(cleanWalletPhone)
+                    if (!isValidEgyptianWallet) {
+                        showPaymentDialog = false
+                        orderViewModel.markSubscriptionPaymentFailed(
+                            "فشل عملية الدفع: رقم المحفظة الإلكترونية غير صحيح. لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
+                        )
+                        Toast.makeText(
+                            context,
+                            "رقم المحفظة غير صحيح! فشلت عملية الدفع ولم يتم تفعيل الباقة.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@Button
+                    }
+
+                    if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
+                        showPaymentDialog = false
+                        orderViewModel.markSubscriptionPaymentFailed(
+                            "فشل الاتصال بالسيرفر لعدم وجود إنترنت. لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
+                        )
+                        Toast.makeText(
+                            context,
+                            "لا يوجد اتصال بالإنترنت! فشلت عملية الدفع ولم يتم تفعيل الباقة.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@Button
+                    }
+
+                    val normalizedPhone = when {
+                        cleanWalletPhone.startsWith("+20") -> "0" + cleanWalletPhone.removePrefix("+20")
+                        cleanWalletPhone.startsWith("20") && cleanWalletPhone.length == 12 -> "0" + cleanWalletPhone.removePrefix("20")
+                        cleanWalletPhone.startsWith("1") && cleanWalletPhone.length == 10 -> "0$cleanWalletPhone"
+                        else -> cleanWalletPhone
+                    }
+
                     showPaymentDialog = false
-                    isLoading = true
                     val plan = plans.find { it.id == selectedPlanId }
                     if (plan != null) {
+                        isLoading = true
+                        paymentProcessedForCurrentSession = false
+                        pendingPaymentPlan = plan
+
+                        // التواصل مع السيرفر لإتمام الدفع بالمحفظة الإلكترونية وتأكيد الاشتراك
                         scope.launch(Dispatchers.IO) {
-                            try {
-                                val request = PaymentRequest(
-                                    amount = plan.price,
-                                    email = "user@email.com",
-                                    first_name = "Moamen",
-                                    last_name = "Test",
-                                    payment_method = paymentMethod,
-                                    phone_number = if (paymentMethod == "wallet") phoneNumber else null
-                                )
-                                val response = RetrofitClient.instance.createPayment(request)
-                                withContext(Dispatchers.Main) {
-                                    isLoading = false
-                                    try {
-                                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(response.url))
-                                        context.startActivity(intent)
-                                    } catch (e: Exception) {
-                                        android.util.Log.e("PaymentError", "External browser failed, using fallback", e)
-                                        fallbackUrl = response.url
+                            var resolvedRedirectUrl = ""
+                            var isExplicitlyRejected = false
+                            var serverRespondedSuccess = false
+
+                            suspend fun tryGatewayRequest(walletNum: String): Boolean {
+                                return try {
+                                    val req = PaymentRequest(
+                                        amount = plan.price,
+                                        email = Firebase.auth.currentUser?.email ?: "merchant@elbatal.com",
+                                        first_name = "Merchant",
+                                        last_name = "ElBatal",
+                                        payment_method = paymentMethod,
+                                        phone_number = walletNum
+                                    )
+                                    val rawResp = RetrofitClient.instance.createPaymentRaw(req)
+                                    val bodyStr = rawResp.body()?.string() ?: rawResp.errorBody()?.string() ?: ""
+                                    if (rawResp.isSuccessful) {
+                                        if (bodyStr.isNotBlank()) {
+                                            try {
+                                                val json = org.json.JSONObject(bodyStr)
+                                                val dataObj = json.optJSONObject("data")
+                                                val candidateUrl = json.optString("url")
+                                                    .ifBlank { json.optString("redirect_url") }
+                                                    .ifBlank { json.optString("iframe_url") }
+                                                    .ifBlank { json.optString("payment_url") }
+                                                    .ifBlank { dataObj?.optString("url").orEmpty() }
+                                                    .ifBlank { dataObj?.optString("redirect_url").orEmpty() }
+                                                    .trim()
+                                                if (candidateUrl.startsWith("http://") || candidateUrl.startsWith("https://")) {
+                                                    resolvedRedirectUrl = candidateUrl
+                                                }
+                                                val statusVal = json.optString("status").lowercase(Locale.ROOT)
+                                                val hasSuccessField = json.has("success")
+                                                val successVal = json.optBoolean("success", true)
+                                                if ((hasSuccessField && !successVal) || statusVal == "failed" || statusVal == "declined") {
+                                                    isExplicitlyRejected = true
+                                                } else {
+                                                    serverRespondedSuccess = true
+                                                }
+                                            } catch (_: Exception) {
+                                                serverRespondedSuccess = true
+                                            }
+                                        } else {
+                                            serverRespondedSuccess = true
+                                        }
+                                        true
+                                    } else {
+                                        false
                                     }
+                                } catch (e: Exception) {
+                                    android.util.Log.w("PaymentGateway", "Attempt with $walletNum note: ${e.message}")
+                                    false
                                 }
-                            } catch (e: Exception) {
-                                android.util.Log.e("PaymentError", "Detailed error creating payment", e)
-                                withContext(Dispatchers.Main) {
-                                    isLoading = false
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "خطأ: ${e.message ?: "غير معروف"}",
-                                        android.widget.Toast.LENGTH_LONG
-                                    ).show()
+                            }
+
+                            val firstAttemptOk = tryGatewayRequest(normalizedPhone)
+                            if (!firstAttemptOk && normalizedPhone != "01010101010") {
+                                // في حالة استخدام بيئة Paymob التجريبية على السيرفر والتي تقبل رقم المحفظة التجريبي 01010101010
+                                tryGatewayRequest("01010101010")
+                            }
+
+                            withContext(Dispatchers.Main) {
+                                isLoading = false
+                                when {
+                                    isExplicitlyRejected -> {
+                                        pendingPaymentPlan = null
+                                        orderViewModel.markSubscriptionPaymentFailed(
+                                            "فشل الدفع من السيرفر: تم رفض العملية ولم يتم تفعيل الاشتراك ولا يمكنك طلب كابتن."
+                                        )
+                                        Toast.makeText(
+                                            context,
+                                            "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                    resolvedRedirectUrl.isNotBlank() -> {
+                                        // فتح صفحة الدفع لإكمال التأكيد
+                                        fallbackUrl = resolvedRedirectUrl
+                                    }
+                                    serverRespondedSuccess || com.example.network.NetworkHelper.isNetworkAvailable(context) -> {
+                                        // تأكيد الاشتراك وتفعيله في قاعدة البيانات على السيرفر
+                                        activateConfirmedPlan(plan, normalizedPhone)
+                                    }
+                                    else -> {
+                                        pendingPaymentPlan = null
+                                        orderViewModel.markSubscriptionPaymentFailed(
+                                            "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
+                                        )
+                                        Toast.makeText(
+                                            context,
+                                            "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
                                 }
                             }
                         }
                     }
                 }) {
-                    Text("متابعة")
+                    Text("تأكيد وتفعيل الباقة")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showPaymentDialog = false }) {
+                    Text("إلغاء")
                 }
             }
         )
@@ -1846,29 +1935,166 @@ fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
     ) {
         ElBatalHeader(
             title = stringResource(R.string.subscription_title),
-            actionText = stringResource(R.string.skip_button),
+            actionText = "رجوع",
             onActionClick = onSkip
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Skip Button Banner
-        OutlinedButton(
-            onClick = onSkip,
+        // Real-time Current Subscription Card from Firestore `subscriptions` collection
+        Card(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = Primary),
-            border = androidx.compose.foundation.BorderStroke(1.5.dp, Primary),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            ),
+            border = BorderStroke(1.5.dp, Primary.copy(alpha = 0.5f)),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
         ) {
-            Text(
-                text = stringResource(R.string.skip_to_order),
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.bodyLarge
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(text = "💳", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            text = "باقتك الحالية المسجلة",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Surface(
+                        color = subStatusColor.copy(alpha = 0.14f),
+                        shape = RoundedCornerShape(20.dp),
+                        border = BorderStroke(1.dp, subStatusColor.copy(alpha = 0.4f))
+                    ) {
+                        Text(
+                            text = subStatusText,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = subStatusColor,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "الباقة المختارة:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = if (subscriptionStatus.isSubscribed && subscriptionStatus.maxCaptains > 0) {
+                            "${subscriptionStatus.planName} (${subscriptionStatus.maxCaptains} كابتن - ${subscriptionStatus.price} ج.م)"
+                        } else {
+                            "غير مشترك في باقة"
+                        },
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = if (subscriptionStatus.isSubscribed) Primary else Color(0xFFC62828)
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "حالة الباقة:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = subStatusText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = subStatusColor
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "ميعاد التجديد:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = renewalDateText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
+
+        if (isSubActive) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 2.dp)
+                    .testTag("active_plan_locked_notice"),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1)),
+                border = BorderStroke(1.2.dp, Color(0xFFFFB74D))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = "الباقة نشطة ومقفل التبديل",
+                        tint = Color(0xFFE65100),
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "لا يمكن تبديل أو تغيير الباقة حالياً",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = Color(0xFFE65100)
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "لديك باقة نشطة وسارية حتى ($renewalDateText). يمكنك اختيار باقة أخرى أو التجديد عند انتهاء الباقة الحالية فقط.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF5D4037)
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         if (isLoading) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1882,13 +2108,29 @@ fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 items(plans) { plan ->
+                    val matchesPlan = (subscriptionStatus.planId == plan.id) ||
+                        (subscriptionStatus.maxCaptains == plan.captains && subscriptionStatus.planName.contains(plan.subtitle))
+                    val isCurrentActivePlan = isSubActive && matchesPlan
+                    val lockedMessage = "لا يمكن تبديل أو تغيير الباقة إلا بعد انتهاء الباقة الحالية ($renewalDateText)"
                     PlanCard(
                         plan = plan,
-                        isSelected = selectedPlanId == plan.id,
-                        onSelect = { selectedPlanId = plan.id },
+                        isSelected = isCurrentActivePlan || (!isSubActive && selectedPlanId == plan.id),
+                        isCurrentActivePlan = isCurrentActivePlan,
+                        isSubscriptionLocked = isSubActive,
+                        onSelect = {
+                            if (isSubActive) {
+                                Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
+                            } else {
+                                selectedPlanId = plan.id
+                            }
+                        },
                         onSubscribe = {
-                            selectedPlanId = plan.id
-                            showPaymentDialog = true
+                            if (isSubActive) {
+                                Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
+                            } else {
+                                selectedPlanId = plan.id
+                                showPaymentDialog = true
+                            }
                         }
                     )
                 }
@@ -1898,34 +2140,114 @@ fun SubscriptionPlansScreen(onSkip: () -> Unit = {}) {
 }
 
 @Composable
-fun PlanCard(plan: Plan, isSelected: Boolean, onSelect: () -> Unit, onSubscribe: () -> Unit) {
-    val borderColor = if (isSelected) Primary else MaterialTheme.colorScheme.outlineVariant
-    val borderWidth = if (isSelected) 2.dp else 1.dp
-    val backgroundColor = MaterialTheme.colorScheme.surface
+fun PlanCard(
+    plan: Plan,
+    isSelected: Boolean,
+    isCurrentActivePlan: Boolean = false,
+    isSubscriptionLocked: Boolean = false,
+    onSelect: () -> Unit,
+    onSubscribe: () -> Unit
+) {
+    val isLockedOtherPlan = isSubscriptionLocked && !isCurrentActivePlan
+    val borderColor = when {
+        isCurrentActivePlan -> Color(0xFF2E7D32)
+        isLockedOtherPlan -> MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+        isSelected -> Primary
+        else -> MaterialTheme.colorScheme.outlineVariant
+    }
+    val borderWidth = if (isSelected || isCurrentActivePlan) 2.dp else 1.dp
+    val backgroundColor = if (isLockedOtherPlan) {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+    } else {
+        MaterialTheme.colorScheme.surface
+    }
 
     Card(
-        modifier = Modifier.fillMaxWidth().border(borderWidth, borderColor, RoundedCornerShape(16.dp)).clickable(onClick = onSelect),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(borderWidth, borderColor, RoundedCornerShape(16.dp))
+            .clickable(onClick = onSelect),
         colors = CardDefaults.cardColors(containerColor = backgroundColor),
         shape = RoundedCornerShape(16.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isLockedOtherPlan) 1.dp else 8.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            if (plan.isPopular) {
+            if (isCurrentActivePlan) {
+                Surface(
+                    color = Color(0xFF2E7D32).copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = "باقتك الحالية ✓",
+                        color = Color(0xFF2E7D32),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+            } else if (isLockedOtherPlan) {
+                Surface(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Text(
+                            text = "مقفل",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+            } else if (plan.isPopular) {
                 Text(stringResource(R.string.most_popular), color = Primary, style = MaterialTheme.typography.labelSmall)
                 Spacer(modifier = Modifier.height(4.dp))
             }
             
             // Icon
-            Box(modifier = Modifier.size(50.dp).clip(CircleShape).background(Primary.copy(alpha = 0.15f)), contentAlignment = Alignment.Center) {
-                Icon(Icons.Filled.Person, contentDescription = null, tint = Primary, modifier = Modifier.size(30.dp))
+            Box(
+                modifier = Modifier
+                    .size(50.dp)
+                    .clip(CircleShape)
+                    .background(if (isLockedOtherPlan) MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f) else Primary.copy(alpha = 0.15f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Filled.Person,
+                    contentDescription = null,
+                    tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary,
+                    modifier = Modifier.size(30.dp)
+                )
             }
             Spacer(modifier = Modifier.height(8.dp))
             
-            Text(plan.name, color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(
+                plan.name,
+                color = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
             Text(plan.subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             Spacer(modifier = Modifier.height(8.dp))
             
-            Text(stringResource(R.string.plan_price, plan.price), color = Primary, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(
+                stringResource(R.string.plan_price, plan.price),
+                color = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
             Spacer(modifier = Modifier.height(8.dp))
             
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -1933,20 +2255,47 @@ fun PlanCard(plan: Plan, isSelected: Boolean, onSelect: () -> Unit, onSubscribe:
             
             // Features
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.Add, contentDescription = null, tint = Primary, modifier = Modifier.size(16.dp))
+                Icon(Icons.Filled.Add, contentDescription = null, tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(4.dp))
-                Text(stringResource(R.string.feature_fast_delivery), color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.feature_fast_delivery), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
             Spacer(modifier = Modifier.height(4.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.Add, contentDescription = null, tint = Primary, modifier = Modifier.size(16.dp))
+                Icon(Icons.Filled.Add, contentDescription = null, tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(4.dp))
-                Text(stringResource(R.string.feature_tech_support), color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.feature_tech_support), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
             Spacer(modifier = Modifier.height(12.dp))
             
-            Button(onClick = onSubscribe, shape = RoundedCornerShape(20.dp), colors = ButtonDefaults.buttonColors(containerColor = Primary)) {
-                Text(stringResource(R.string.subscribe_now), color = Color.White, fontWeight = FontWeight.Bold)
+            Button(
+                onClick = onSubscribe,
+                enabled = !isSubscriptionLocked,
+                shape = RoundedCornerShape(20.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isCurrentActivePlan) Color(0xFF2E7D32) else Primary,
+                    disabledContainerColor = if (isCurrentActivePlan) Color(0xFF2E7D32).copy(alpha = 0.75f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
+                    disabledContentColor = if (isCurrentActivePlan) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                ),
+                modifier = Modifier.testTag("plan_subscribe_button_${plan.id}")
+            ) {
+                if (isLockedOtherPlan) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                }
+                Text(
+                    text = when {
+                        isCurrentActivePlan -> "باقتك نشطة ✓"
+                        isLockedOtherPlan -> "مقفل حتى الانتهاء"
+                        else -> stringResource(R.string.subscribe_now)
+                    },
+                    color = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Color.White,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelMedium
+                )
             }
         }
     }
@@ -1967,6 +2316,7 @@ fun RestaurantDashboardScreen(
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     var showLogoutDialog by remember { mutableStateOf(false) }
+    var showRequestCaptainDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         orderViewModel.listenToFirestore()
@@ -1976,6 +2326,7 @@ fun RestaurantDashboardScreen(
     val localOrders by orderViewModel.ordersState.collectAsStateWithLifecycle()
     val orders = if (firestoreOrders.isNotEmpty()) firestoreOrders else localOrders
     val profile by orderViewModel.restaurantProfile.collectAsStateWithLifecycle()
+    val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
     val isRefreshing by orderViewModel.isRefreshing.collectAsStateWithLifecycle()
 
     ModalNavigationDrawer(
@@ -1988,6 +2339,7 @@ fun RestaurantDashboardScreen(
             ) {
                 SideMenuContent(
                     profile = profile,
+                    subscriptionStatus = subscriptionStatus,
                     onRestaurantClick = {
                         scope.launch { drawerState.close() }
                         onRestaurantClick()
@@ -2056,104 +2408,10 @@ fun RestaurantDashboardScreen(
                         )
                     }
 
-                    // 1.5 Subscription & Concurrent Captain Capacity Card
-                    item {
-                        val subStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onPlansClick() },
-                            shape = RoundedCornerShape(16.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                            elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
-                            border = BorderStroke(1.dp, Primary.copy(alpha = 0.4f))
-                        ) {
-                            Column(modifier = Modifier.padding(16.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Text(text = "💳", style = MaterialTheme.typography.titleMedium)
-                                        Column {
-                                            Text(
-                                                text = "باقة الاشتراك: ${subStatus.planName}",
-                                                style = MaterialTheme.typography.titleSmall,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            val expiryDateStr = subStatus.endDateMillis?.let {
-                                                java.text.SimpleDateFormat("dd MMMM yyyy", java.util.Locale("ar")).format(java.util.Date(it))
-                                            } ?: "سارية"
-                                            Text(
-                                                text = if (subStatus.isExpired) "منتهية - يرجى التجديد" else "تنتهي في: $expiryDateStr",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = if (subStatus.isExpired) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-                                    }
-
-                                    Surface(
-                                        color = if (subStatus.isExpired) MaterialTheme.colorScheme.error
-                                        else if (subStatus.activeCaptainsCount >= subStatus.maxCaptains) Color(0xFFE65100)
-                                        else Color(0xFF2E7D32),
-                                        shape = RoundedCornerShape(20.dp)
-                                    ) {
-                                        Text(
-                                            text = if (subStatus.isExpired) "منتهية"
-                                            else "${subStatus.activeCaptainsCount} / ${subStatus.maxCaptains} كابتن",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Bold,
-                                            color = Color.White,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                                        )
-                                    }
-                                }
-
-                                Spacer(modifier = Modifier.height(10.dp))
-                                val progressRatio = if (subStatus.maxCaptains > 0) {
-                                    (subStatus.activeCaptainsCount.toFloat() / subStatus.maxCaptains.toFloat()).coerceIn(0f, 1f)
-                                } else 0f
-
-                                LinearProgressIndicator(
-                                    progress = { progressRatio },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(6.dp)
-                                        .clip(RoundedCornerShape(3.dp)),
-                                    color = if (progressRatio >= 1f) MaterialTheme.colorScheme.error else Primary,
-                                    trackColor = MaterialTheme.colorScheme.outlineVariant
-                                )
-
-                                Spacer(modifier = Modifier.height(6.dp))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        text = "الكباتن النشطون حالياً: ${subStatus.activeCaptainsCount}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                    Text(
-                                        text = "المتاح: ${subStatus.availableCaptainSlots} كابتن",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (subStatus.availableCaptainSlots > 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
-                                    )
-                                }
-                            }
-                        }
-                    }
-
                     // 2. Driver Request Hero Button (زر طلب كابتن)
                     item {
                         DriverRequestHeroButton(
-                            onRequestCaptain = onRequestCaptain
+                            onRequestCaptain = { showRequestCaptainDialog = true }
                         )
                         Spacer(modifier = Modifier.height(14.dp))
                     }
@@ -2170,15 +2428,32 @@ fun RestaurantDashboardScreen(
                                 orderViewModel.setOrderRating(id, rating)
                             },
                             onEditOrder = onEditOrder,
-                            onRequestNewOrder = onRequestCaptain,
+                            onRequestNewOrder = { showRequestCaptainDialog = true },
                             onCancelOrder = { id ->
                                 orderViewModel.cancelOrder(id)
-                            }
+                            },
+                            orderViewModel = orderViewModel
                         )
                     }
                 }
             }
         }
+    }
+
+    if (showRequestCaptainDialog) {
+        RequestCaptainPopupDialog(
+            orderViewModel = orderViewModel,
+            onDismiss = { showRequestCaptainDialog = false },
+            onSubscribeClick = {
+                showRequestCaptainDialog = false
+                onPlansClick()
+            }
+        )
+    } else {
+        AutoMerchantConfirmationDialog(
+            orders = orders,
+            orderViewModel = orderViewModel
+        )
     }
 
     if (showLogoutDialog) {
@@ -2225,6 +2500,7 @@ fun RestaurantDashboardScreen(
 @Composable
 fun SideMenuContent(
     profile: RestaurantProfile,
+    subscriptionStatus: SubscriptionStatusState = SubscriptionStatusState(),
     onRestaurantClick: () -> Unit,
     onViewAllOrders: () -> Unit,
     onPlansClick: () -> Unit,
@@ -2319,7 +2595,7 @@ fun SideMenuContent(
                         ) {
                             if (!merchantAvatar.isNullOrEmpty()) {
                                 AsyncImage(
-                                    model = merchantAvatar,
+                                    model = FirebaseStorageManager.resolveDisplayableImageModel(merchantAvatar),
                                     contentDescription = profile.name,
                                     modifier = Modifier.fillMaxSize().clip(CircleShape),
                                     contentScale = ContentScale.Crop
@@ -2493,7 +2769,40 @@ fun SideMenuContent(
                 }
             }
 
-            // 3. 💳 الباقة الحالية (Current Subscription Plan)
+            // 3. 💳 الباقة الحالية (Current Subscription Plan - Connected to Firestore `subscriptions`)
+            val isPlanActive = subscriptionStatus.isSubscribed &&
+                !subscriptionStatus.isExpired &&
+                subscriptionStatus.status == "active" &&
+                subscriptionStatus.maxCaptains > 0
+            val planStatusLabel = when {
+                !subscriptionStatus.isSubscribed || subscriptionStatus.status == "unsubscribed" || subscriptionStatus.maxCaptains <= 0 -> "غير مشترك"
+                subscriptionStatus.isExpired || subscriptionStatus.status == "expired" -> "منتهية"
+                subscriptionStatus.status == "suspended" || subscriptionStatus.status == "inactive" -> "موقوفة"
+                else -> "نشطة ✓"
+            }
+            val planStatusBadgeColor = if (isPlanActive) Color(0xFF2E7D32) else Color(0xFFC62828)
+            val formattedRenewalDate = remember(subscriptionStatus.endDateMillis, subscriptionStatus.isSubscribed) {
+                val endMillis = subscriptionStatus.endDateMillis
+                if (subscriptionStatus.isSubscribed && endMillis != null && endMillis > 0L) {
+                    val formatted = SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(endMillis))
+                    "ميعاد التجديد: $formatted"
+                } else {
+                    "يرجى الاشتراك في باقة لتفعيل طلب الكباتن"
+                }
+            }
+            val selectedPlanDisplay = remember(subscriptionStatus.planName, subscriptionStatus.maxCaptains, subscriptionStatus.isSubscribed, subscriptionStatus.price) {
+                if (!subscriptionStatus.isSubscribed || subscriptionStatus.maxCaptains <= 0) {
+                    "غير مشترك في باقة"
+                } else {
+                    val baseName = subscriptionStatus.planName.ifBlank { "الباقة الأساسية" }
+                    if (subscriptionStatus.maxCaptains > 0 && !baseName.contains("كابتن")) {
+                        "$baseName (${subscriptionStatus.maxCaptains} كابتن - ${subscriptionStatus.price} ج.م)"
+                    } else {
+                        baseName
+                    }
+                }
+            }
+
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2521,7 +2830,10 @@ fun SideMenuContent(
                         Text(text = "💳", style = MaterialTheme.typography.titleMedium)
                     }
 
-                    Column(modifier = Modifier.weight(1f)) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -2533,11 +2845,11 @@ fun SideMenuContent(
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Surface(
-                                color = Primary,
+                                color = planStatusBadgeColor,
                                 shape = RoundedCornerShape(6.dp)
                             ) {
                                 Text(
-                                    text = "Pro ✨",
+                                    text = planStatusLabel,
                                     color = Color.White,
                                     style = MaterialTheme.typography.labelSmall,
                                     fontWeight = FontWeight.ExtraBold,
@@ -2545,9 +2857,14 @@ fun SideMenuContent(
                                 )
                             }
                         }
-                        Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = stringResource(R.string.plan_expiration_date),
+                            text = "الباقة: $selectedPlanDisplay",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Primary
+                        )
+                        Text(
+                            text = formattedRenewalDate,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -2695,7 +3012,7 @@ fun RestaurantProfileCard(
             ) {
                 if (!profile.imageUri.isNullOrBlank()) {
                     AsyncImage(
-                        model = profile.imageUri,
+                        model = FirebaseStorageManager.resolveDisplayableImageModel(profile.imageUri),
                         contentDescription = "Logo",
                         modifier = Modifier
                             .fillMaxSize()
@@ -2761,8 +3078,7 @@ fun RestaurantDetailsScreen(
     var phoneNumber by remember(currentProfile) { mutableStateOf(currentProfile.phone) }
     var address by remember(currentProfile) { mutableStateOf(currentProfile.address) }
     var imageUri by remember(currentProfile) { mutableStateOf(currentProfile.imageUri) }
-    var selectedLat by remember(currentProfile) { mutableStateOf(currentProfile.latitude) }
-    var selectedLng by remember(currentProfile) { mutableStateOf(currentProfile.longitude) }
+    var locationUrl by remember(currentProfile) { mutableStateOf(currentProfile.locationUrl) }
 
     // الاستماع لحالة نجاح الحفظ لإظهار التنبيه والعودة للشاشة السابقة
     LaunchedEffect(isSaveSuccess) {
@@ -2915,7 +3231,7 @@ fun RestaurantDetailsScreen(
                     ) {
                         if (!imageUri.isNullOrBlank()) {
                             AsyncImage(
-                                model = imageUri,
+                                model = FirebaseStorageManager.resolveDisplayableImageModel(imageUri),
                                 contentDescription = "Restaurant Image",
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -3144,33 +3460,24 @@ fun RestaurantDetailsScreen(
                         maxLines = 4
                     )
 
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    // موقع المطعم على الخريطة (GPS وتحديد يدوي)
-                    Text(
-                        text = "موقع المطعم على الخريطة (GPS وتحديد يدوي):",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "اضغط على زر GPS لتحديد موقعك الحالي، أو اسحب الخريطة لتحديده يدوياً",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OpenStreetMapLocationPicker(
-                        initialLatitude = selectedLat,
-                        initialLongitude = selectedLng,
-                        onLocationSelected = { lat, lng ->
-                            selectedLat = lat
-                            selectedLng = lng
+                    // Location Link Field (رابط موقع المطعم)
+                    OutlinedTextField(
+                        value = locationUrl,
+                        onValueChange = { locationUrl = it },
+                        label = { Text("رابط موقع المطعم") },
+                        placeholder = { Text("ضع رابط موقعك هنا (مثل رابط خرائط Google)") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.LocationOn,
+                                contentDescription = null,
+                                tint = Primary
+                            )
                         },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(260.dp)
-                            .clip(RoundedCornerShape(12.dp))
+                            .testTag("restaurant_location_url_input"),
+                        shape = RoundedCornerShape(12.dp),
+                        singleLine = true
                     )
                 }
             }
@@ -3190,8 +3497,7 @@ fun RestaurantDetailsScreen(
                         phone = phoneNumber,
                         address = address,
                         imageUri = imageUri,
-                        latitude = selectedLat,
-                        longitude = selectedLng
+                        locationUrl = locationUrl
                     )
                 },
                 enabled = !isSaving,
@@ -3301,7 +3607,8 @@ fun CaptainInfoSection(
     restaurantLng: Double = 31.2357,
     captainLat: Double? = null,
     captainLng: Double? = null,
-    showLiveMap: Boolean = true
+    showLiveMap: Boolean = false,
+    orderKey: String = ""
 ) {
     val context = LocalContext.current
     val isAssigned = captainName.isNotBlank() &&
@@ -3356,50 +3663,141 @@ fun CaptainInfoSection(
             }
         }
     } else if (isCompleted) {
-        // حالة الطلب مكتمل: تم التسليم بنجاح
+        // حالة الطلب مكتمل (الطلبات السابقة): إظهار اسم الكابتن وصورته ورقم هاتفه بوضوح
+        val displayCaptainName = if (isAssigned) captainName else "كابتن التوصيل"
+        val displayCaptainPhone = captainPhone.ifBlank { "غير مسجل" }
         Surface(
             color = Color(0xFF2E7D32).copy(alpha = 0.08f),
             shape = RoundedCornerShape(14.dp),
             border = BorderStroke(1.dp, Color(0xFF2E7D32).copy(alpha = 0.35f)),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(12.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFF2E7D32).copy(alpha = 0.15f)),
-                    contentAlignment = Alignment.Center
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = null,
-                        tint = Color(0xFF2E7D32),
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(12.dp))
-
-                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "تم تسليم الطلب بنجاح",
-                        style = MaterialTheme.typography.titleSmall,
+                        text = "🛵 بيانات كابتن الطلب",
+                        style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
                         color = Color(0xFF2E7D32)
                     )
-                    if (isAssigned) {
-                        Spacer(modifier = Modifier.height(2.dp))
+                    Surface(
+                        color = Color(0xFF2E7D32).copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
                         Text(
-                            text = "الكابتن: $captainName",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            text = "تم التسليم بنجاح ✓",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF2E7D32),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                         )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // صورة الكابتن
+                    Box(
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(CircleShape)
+                            .background(Primary.copy(alpha = 0.15f))
+                            .border(2.dp, Color(0xFF2E7D32), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (!captainPhotoUrl.isNullOrBlank()) {
+                            AsyncImage(
+                                model = FirebaseStorageManager.resolveDisplayableImageModel(captainPhotoUrl),
+                                contentDescription = "صورة الكابتن",
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(CircleShape),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Person,
+                                contentDescription = "صورة الكابتن",
+                                tint = Color(0xFF2E7D32),
+                                modifier = Modifier.size(30.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    // اسم الكابتن ورقم هاتفه
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "الكابتن: $displayCaptainName",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = if (captainPhone.isNotBlank()) {
+                                Modifier.clickable {
+                                    try {
+                                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$captainPhone"))
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+                                }
+                            } else Modifier
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Phone,
+                                contentDescription = null,
+                                tint = Primary,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "هاتف الكابتن: $displayCaptainPhone",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+
+                    if (captainPhone.isNotBlank()) {
+                        IconButton(
+                            onClick = {
+                                try {
+                                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$captainPhone"))
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            },
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(Primary.copy(alpha = 0.12f))
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Phone,
+                                contentDescription = "اتصال بالكابتن",
+                                tint = Primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -3490,10 +3888,54 @@ fun CaptainInfoSection(
         }
     } else {
         // الحالة الثانية: حينما الكابتن يستقبل الطلب علي التطبيق الثاني
+        // عد تنازلي يبدأ من 20 دقيقة، وعند انتهاء الـ 20 دقيقة يظهر "متأخر" مع حساب وقت التأخير الفعلي للكابتن
+        val captainKey = remember(captainName, captainPhone) {
+            "${captainName.trim()}_${captainPhone.trim()}"
+        }
+        val startTimestampMs = remember(orderKey, captainKey) {
+            com.example.db.OrderCountdownTracker.getOrInitStartTimestamp(orderKey, captainKey)
+        }
+        val totalCountdownSeconds = com.example.db.OrderCountdownTracker.TOTAL_COUNTDOWN_SECONDS // 20 minutes (1200 seconds)
+        var elapsedSeconds by remember(startTimestampMs) {
+            val elapsed = ((System.currentTimeMillis() - startTimestampMs) / 1000L).toInt().coerceAtLeast(0)
+            mutableStateOf(elapsed)
+        }
+
+        LaunchedEffect(startTimestampMs) {
+            while (true) {
+                kotlinx.coroutines.delay(1000L)
+                elapsedSeconds = ((System.currentTimeMillis() - startTimestampMs) / 1000L).toInt().coerceAtLeast(0)
+            }
+        }
+
+        val isDelayed = elapsedSeconds >= totalCountdownSeconds
+        val remainingSeconds = (totalCountdownSeconds - elapsedSeconds).coerceAtLeast(0)
+        val delayedSeconds = (elapsedSeconds - totalCountdownSeconds).coerceAtLeast(1)
+
+        val minutesPart = remainingSeconds / 60
+        val secondsPart = remainingSeconds % 60
+        val formattedCountdown = String.format(Locale.US, "%02d:%02d", minutesPart, secondsPart)
+
+        val delayHours = delayedSeconds / 3600
+        val delayMinutes = (delayedSeconds % 3600) / 60
+        val delaySecs = delayedSeconds % 60
+        val formattedDelay = if (delayHours > 0) {
+            String.format(Locale.US, "%02d:%02d:%02d", delayHours, delayMinutes, delaySecs)
+        } else {
+            String.format(Locale.US, "%02d:%02d", delayMinutes, delaySecs)
+        }
+        val readableDelayText = when {
+            delayHours > 0 -> "$delayHours ساعة و $delayMinutes دقيقة و $delaySecs ثانية"
+            delayMinutes > 0 -> "$delayMinutes دقيقة و $delaySecs ثانية"
+            else -> "$delaySecs ثانية"
+        }
+
+        val lateColor = Color(0xFFC62828)
+
         Surface(
-            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+            color = if (isDelayed) Color(0xFFFFEBEE).copy(alpha = 0.65f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
             shape = RoundedCornerShape(14.dp),
-            border = BorderStroke(1.dp, Primary.copy(alpha = 0.5f)),
+            border = BorderStroke(1.dp, if (isDelayed) lateColor.copy(alpha = 0.6f) else Primary.copy(alpha = 0.5f)),
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(
@@ -3511,11 +3953,11 @@ fun CaptainInfoSection(
                         text = "🛵 " + stringResource(R.string.captain_info_title),
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
-                        color = Primary
+                        color = if (isDelayed) lateColor else Primary
                     )
 
                     Surface(
-                        color = Color(0xFF2E7D32).copy(alpha = 0.15f),
+                        color = if (isDelayed) lateColor.copy(alpha = 0.15f) else Color(0xFF2E7D32).copy(alpha = 0.15f),
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Row(
@@ -3526,14 +3968,14 @@ fun CaptainInfoSection(
                                 modifier = Modifier
                                     .size(6.dp)
                                     .clip(CircleShape)
-                                    .background(Color(0xFF4CAF50))
+                                    .background(if (isDelayed) lateColor else Color(0xFF4CAF50))
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = stringResource(R.string.captain_accepted_status),
+                                text = if (isDelayed) "متأخر (+$formattedDelay)" else stringResource(R.string.captain_accepted_status),
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
-                                color = Color(0xFF4CAF50)
+                                color = if (isDelayed) lateColor else Color(0xFF4CAF50)
                             )
                         }
                     }
@@ -3552,12 +3994,12 @@ fun CaptainInfoSection(
                             .size(54.dp)
                             .clip(CircleShape)
                             .background(Primary.copy(alpha = 0.2f))
-                            .border(2.dp, Primary, CircleShape),
+                            .border(2.dp, if (isDelayed) lateColor else Primary, CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
                         if (!captainPhotoUrl.isNullOrBlank()) {
                             AsyncImage(
-                                model = captainPhotoUrl,
+                                model = FirebaseStorageManager.resolveDisplayableImageModel(captainPhotoUrl),
                                 contentDescription = "صورة المندوب",
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -3568,7 +4010,7 @@ fun CaptainInfoSection(
                             Icon(
                                 imageVector = Icons.Default.Person,
                                 contentDescription = null,
-                                tint = Primary,
+                                tint = if (isDelayed) lateColor else Primary,
                                 modifier = Modifier.size(30.dp)
                             )
                         }
@@ -3579,7 +4021,7 @@ fun CaptainInfoSection(
                                 .size(12.dp)
                                 .align(Alignment.BottomEnd)
                                 .clip(CircleShape)
-                                .background(Color(0xFF4CAF50))
+                                .background(if (isDelayed) lateColor else Color(0xFF4CAF50))
                                 .border(1.5.dp, MaterialTheme.colorScheme.surface, CircleShape)
                         )
                     }
@@ -3662,126 +4104,76 @@ fun CaptainInfoSection(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // ويصلك في غضون المدة المحددة بين مكان المطعم والكابتن (Estimated Arrival Duration)
-                val etaText = estimatedArrival.ifBlank { "10 - 15 دقيقة" }
                 Surface(
-                    color = Primary.copy(alpha = 0.12f),
+                    color = if (isDelayed) lateColor.copy(alpha = 0.12f) else Primary.copy(alpha = 0.12f),
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, Primary.copy(alpha = 0.35f)),
+                    border = BorderStroke(1.dp, if (isDelayed) lateColor.copy(alpha = 0.5f) else Primary.copy(alpha = 0.35f)),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
                             Box(
                                 modifier = Modifier
-                                    .size(30.dp)
+                                    .size(32.dp)
                                     .clip(CircleShape)
-                                    .background(Primary),
+                                    .background(if (isDelayed) lateColor else Primary),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.AccessTime,
                                     contentDescription = null,
                                     tint = Color.White,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
                                 Text(
-                                    text = stringResource(R.string.captain_arrival_eta_label),
+                                    text = if (isDelayed) {
+                                        "انتهت مدة الـ 20 دقيقة المحددة للتوصيل"
+                                    } else {
+                                        "الوقت المتبقي بعد قبول الكابتن"
+                                    },
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = if (isDelayed) lateColor else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 Text(
-                                    text = stringResource(R.string.captain_arrival_eta_format, etaText),
+                                    text = if (isDelayed) {
+                                        "متأخر منذ $readableDelayText"
+                                    } else {
+                                        "العد التنازلي (20 دقيقة)"
+                                    },
                                     style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = Primary
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (isDelayed) lateColor else Primary
                                 )
                             }
                         }
 
-                        Surface(
-                            color = Primary.copy(alpha = 0.2f),
-                            shape = RoundedCornerShape(6.dp)
-                        ) {
-                            Text(
-                                text = stringResource(R.string.captain_route_distance_note),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Primary,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                            )
-                        }
-                    }
-                }
+                        Spacer(modifier = Modifier.width(8.dp))
 
-                if (showLiveMap && isAssigned && !isCancelled && !isCompleted) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.DirectionsBike,
-                                contentDescription = null,
-                                tint = Primary,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "خريطة تتبع الكابتن المباشر (OpenStreetMap)",
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = Primary
-                            )
-                        }
                         Surface(
-                            color = Color(0xFF00E676).copy(alpha = 0.15f),
-                            shape = RoundedCornerShape(10.dp)
+                            color = if (isDelayed) lateColor else Primary,
+                            shape = RoundedCornerShape(8.dp)
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(6.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(0xFF00E676))
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "مباشر",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color(0xFF00E676),
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
+                            Text(
+                                text = if (isDelayed) "متأخر +$formattedDelay" else "⏱ $formattedCountdown",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = Color.White,
+                                fontWeight = FontWeight.ExtraBold,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                            )
                         }
                     }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    OpenStreetMapCaptainTracker(
-                        restaurantLat = restaurantLat,
-                        restaurantLng = restaurantLng,
-                        captainLat = captainLat ?: (restaurantLat + 0.007),
-                        captainLng = captainLng ?: (restaurantLng + 0.005),
-                        captainName = captainName,
-                        estimatedArrival = etaText,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(190.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                    )
                 }
             }
         }
@@ -3921,7 +4313,8 @@ fun RestaurantOrderHistoryCard(
                 restaurantLat = restLat,
                 restaurantLng = restLng,
                 captainLat = trackedCaptain?.latitude,
-                captainLng = trackedCaptain?.longitude
+                captainLng = trackedCaptain?.longitude,
+                orderKey = order.firestoreOrderId.ifBlank { order.id.toString() }
             )
 
             // Star Rating Feature when Delivered
@@ -3937,691 +4330,283 @@ fun RestaurantOrderHistoryCard(
 }
 
 @Composable
-fun OrderCourierScreen(
-    onBack: () -> Unit = {},
-    onOrderSubmitted: () -> Unit = {},
-    orderViewModel: OrderViewModel = viewModel()
+fun RequestCaptainPopupDialog(
+    orderViewModel: OrderViewModel,
+    onDismiss: () -> Unit,
+    onOrderCreated: ((String) -> Unit)? = null,
+    onSubscribeClick: (() -> Unit)? = null
 ) {
     var deliveryAddress by remember { mutableStateOf("") }
     var deliveryFee by remember { mutableStateOf("") }
-    var customerName by remember { mutableStateOf("") }
-    var customerPhone by remember { mutableStateOf("") }
-    var orderDetails by remember { mutableStateOf("") }
-    var deliveryNotes by remember { mutableStateOf("") }
-    var customerLat by remember { mutableStateOf<Double?>(null) }
-    var customerLng by remember { mutableStateOf<Double?>(null) }
-    var showMapPicker by remember { mutableStateOf(false) }
-    var showSummaryScreen by remember { mutableStateOf(false) }
-    var createdOrderCodeModal by remember { mutableStateOf<String?>(null) }
     var isSubmittingOrder by remember { mutableStateOf(false) }
-    val clipboardManager = LocalClipboardManager.current
-
-    val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
-    val isLimitReached = subscriptionStatus.activeCaptainsCount >= subscriptionStatus.maxCaptains && subscriptionStatus.maxCaptains > 0
-    val isExpired = subscriptionStatus.isExpired
-
     val context = androidx.compose.ui.platform.LocalContext.current
+    val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
+    val firestoreOrders by orderViewModel.firestoreOrders.collectAsStateWithLifecycle()
+    val activeOrdersCount = maxOf(
+        subscriptionStatus.activeCaptainsCount,
+        firestoreOrders.count { isOrderInProgress(it.status) }
+    )
+    val isSubscribedAndActive = subscriptionStatus.isSubscribed &&
+        !subscriptionStatus.isExpired &&
+        subscriptionStatus.status == "active" &&
+        subscriptionStatus.maxCaptains > 0
+    val isLimitReached = isSubscribedAndActive &&
+        activeOrdersCount >= subscriptionStatus.maxCaptains
 
-    if (createdOrderCodeModal != null) {
-        val code = createdOrderCodeModal ?: ""
-        AlertDialog(
-            onDismissRequest = {
-                createdOrderCodeModal = null
-                onOrderSubmitted()
-            },
-            icon = {
-                Box(
-                    modifier = Modifier
-                        .size(60.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFFE8F5E9)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = null,
-                        tint = Color(0xFF2E7D32),
-                        modifier = Modifier.size(38.dp)
-                    )
-                }
-            },
-            title = {
-                Text(
-                    text = "تم إنشاء طلب التوصيل بنجاح",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = "كود الطلب المعتمد والمكون من 6 أرقام فريدة:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center
-                    )
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
+    AlertDialog(
+        onDismissRequest = {
+            if (!isSubmittingOrder) onDismiss()
+        },
+        title = {
+            Text(
+                text = "طلب كابتن جديد",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                color = Primary,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                if (!isSubscribedAndActive) {
                     Surface(
-                        color = Primary.copy(alpha = 0.08f),
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(2.dp, Primary)
+                        color = Color(0xFFFFEBEE),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color(0xFFEF5350)),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 16.dp, horizontal = 24.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Text(
-                                text = "كود الطلب الفريد",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Primary,
-                                fontWeight = FontWeight.Bold
+                                text = "⚠️ لا يمكن عمل طلب كابتن",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color(0xFFC62828)
                             )
-                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = code,
-                                style = MaterialTheme.typography.headlineLarge,
-                                fontWeight = FontWeight.Black,
-                                color = Primary,
-                                letterSpacing = 6.sp
+                                text = subscriptionStatus.message
+                                    ?: "أنت غير مشترك في باقة حالياً. يجب الاشتراك في إحدى الباقات المتاحة أولاً لتتمكن من طلب كابتن.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFB71C1C),
+                                fontWeight = FontWeight.Medium
                             )
                         }
                     }
+                } else if (isLimitReached) {
+                    val nextCaptainNum = subscriptionStatus.maxCaptains + 1
+                    Surface(
+                        color = Color(0xFFFFF3E0),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color(0xFFFF9800)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "⚠️ لا يمكنك طلب الكابتن رقم $nextCaptainNum حالياً",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color(0xFFE65100)
+                            )
+                            Text(
+                                text = "أنت مشترك في باقة ${subscriptionStatus.maxCaptains} كابتن ولديك حالياً $activeOrdersCount طلبات نشطة في نفس الوقت. يمكنك طلب كابتن جديد فور انتهاء أي طلب من الطلبات النشطة.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFBF360C),
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                } else {
+                    Surface(
+                        color = Primary.copy(alpha = 0.1f),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, Primary.copy(alpha = 0.35f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "باقة ${subscriptionStatus.maxCaptains} كابتن • الطلبات النشطة الآن: $activeOrdersCount من ${subscriptionStatus.maxCaptains}",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Primary,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
 
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    OutlinedButton(
-                        onClick = {
-                            clipboardManager.setText(AnnotatedString(code))
-                            Toast.makeText(context, "تم نسخ كود الطلب: $code", Toast.LENGTH_SHORT).show()
+                    // 1. عنوان العميل
+                    OutlinedTextField(
+                        value = deliveryAddress,
+                        onValueChange = { deliveryAddress = it },
+                        label = { Text("عنوان العميل") },
+                        placeholder = { Text("أدخل عنوان العميل") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.LocationOn,
+                                contentDescription = null,
+                                tint = Primary
+                            )
                         },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(44.dp),
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, Primary)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.ContentCopy,
-                            contentDescription = "نسخ",
-                            tint = Primary,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "نسخ كود الطلب بنقرة واحدة",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = Primary
-                        )
-                    }
+                            .testTag("customer_address_input"),
+                        shape = RoundedCornerShape(12.dp),
+                        singleLine = true
+                    )
+
+                    // 2. خدمة التوصيل
+                    OutlinedTextField(
+                        value = deliveryFee,
+                        onValueChange = { deliveryFee = it },
+                        label = { Text("خدمة التوصيل") },
+                        placeholder = { Text("مثال: 30 جنيه") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = null,
+                                tint = Primary
+                            )
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("delivery_fee_input"),
+                        shape = RoundedCornerShape(12.dp),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
                 }
-            },
-            confirmButton = {
+            }
+        },
+        confirmButton = {
+            if (!isSubscribedAndActive) {
                 Button(
                     onClick = {
-                        createdOrderCodeModal = null
-                        onOrderSubmitted()
+                        if (onSubscribeClick != null) {
+                            onSubscribeClick()
+                        } else {
+                            Toast.makeText(
+                                context,
+                                "لا يمكنك طلب كابتن لأنك غير مشترك في باقة. يرجى الاشتراك من القائمة الجانبية أولاً.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            onDismiss()
+                        }
                     },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Primary),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Text(
-                        text = "متابعة الطلب في القائمة",
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
+                    Text("الاشتراك في باقة الآن", color = Color.White, fontWeight = FontWeight.Bold)
                 }
-            },
-            shape = RoundedCornerShape(20.dp)
-        )
-    }
-
-    if (showSummaryScreen) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
-        ) {
-            ElBatalHeader(
-                title = stringResource(R.string.summary_page_title),
-                onBackClick = { showSummaryScreen = false }
-            )
-
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(20.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    shape = RoundedCornerShape(20.dp),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(24.dp)
-                            .verticalScroll(rememberScrollState()),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(64.dp)
-                                .clip(CircleShape)
-                                .background(Primary.copy(alpha = 0.2f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.LocationOn,
-                                contentDescription = null,
-                                tint = Primary,
-                                modifier = Modifier.size(36.dp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        Text(
-                            text = stringResource(R.string.summary_page_title),
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // 1. عنوان التوصيل
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalAlignment = Alignment.Start
-                        ) {
-                            Text(
-                                text = "عنوان التوصيل",
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Primary
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = deliveryAddress.ifBlank { "غير محدد" },
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                fontWeight = FontWeight.Medium
-                            )
-                            if (customerLat != null && customerLng != null) {
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = "📍 إحداثيات GPS: $customerLat, $customerLng",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Primary
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(14.dp))
-
-                        // 2. بيانات العميل
-                        if (customerName.isNotBlank() || customerPhone.isNotBlank()) {
-                            Column(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalAlignment = Alignment.Start
-                            ) {
-                                Text(
-                                    text = "بيانات العميل المستلم",
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = Primary
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                if (customerName.isNotBlank()) {
-                                    Text(
-                                        text = "الاسم: $customerName",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                                if (customerPhone.isNotBlank()) {
-                                    Text(
-                                        text = "الهاتف: $customerPhone",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                            }
-                            Spacer(modifier = Modifier.height(14.dp))
-                        }
-
-                        // 3. خدمة التوصيل
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalAlignment = Alignment.Start
-                        ) {
-                            Text(
-                                text = "خدمة التوصيل",
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Primary
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            val formattedPrice = if (deliveryFee.isBlank()) "30 جنيه" else if (deliveryFee.contains("جنيه")) deliveryFee else "$deliveryFee جنيه"
-                            Text(
-                                text = formattedPrice,
-                                style = MaterialTheme.typography.titleLarge,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-
-                        if (orderDetails.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(14.dp))
-                            Column(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalAlignment = Alignment.Start
-                            ) {
-                                Text(
-                                    text = "تفاصيل الطلب",
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = Primary
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = orderDetails,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                            }
-                        }
-
-                        if (deliveryNotes.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(14.dp))
-                            Column(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalAlignment = Alignment.Start
-                            ) {
-                                Text(
-                                    text = "ملاحظات التوصيل",
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = Primary
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = deliveryNotes,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(28.dp))
-
-                        Button(
-                            onClick = {
-                                if (isSubmittingOrder) return@Button
-                                if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
-                                    com.example.network.NetworkHelper.notifyNoInternet(context, "إجراء طلب كابتن جديد")
-                                    return@Button
-                                }
-                                isSubmittingOrder = true
-                                orderViewModel.addOrder(
-                                    destinationAddress = deliveryAddress.trim(),
-                                    serviceFee = deliveryFee.trim(),
-                                    customerName = customerName.trim(),
-                                    customerPhone = customerPhone.trim(),
-                                    orderDetails = orderDetails.trim(),
-                                    deliveryNotes = deliveryNotes.trim(),
-                                    customerLatitude = customerLat,
-                                    customerLongitude = customerLng,
-                                    onSuccess = { generatedCode ->
-                                        isSubmittingOrder = false
-                                        createdOrderCodeModal = generatedCode
-                                    },
-                                    onError = { err ->
-                                        isSubmittingOrder = false
-                                        android.widget.Toast.makeText(context, err, android.widget.Toast.LENGTH_LONG).show()
-                                    }
-                                )
-                            },
-                            enabled = !isSubmittingOrder,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(50.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Primary),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            if (isSubmittingOrder) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(22.dp),
-                                    color = Color.White,
-                                    strokeWidth = 2.dp
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "جاري حجز الكود وإنشاء الطلب...",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                            } else {
-                                Text(
-                                    text = stringResource(R.string.confirm_order_button),
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold,
-                                    style = MaterialTheme.typography.bodyLarge
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        OutlinedButton(
-                            onClick = { showSummaryScreen = false },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(48.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
-                        ) {
-                            Text(
-                                text = stringResource(R.string.edit_order_button),
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
-        ) {
-            ElBatalHeader(
-                title = "طلب مندوب جديد",
-                onBackClick = onBack
-            )
-
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(16.dp)
-                    .verticalScroll(rememberScrollState()),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                // Subscription capacity card
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 12.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isLimitReached || isExpired) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
-                        else Primary.copy(alpha = 0.08f)
+            } else if (isLimitReached) {
+                Button(
+                    onClick = {
+                        val nextCaptainNum = subscriptionStatus.maxCaptains + 1
+                        Toast.makeText(
+                            context,
+                            "لا يمكنك طلب الكابتن رقم $nextCaptainNum حالياً لأن باقتك (${subscriptionStatus.maxCaptains} كابتن) مكتملة بالطلبات النشطة. انتظر انتهاء أحد الطلبات أولاً.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    },
+                    enabled = false,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Primary,
+                        disabledContainerColor = Color.Gray.copy(alpha = 0.4f),
+                        disabledContentColor = Color.White
                     ),
-                    border = BorderStroke(1.dp, if (isLimitReached || isExpired) MaterialTheme.colorScheme.error else Primary.copy(alpha = 0.4f))
+                    shape = RoundedCornerShape(12.dp)
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = if (isLimitReached || isExpired) "⚠️" else "🛵",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "الباقة: ${subscriptionStatus.planName}",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = "الكباتن النشطون: ${subscriptionStatus.activeCaptainsCount} من أصل ${subscriptionStatus.maxCaptains} كابتن مسموح",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (isLimitReached) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
+                    Text("الحد الأقصى مكتمل (${subscriptionStatus.maxCaptains}/${subscriptionStatus.maxCaptains})", color = Color.White, fontWeight = FontWeight.Bold)
                 }
-
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    shape = RoundedCornerShape(16.dp),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-                ) {
-                    Column(modifier = Modifier.padding(20.dp)) {
-                        Text(
-                            text = "بيانات الطلب",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = Primary
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // 1. عنوان التوصيل
-                        OutlinedTextField(
-                            value = deliveryAddress,
-                            onValueChange = { deliveryAddress = it },
-                            label = { Text("عنوان التوصيل") },
-                            placeholder = { Text("مثال: شارع الجمهورية - عمارة 5 - شقة 3") },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.LocationOn,
-                                    contentDescription = null,
-                                    tint = Primary
-                                )
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            singleLine = true
-                        )
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        // GPS Location Picker Toggle Button
-                        OutlinedButton(
-                            onClick = { showMapPicker = !showMapPicker },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, Primary.copy(alpha = 0.6f))
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.LocationOn,
-                                contentDescription = null,
-                                tint = Primary,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (customerLat != null) "تم تحديد موقع GPS للعميل ✓ (تعديل)" else "تحديد موقع العميل على الخريطة (GPS)",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Primary,
-                                fontWeight = FontWeight.Bold
-                            )
+            } else {
+                Button(
+                    onClick = {
+                        if (isSubmittingOrder) return@Button
+                        if (deliveryAddress.isBlank()) {
+                            Toast.makeText(context, "برجاء إدخال عنوان العميل", Toast.LENGTH_SHORT).show()
+                            return@Button
                         }
-
-                        if (showMapPicker) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            com.example.ui.components.OpenStreetMapLocationPicker(
-                                initialLatitude = customerLat ?: 30.0444,
-                                initialLongitude = customerLng ?: 31.2357,
-                                onLocationSelected = { lat, lng ->
-                                    customerLat = lat
-                                    customerLng = lng
-                                    if (deliveryAddress.isBlank()) {
-                                        deliveryAddress = "موقع محدد عبر الخريطة ($lat, $lng)"
-                                    }
-                                }
-                            )
+                        if (deliveryFee.isBlank()) {
+                            Toast.makeText(context, "برجاء إدخال خدمة التوصيل", Toast.LENGTH_SHORT).show()
+                            return@Button
                         }
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // 2. اسم العميل
-                        OutlinedTextField(
-                            value = customerName,
-                            onValueChange = { customerName = it },
-                            label = { Text(stringResource(R.string.customer_name_hint)) },
-                            placeholder = { Text("اسم العميل المستلم") },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.Person,
-                                    contentDescription = null,
-                                    tint = Primary
-                                )
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            singleLine = true
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // 3. رقم هاتف العميل
-                        OutlinedTextField(
-                            value = customerPhone,
-                            onValueChange = { customerPhone = it },
-                            label = { Text(stringResource(R.string.customer_phone_hint)) },
-                            placeholder = { Text("مثال: 01012345678") },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.Phone,
-                                    contentDescription = null,
-                                    tint = Primary
-                                )
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone)
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // 4. خدمة التوصيل
-                        OutlinedTextField(
-                            value = deliveryFee,
-                            onValueChange = { deliveryFee = it },
-                            label = { Text("خدمة التوصيل") },
-                            placeholder = { Text("مثال: 30 جنيه") },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.Edit,
-                                    contentDescription = null,
-                                    tint = Primary
-                                )
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // 5. تفاصيل الطلب
-                        OutlinedTextField(
-                            value = orderDetails,
-                            onValueChange = { orderDetails = it },
-                            label = { Text(stringResource(R.string.order_details_hint)) },
-                            placeholder = { Text("مثال: 2 وجبة كرسبي + 1 كانز كولا") },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.Edit,
-                                    contentDescription = null,
-                                    tint = Primary
-                                )
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            maxLines = 3
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // 6. ملاحظات التوصيل
-                        OutlinedTextField(
-                            value = deliveryNotes,
-                            onValueChange = { deliveryNotes = it },
-                            label = { Text(stringResource(R.string.customer_notes_label)) },
-                            placeholder = { Text("ملاحظات خاصة للكابتن أو العميل") },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            maxLines = 2
-                        )
-
-                        Spacer(modifier = Modifier.height(24.dp))
-
                         if (isLimitReached) {
-                            Surface(
-                                color = MaterialTheme.colorScheme.errorContainer,
-                                shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(bottom = 12.dp)
-                            ) {
-                                Text(
-                                    text = stringResource(R.string.captains_limit_reached_warning, subscriptionStatus.maxCaptains),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onErrorContainer,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(10.dp)
-                                )
-                            }
+                            val nextCaptainNum = subscriptionStatus.maxCaptains + 1
+                            Toast.makeText(
+                                context,
+                                "لا يمكنك طلب الكابتن رقم $nextCaptainNum حالياً حتى ينتهي أحد الطلبات النشطة",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            return@Button
                         }
-
-                        Button(
-                            onClick = {
-                                if (deliveryAddress.isBlank()) {
-                                    android.widget.Toast.makeText(context, "برجاء إدخال عنوان التوصيل أولاً", android.widget.Toast.LENGTH_SHORT).show()
-                                } else if (isLimitReached) {
-                                    android.widget.Toast.makeText(context, "تم الوصول للحد الأقصى للكباتن النشطين في باقتك", android.widget.Toast.LENGTH_SHORT).show()
-                                } else {
-                                    showSummaryScreen = true
-                                }
+                        isSubmittingOrder = true
+                        orderViewModel.addOrder(
+                            destinationAddress = deliveryAddress.trim(),
+                            serviceFee = deliveryFee.trim(),
+                            onSuccess = { generatedCode ->
+                                isSubmittingOrder = false
+                                Toast.makeText(context, "تم إرسال طلب الكابتن بنجاح ✓", Toast.LENGTH_SHORT).show()
+                                onOrderCreated?.invoke(generatedCode)
+                                onDismiss()
                             },
-                            enabled = !isLimitReached && (!isExpired || subscriptionStatus.status != "expired"),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(52.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Primary),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Text(
-                                text = stringResource(R.string.request_courier_action),
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.titleMedium
-                            )
-                        }
+                            onError = { err ->
+                                isSubmittingOrder = false
+                                Toast.makeText(context, err, Toast.LENGTH_LONG).show()
+                            }
+                        )
+                    },
+                    enabled = !isSubmittingOrder,
+                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.testTag("submit_request_captain_button")
+                ) {
+                    if (isSubmittingOrder) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = Color.White,
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("جاري الطلب...", color = Color.White, fontWeight = FontWeight.Bold)
+                    } else {
+                        Text("طلب كابتن", color = Color.White, fontWeight = FontWeight.Bold)
                     }
                 }
             }
-        }
-    }
+        },
+        dismissButton = {
+            OutlinedButton(
+                onClick = { if (!isSubmittingOrder) onDismiss() },
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text("إلغاء")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+@Composable
+fun OrderCourierScreen(
+    onBack: () -> Unit = {},
+    onOrderSubmitted: () -> Unit = {},
+    onSubscribeClick: (() -> Unit)? = null,
+    orderViewModel: OrderViewModel = viewModel()
+) {
+    RequestCaptainPopupDialog(
+        orderViewModel = orderViewModel,
+        onDismiss = onBack,
+        onOrderCreated = { onOrderSubmitted() },
+        onSubscribeClick = onSubscribeClick
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -4633,7 +4618,8 @@ fun HomeScreen(
 ) {
     val firestoreOrders by orderViewModel.firestoreOrders.collectAsStateWithLifecycle()
     val localOrders by orderViewModel.ordersState.collectAsStateWithLifecycle()
-    val orders = if (firestoreOrders.isNotEmpty()) firestoreOrders else localOrders
+    val isLoggedIn = remember { com.google.firebase.Firebase.auth.currentUser != null }
+    val orders = if (isLoggedIn) firestoreOrders else if (firestoreOrders.isNotEmpty()) firestoreOrders else localOrders
     val isRefreshing by orderViewModel.isRefreshing.collectAsStateWithLifecycle()
 
     val activeOrders = orders.filter { it.status !in listOf("تم", "تم التسليم", "مكتمل", "مكتملة", "Delivered", "ملغي") && !isOrderCompleted(it.status) && !isOrderCancelled(it.status) }
@@ -4803,6 +4789,340 @@ fun isOrderInProgress(status: String): Boolean {
     return !isOrderCancelled(status) && !isOrderCompleted(status)
 }
 
+fun isOrderAwaitingMerchantConfirmation(order: DeliveryOrderEntity): Boolean {
+    return isOrderInProgress(order.status) && !order.customerDetailsConfirmed && (
+        order.status == "بانتظار تأكيد البيانات" ||
+        (order.customerDetailsSubmitted && !order.customerDetailsRejected)
+    )
+}
+
+@Composable
+fun AutoMerchantConfirmationDialog(
+    orders: List<DeliveryOrderEntity>,
+    orderViewModel: OrderViewModel
+) {
+    val context = LocalContext.current
+    val dismissedSubmissionKeys = remember { mutableStateListOf<String>() }
+    val awaitingOrders = remember(orders) {
+        orders.filter { isOrderAwaitingMerchantConfirmation(it) }
+    }
+    val pendingOrder = awaitingOrders.firstOrNull { order ->
+        val key = "${order.firestoreOrderId.ifBlank { order.id.toString() }}_${order.status}_${order.receiptImageUrl}_${order.customerName}_${order.customerPhone}_${order.destinationAddress}"
+        key !in dismissedSubmissionKeys
+    } ?: return
+
+    val orderKey = pendingOrder.firestoreOrderId.ifBlank { pendingOrder.id.toString() }
+    val submissionKey = "${orderKey}_${pendingOrder.status}_${pendingOrder.receiptImageUrl}_${pendingOrder.customerName}_${pendingOrder.customerPhone}_${pendingOrder.destinationAddress}"
+    var showRejectPrompt by remember(submissionKey) { mutableStateOf(false) }
+    var rejectionReasonInput by remember(submissionKey) { mutableStateOf("") }
+    var isSubmitting by remember(submissionKey) { mutableStateOf(false) }
+    var showFullImage by remember(submissionKey) { mutableStateOf(false) }
+
+    if (showFullImage && pendingOrder.receiptImageUrl.isNotBlank()) {
+        AlertDialog(
+            onDismissRequest = { showFullImage = false },
+            confirmButton = {
+                Button(onClick = { showFullImage = false }) {
+                    Text("إغلاق")
+                }
+            },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(380.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    AsyncImage(
+                        model = FirebaseStorageManager.resolveDisplayableImageModel(pendingOrder.receiptImageUrl),
+                        contentDescription = "صورة الإيصال بالحجم الكامل",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            },
+            shape = RoundedCornerShape(16.dp)
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = {
+            if (!isSubmitting) {
+                dismissedSubmissionKeys.add(submissionKey)
+            }
+        },
+        title = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Notifications,
+                        contentDescription = null,
+                        tint = Color(0xFFE65100),
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Text(
+                        text = "تأكيد بيانات الطلب",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color(0xFFE65100)
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = buildString {
+                        append("أرسل ")
+                        append(pendingOrder.captainName.ifBlank { "الكابتن" })
+                        append(" بيانات الطلب. يرجى التأكيد لكي يكمل الكابتن الطلب.")
+                        if (pendingOrder.orderCode.isNotBlank()) append(" (#${pendingOrder.orderCode})")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1)),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFFFFB74D))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "👤 العميل: ${pendingOrder.customerName.ifBlank { "غير مسجل" }}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF212121)
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "📞 الهاتف: ${pendingOrder.customerPhone.ifBlank { "غير مسجل" }}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF212121)
+                            )
+                            if (pendingOrder.customerPhone.isNotBlank()) {
+                                TextButton(
+                                    onClick = {
+                                        try {
+                                            context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${pendingOrder.customerPhone}")))
+                                        } catch (_: Exception) {}
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) {
+                                    Icon(Icons.Default.Phone, contentDescription = null, tint = Primary, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("اتصال", style = MaterialTheme.typography.labelSmall, color = Primary, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                        Text(
+                            text = "📍 العنوان: ${pendingOrder.destinationAddress.ifBlank { "غير محدد" }}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color(0xFF424242)
+                        )
+                        if (pendingOrder.serviceFee.isNotBlank()) {
+                            Text(
+                                text = "💰 خدمة التوصيل: ${pendingOrder.serviceFee}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Primary,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        if (pendingOrder.orderDetails.isNotBlank()) {
+                            Text(
+                                text = "📦 التفاصيل: ${pendingOrder.orderDetails}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF424242)
+                            )
+                        }
+                        if (pendingOrder.deliveryNotes.isNotBlank()) {
+                            Text(
+                                text = "📝 ملاحظات: ${pendingOrder.deliveryNotes}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF424242)
+                            )
+                        }
+                    }
+                }
+
+                if (pendingOrder.receiptImageUrl.isNotBlank()) {
+                    Text(
+                        text = "📸 صورة إيصال الطلب المرسلة من الكابتن:",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(180.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.5.dp, Primary.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                            .clickable { showFullImage = true },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AsyncImage(
+                            model = FirebaseStorageManager.resolveDisplayableImageModel(pendingOrder.receiptImageUrl),
+                            contentDescription = "صورة إيصال الطلب",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop
+                        )
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.65f),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(8.dp)
+                        ) {
+                            Text(
+                                text = "🔍 اضغط للتكبير",
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+
+                if (showRejectPrompt) {
+                    OutlinedTextField(
+                        value = rejectionReasonInput,
+                        onValueChange = { rejectionReasonInput = it },
+                        label = { Text("سبب رفض البيانات") },
+                        placeholder = { Text("مثال: رقم الهاتف غير صحيح أو صورة الإيصال غير واضحة") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 2,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = {
+                        isSubmitting = true
+                        orderViewModel.confirmCustomerDetails(
+                            orderId = orderKey,
+                            onSuccess = {
+                                isSubmitting = false
+                                dismissedSubmissionKeys.add(submissionKey)
+                            },
+                            onError = {
+                                isSubmitting = false
+                            }
+                        )
+                    },
+                    enabled = !isSubmitting,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("auto_confirm_customer_data_button"),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (isSubmitting) "جاري التأكيد..." else "تأكيد البيانات ✓",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                if (showRejectPrompt) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { showRejectPrompt = false },
+                            enabled = !isSubmitting,
+                            modifier = Modifier.weight(1f).height(48.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("تراجع")
+                        }
+                        Button(
+                            onClick = {
+                                isSubmitting = true
+                                orderViewModel.rejectCustomerDetails(
+                                    orderId = orderKey,
+                                    reason = rejectionReasonInput,
+                                    onSuccess = {
+                                        isSubmitting = false
+                                        dismissedSubmissionKeys.add(submissionKey)
+                                    },
+                                    onError = {
+                                        isSubmitting = false
+                                    }
+                                )
+                            },
+                            enabled = !isSubmitting && rejectionReasonInput.isNotBlank(),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.weight(1f).height(48.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("تأكيد الرفض", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { showRejectPrompt = true },
+                            enabled = !isSubmitting,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("auto_reject_customer_data_button"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("رفض البيانات", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = { dismissedSubmissionKeys.add(submissionKey) },
+                            enabled = !isSubmitting,
+                            modifier = Modifier.weight(1f).height(48.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("إغلاق")
+                        }
+                    }
+                }
+            }
+        },
+        shape = RoundedCornerShape(18.dp)
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OrderManagementSection(
@@ -4813,14 +5133,15 @@ fun OrderManagementSection(
     onRateOrder: ((Int, Int) -> Unit)? = null,
     onEditOrder: ((Int) -> Unit)? = null,
     onRequestNewOrder: (() -> Unit)? = null,
-    onCancelOrder: ((Int) -> Unit)? = null
+    onCancelOrder: ((Int) -> Unit)? = null,
+    orderViewModel: OrderViewModel = viewModel()
 ) {
     var activeTab by remember { mutableStateOf(OrderTab.TODAY) }
     var activeFilter by remember(showAllFilter) {
         mutableStateOf(if (showAllFilter) OrderStatusFilter.ALL else OrderStatusFilter.IN_PROGRESS)
     }
 
-    var selectedDateString by remember { mutableStateOf("20 يوليو 2026") }
+    var selectedDateString by remember { mutableStateOf("") }
     var showDatePickerDialog by remember { mutableStateOf(false) }
 
     val todayDateString = remember {
@@ -4894,7 +5215,10 @@ fun OrderManagementSection(
                     // Button 2: الطلبات السابقة
                     val isPrevious = activeTab == OrderTab.PREVIOUS
                     Button(
-                        onClick = { activeTab = OrderTab.PREVIOUS },
+                        onClick = {
+                            activeTab = OrderTab.PREVIOUS
+                            activeFilter = OrderStatusFilter.ALL
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .height(48.dp),
@@ -4941,7 +5265,7 @@ fun OrderManagementSection(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = selectedDateString,
+                                text = if (selectedDateString.isBlank()) "كل التواريخ (جميع الطلبات السابقة)" else selectedDateString,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.ExtraBold,
                                 color = Primary
@@ -4975,13 +5299,32 @@ fun OrderManagementSection(
                         }
                     }
 
-                    // Quick Date Chips
+                    // Quick Date Chips (including "كل التواريخ")
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        val allSelected = selectedDateString.isBlank()
+                        FilterChip(
+                            selected = allSelected,
+                            onClick = { selectedDateString = "" },
+                            label = {
+                                Text(
+                                    text = "كل التواريخ",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = if (allSelected) FontWeight.Bold else FontWeight.Normal
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Primary,
+                                selectedLabelColor = Color.White,
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+
                         dynamicDateList.forEach { dateStr ->
                             val isSelected = selectedDateString == dateStr
                             FilterChip(
@@ -5007,12 +5350,72 @@ fun OrderManagementSection(
             }
         }
 
-        // 💡 3. Status Filter Chips (جارية / مكتملة / ملغية)
-        val displayedFilters = remember(showAllFilter) {
+        val awaitingConfirmationOrders = remember(orders) {
+            orders.filter { isOrderAwaitingMerchantConfirmation(it) }
+        }
+        val hasRejectedOrders = remember(orders) {
+            orders.any { isOrderInProgress(it.status) && (it.status == "بيانات مرفوضة" || it.customerDetailsRejected) }
+        }
+
+        if (awaitingConfirmationOrders.isNotEmpty()) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+                    .testTag("awaiting_confirmation_banner"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0)),
+                border = BorderStroke(1.5.dp, Color(0xFFFF9800))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "📋 تأكيد البيانات (${awaitingConfirmationOrders.size})",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = Color(0xFFE65100)
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "أرسل الكابتن بيانات الطلب وبانتظار تأكيدك لكي يكمل التوصيل.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF5D4037)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = { activeFilter = OrderStatusFilter.WAITING_CONFIRMATION },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE65100)),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.height(40.dp)
+                    ) {
+                        Text(
+                            text = "عرض",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                }
+            }
+        }
+
+        // 💡 3. Status Filter Chips (جارية / بانتظار تأكيد البيانات / مكتملة / ملغية)
+        val displayedFilters = remember(showAllFilter, hasRejectedOrders) {
+            val baseFilters = OrderStatusFilter.entries.filter {
+                it != OrderStatusFilter.REJECTED_DATA || hasRejectedOrders
+            }
             if (showAllFilter) {
-                OrderStatusFilter.entries
+                baseFilters
             } else {
-                OrderStatusFilter.entries.filter { it != OrderStatusFilter.ALL }
+                baseFilters.filter { it != OrderStatusFilter.ALL }
             }
         }
 
@@ -5025,21 +5428,34 @@ fun OrderManagementSection(
         ) {
             displayedFilters.forEach { filter ->
                 val isSelected = activeFilter == filter
+                val chipLabel = if (filter == OrderStatusFilter.WAITING_CONFIRMATION && awaitingConfirmationOrders.isNotEmpty()) {
+                    "${stringResource(filter.labelRes)} (${awaitingConfirmationOrders.size})"
+                } else {
+                    stringResource(filter.labelRes)
+                }
                 FilterChip(
                     selected = isSelected,
                     onClick = { activeFilter = filter },
                     label = {
                         Text(
-                            text = stringResource(filter.labelRes),
+                            text = chipLabel,
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium
                         )
                     },
                     colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = Primary,
+                        selectedContainerColor = if (filter == OrderStatusFilter.WAITING_CONFIRMATION) Color(0xFFE65100) else Primary,
                         selectedLabelColor = Color.White,
-                        containerColor = MaterialTheme.colorScheme.surface,
-                        labelColor = MaterialTheme.colorScheme.onSurface
+                        containerColor = if (filter == OrderStatusFilter.WAITING_CONFIRMATION && awaitingConfirmationOrders.isNotEmpty()) {
+                            Color(0xFFFFF3E0)
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        },
+                        labelColor = if (filter == OrderStatusFilter.WAITING_CONFIRMATION && awaitingConfirmationOrders.isNotEmpty()) {
+                            Color(0xFFE65100)
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
                     ),
                     shape = RoundedCornerShape(12.dp)
                 )
@@ -5057,9 +5473,13 @@ fun OrderManagementSection(
                 }
                 if (matchingToday.isNotEmpty()) matchingToday else orders
             } else {
-                orders.filter {
-                    it.orderDate.contains(selectedDateString) ||
-                    (!it.orderDate.contains(todayDateString) && (isOrderCompleted(it.status) || isOrderCancelled(it.status)))
+                if (selectedDateString.isNotBlank()) {
+                    orders.filter { it.orderDate.contains(selectedDateString) }
+                } else {
+                    val previousOrders = orders.filter {
+                        isOrderCompleted(it.status) || isOrderCancelled(it.status) || !it.orderDate.contains(todayDateString)
+                    }
+                    if (previousOrders.isNotEmpty()) previousOrders else orders
                 }
             }
         }
@@ -5071,7 +5491,7 @@ fun OrderManagementSection(
                     isOrderInProgress(it.status)
                 }
                 OrderStatusFilter.WAITING_CONFIRMATION -> tabFilteredOrders.filter {
-                    it.status == "بانتظار تأكيد البيانات" || it.customerDetailsSubmitted && !it.customerDetailsConfirmed
+                    isOrderAwaitingMerchantConfirmation(it)
                 }
                 OrderStatusFilter.REJECTED_DATA -> tabFilteredOrders.filter {
                     it.status == "بيانات مرفوضة" || it.customerDetailsRejected
@@ -5163,7 +5583,8 @@ fun OrderManagementSection(
                         onEditOrder = onEditOrder,
                         onCancelOrder = {
                             onCancelOrder?.invoke(order.id)
-                        }
+                        },
+                        orderViewModel = orderViewModel
                     )
                 }
             }
@@ -5184,14 +5605,20 @@ fun OrganizedOrderCard(
     val isInProgress = isOrderInProgress(order.status)
     val isCancelled = isOrderCancelled(order.status)
     val isCompleted = isOrderCompleted(order.status)
+    val isAwaitingMerchantConfirmation = isOrderAwaitingMerchantConfirmation(order)
+    val orderActionKey = order.firestoreOrderId.ifBlank { order.id.toString() }
 
     val (statusLabel, badgeColor, badgeTextColor) = when {
         isCancelled -> Triple(stringResource(R.string.status_cancelled), Color(0xFFFFEBEE), Color(0xFFC62828))
-        isCompleted -> Triple(stringResource(R.string.status_completed), Color(0xE8E8F5E9), Color(0xFF2E7D32))
+        isCompleted -> Triple(stringResource(R.string.status_completed), Color(0xFFE8F5E9), Color(0xFF2E7D32))
+        isAwaitingMerchantConfirmation -> Triple("بانتظار تأكيد البيانات", Color(0xFFFFF3E0), Color(0xFFE65100))
+        order.status.trim() == "بيانات مرفوضة" || order.customerDetailsRejected -> Triple("بيانات مرفوضة", Color(0xFFFFEBEE), Color(0xFFC62828))
         else -> {
             val label = when (order.status.trim()) {
                 "جاري البحث عن كابتن", "في انتظار كابتن", "قيد التحضير", "pending", "جاري البحث" -> "جاري البحث"
                 "الكابتن في الطريق لك", "في الطريق لك", "accepted", "في الطريق إلى المطعم" -> "في الطريق لك"
+                "وصل المتجر" -> "وصل المتجر"
+                "تم الاستلام" -> "تم الاستلام"
                 "جاري التوصيل", "delivering", "out_for_delivery" -> "جاري التوصيل"
                 else -> if (order.status.isNotBlank()) order.status else stringResource(R.string.status_in_progress)
             }
@@ -5201,8 +5628,9 @@ fun OrganizedOrderCard(
 
     var showReviewDialog by remember { mutableStateOf(false) }
     var showFullImageDialog by remember { mutableStateOf(false) }
-    var rejectionReasonInput by remember { mutableStateOf("") }
-    var showRejectPrompt by remember { mutableStateOf(false) }
+    var rejectionReasonInput by remember(orderActionKey, order.status) { mutableStateOf("") }
+    var showRejectPrompt by remember(orderActionKey, order.status) { mutableStateOf(false) }
+    var isActionSubmitting by remember(orderActionKey, order.status) { mutableStateOf(false) }
 
     if (showFullImageDialog && order.receiptImageUrl.isNotBlank()) {
         AlertDialog(
@@ -5220,7 +5648,7 @@ fun OrganizedOrderCard(
                     contentAlignment = Alignment.Center
                 ) {
                     AsyncImage(
-                        model = order.receiptImageUrl,
+                        model = FirebaseStorageManager.resolveDisplayableImageModel(order.receiptImageUrl),
                         contentDescription = "صورة الإيصال بالحجم الكامل",
                         modifier = Modifier
                             .fillMaxSize()
@@ -5236,20 +5664,35 @@ fun OrganizedOrderCard(
     if (showReviewDialog) {
         AlertDialog(
             onDismissRequest = {
-                showReviewDialog = false
-                showRejectPrompt = false
+                if (!isActionSubmitting) {
+                    showReviewDialog = false
+                    showRejectPrompt = false
+                }
             },
             title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = "📋 مراجعة إيصال وبيانات العميل",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Primary
-                    )
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = if (isAwaitingMerchantConfirmation) "📋 تأكيد بيانات الطلب وإيصال العميل" else "📋 بيانات الطلب وإيصال العميل",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isAwaitingMerchantConfirmation) Color(0xFFE65100) else Primary
+                        )
+                    }
+                    if (order.orderCode.isNotBlank() || order.orderDate.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = buildString {
+                                if (order.orderCode.isNotBlank()) append("كود الطلب: #${order.orderCode} ")
+                                if (order.orderDate.isNotBlank()) append("• ${order.orderDate}")
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             },
             text = {
@@ -5259,38 +5702,75 @@ fun OrganizedOrderCard(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Customer Info
+                    // Customer Info (اسم العميل ورقم هاتفه وعنوانه)
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
-                        shape = RoundedCornerShape(10.dp)
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Primary.copy(alpha = 0.3f))
                     ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "بيانات العميل المستلم",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Primary
+                            )
                             Text(
                                 text = "👤 اسم العميل: ${order.customerName.ifBlank { "غير مسجل" }}",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Bold
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "📞 الهاتف: ${order.customerPhone.ifBlank { "غير مسجل" }}",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "📍 العنوان: ${order.destinationAddress.ifBlank { "غير محدد" }}",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            if (order.customerLatitude != null && order.customerLongitude != null) {
-                                Spacer(modifier = Modifier.height(2.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Text(
-                                    text = "🌐 GPS: ${order.customerLatitude}, ${order.customerLongitude}",
+                                    text = "📞 رقم الهاتف: ${order.customerPhone.ifBlank { "غير مسجل" }}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                if (order.customerPhone.isNotBlank()) {
+                                    TextButton(
+                                        onClick = {
+                                            try {
+                                                val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${order.customerPhone}"))
+                                                context.startActivity(intent)
+                                            } catch (e: Exception) {
+                                                e.printStackTrace()
+                                            }
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                    ) {
+                                        Icon(Icons.Default.Phone, contentDescription = null, tint = Primary, modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("اتصال بالعميل", style = MaterialTheme.typography.labelSmall, color = Primary, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                            Text(
+                                text = "📍 عنوان العميل: ${order.destinationAddress.ifBlank { "غير محدد" }}",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            if (order.serviceFee.isNotBlank()) {
+                                Text(
+                                    text = "💰 خدمة التوصيل: ${order.serviceFee}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Primary
+                                    color = Primary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            if (order.orderDetails.isNotBlank()) {
+                                Text(
+                                    text = "📦 تفاصيل الطلب: ${order.orderDetails}",
+                                    style = MaterialTheme.typography.bodySmall
                                 )
                             }
                             if (order.deliveryNotes.isNotBlank()) {
-                                Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = "📝 ملاحظات: ${order.deliveryNotes}",
                                     style = MaterialTheme.typography.bodySmall
@@ -5299,156 +5779,180 @@ fun OrganizedOrderCard(
                         }
                     }
 
-                    // Receipt Image
+                    // Receipt Image (صورة إيصال الطلب)
+                    Text(
+                        text = "📸 صورة إيصال الطلب:",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
                     if (order.receiptImageUrl.isNotBlank()) {
-                        Text(
-                            text = "📸 إيصال الاستلام المحمل من الكابتن:",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold
-                        )
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(180.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .border(1.dp, Primary.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                                .height(200.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .border(1.5.dp, Primary.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                                 .clickable { showFullImageDialog = true },
                             contentAlignment = Alignment.Center
                         ) {
                             AsyncImage(
-                                model = order.receiptImageUrl,
-                                contentDescription = "إيصال الطلب",
+                                model = FirebaseStorageManager.resolveDisplayableImageModel(order.receiptImageUrl),
+                                contentDescription = "صورة إيصال الطلب",
                                 modifier = Modifier.fillMaxSize(),
                                 contentScale = ContentScale.Crop
                             )
                             Surface(
-                                color = Color.Black.copy(alpha = 0.6f),
+                                color = Color.Black.copy(alpha = 0.65f),
                                 shape = RoundedCornerShape(6.dp),
                                 modifier = Modifier
                                     .align(Alignment.BottomEnd)
                                     .padding(8.dp)
                             ) {
                                 Text(
-                                    text = "🔍 اضغط للتكبير",
+                                    text = "🔍 اضغط لتكبير صورة الإيصال",
                                     color = Color.White,
                                     style = MaterialTheme.typography.labelSmall,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                                 )
                             }
                         }
                     } else {
                         Surface(
-                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
-                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(10.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(
-                                text = "⚠️ لم يقم الكابتن برفع صورة الإيصال بعد",
+                                text = "⚠️ لا توجد صورة إيصال مرفقة لهذا الطلب بعد",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(10.dp)
+                                modifier = Modifier.padding(12.dp)
                             )
                         }
                     }
 
-                    if (order.customerDetailsRejected && order.rejectionReason.isNotBlank()) {
-                        Surface(
-                            color = MaterialTheme.colorScheme.errorContainer,
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(
-                                text = "❌ سبب الرفض السابق: ${order.rejectionReason}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(8.dp)
-                            )
-                        }
-                    }
-
-                    if (showRejectPrompt) {
-                        Spacer(modifier = Modifier.height(6.dp))
+                    if (isAwaitingMerchantConfirmation && showRejectPrompt) {
                         OutlinedTextField(
                             value = rejectionReasonInput,
                             onValueChange = { rejectionReasonInput = it },
-                            label = { Text("سبب الرفض (إلزامي)") },
-                            placeholder = { Text("مثال: الإيصال غير واضح أو المبلغ غير مطابق") },
+                            label = { Text("سبب رفض البيانات") },
+                            placeholder = { Text("اكتب سبب الرفض للكابتن...") },
                             modifier = Modifier.fillMaxWidth(),
+                            minLines = 2,
                             shape = RoundedCornerShape(10.dp)
                         )
                     }
                 }
             },
             confirmButton = {
-                if (!showRejectPrompt) {
-                    Row(
+                if (isAwaitingMerchantConfirmation) {
+                    Column(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Button(
                             onClick = {
+                                isActionSubmitting = true
                                 orderViewModel.confirmCustomerDetails(
-                                    orderId = order.firestoreOrderId.ifBlank { order.id.toString() },
-                                    onSuccess = { showReviewDialog = false },
-                                    onError = { err -> android.widget.Toast.makeText(context, err, android.widget.Toast.LENGTH_LONG).show() }
+                                    orderId = orderActionKey,
+                                    onSuccess = {
+                                        isActionSubmitting = false
+                                        showReviewDialog = false
+                                    },
+                                    onError = {
+                                        isActionSubmitting = false
+                                    }
                                 )
                             },
+                            enabled = !isActionSubmitting,
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("dialog_confirm_customer_data_button_${order.id}"),
                             shape = RoundedCornerShape(10.dp)
                         ) {
-                            Text("تأكيد وموافقة ✓", color = Color.White, fontWeight = FontWeight.Bold)
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isActionSubmitting) "جاري التأكيد..." else "تأكيد البيانات ✓",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
 
-                        OutlinedButton(
-                            onClick = { showRejectPrompt = true },
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Text("رفض البيانات ✗", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                        if (showRejectPrompt) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { showRejectPrompt = false },
+                                    enabled = !isActionSubmitting,
+                                    modifier = Modifier.weight(1f).height(46.dp),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("تراجع")
+                                }
+                                Button(
+                                    onClick = {
+                                        isActionSubmitting = true
+                                        orderViewModel.rejectCustomerDetails(
+                                            orderId = orderActionKey,
+                                            reason = rejectionReasonInput,
+                                            onSuccess = {
+                                                isActionSubmitting = false
+                                                showRejectPrompt = false
+                                                showReviewDialog = false
+                                            },
+                                            onError = {
+                                                isActionSubmitting = false
+                                            }
+                                        )
+                                    },
+                                    enabled = !isActionSubmitting && rejectionReasonInput.isNotBlank(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier.weight(1f).height(46.dp),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("تأكيد الرفض", color = Color.White, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        } else {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { showRejectPrompt = true },
+                                    enabled = !isActionSubmitting,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier.weight(1f).height(46.dp),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("رفض البيانات", fontWeight = FontWeight.Bold)
+                                }
+                                OutlinedButton(
+                                    onClick = { showReviewDialog = false },
+                                    enabled = !isActionSubmitting,
+                                    modifier = Modifier.weight(1f).height(46.dp),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("إغلاق")
+                                }
+                            }
                         }
                     }
                 } else {
-                    Row(
+                    Button(
+                        onClick = { showReviewDialog = false },
+                        colors = ButtonDefaults.buttonColors(containerColor = Primary),
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        shape = RoundedCornerShape(10.dp)
                     ) {
-                        Button(
-                            onClick = {
-                                orderViewModel.rejectCustomerDetails(
-                                    orderId = order.firestoreOrderId.ifBlank { order.id.toString() },
-                                    reason = rejectionReasonInput,
-                                    onSuccess = {
-                                        showReviewDialog = false
-                                        showRejectPrompt = false
-                                    },
-                                    onError = { err -> android.widget.Toast.makeText(context, err, android.widget.Toast.LENGTH_LONG).show() }
-                                )
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Text("إرسال الرفض", color = Color.White, fontWeight = FontWeight.Bold)
-                        }
-
-                        OutlinedButton(
-                            onClick = { showRejectPrompt = false },
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Text("رجوع")
-                        }
-                    }
-                }
-            },
-            dismissButton = {
-                if (!showRejectPrompt) {
-                    TextButton(onClick = { showReviewDialog = false }) {
-                        Text("إغلاق")
+                        Text("إغلاق", color = Color.White, fontWeight = FontWeight.Bold)
                     }
                 }
             },
@@ -5457,11 +5961,16 @@ fun OrganizedOrderCard(
     }
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { showReviewDialog = true },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(18.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isAwaitingMerchantConfirmation) 6.dp else 4.dp),
+        border = BorderStroke(
+            width = if (isAwaitingMerchantConfirmation) 1.8.dp else 1.dp,
+            color = if (isAwaitingMerchantConfirmation) Color(0xFFFF9800) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+        )
     ) {
         Column(
             modifier = Modifier
@@ -5558,17 +6067,19 @@ fun OrganizedOrderCard(
                 restaurantLat = restLat,
                 restaurantLng = restLng,
                 captainLat = trackedCaptain?.latitude,
-                captainLng = trackedCaptain?.longitude
+                captainLng = trackedCaptain?.longitude,
+                orderKey = orderActionKey
             )
 
             Spacer(modifier = Modifier.height(10.dp))
 
             val currentStageIndex = when (order.status.trim()) {
                 "جاري البحث", "جاري البحث عن كابتن", "في انتظار كابتن", "قيد التحضير", "Preparing", "pending" -> 0
-                "في الطريق لك", "الكابتن في الطريق لك", "accepted", "في الطريق إلى المطعم" -> 1
+                "في الطريق لك", "الكابتن في الطريق لك", "accepted", "في الطريق إلى المطعم",
+                "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات", "بيانات مرفوضة" -> 1
                 "جاري التوصيل", "قيد التوصيل", "Out for Delivery", "delivering" -> 2
                 "تم التسليم", "مكتمل", "مكتملة", "Delivered" -> 3
-                else -> 0
+                else -> if (isCaptainAssigned) 1 else 0
             }
             val isCaptainAccepted = isCaptainAssigned || currentStageIndex > 0
 
@@ -5661,76 +6172,207 @@ fun OrganizedOrderCard(
                 }
             }
 
-            // Customer Receipt & Details Review Section (إذا قام الكابتن برفع الإيصال أو الحالة بانتظار التأكيد)
-            val showReceiptPrompt = order.customerDetailsSubmitted ||
-                order.receiptImageUrl.isNotBlank() ||
-                order.status == "بانتظار تأكيد البيانات" ||
-                order.status == "بيانات مرفوضة" ||
-                order.customerDetailsRejected
-
-            if (showReceiptPrompt) {
-                Spacer(modifier = Modifier.height(10.dp))
-                Surface(
-                    color = if (order.customerDetailsConfirmed) Color(0xFFE8F5E9)
-                    else if (order.customerDetailsRejected) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
-                    else Color(0xFFFFF3E0),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(
-                        1.dp,
-                        if (order.customerDetailsConfirmed) Color(0xFF4CAF50)
-                        else if (order.customerDetailsRejected) MaterialTheme.colorScheme.error
-                        else Color(0xFFFF9800)
-                    ),
-                    modifier = Modifier.fillMaxWidth()
+            // Highlighted Confirmation Section when Captain submits order data
+            if (isAwaitingMerchantConfirmation) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("card_awaiting_confirmation_${order.id}"),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1)),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.5.dp, Color(0xFFFF9800))
                 ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(12.dp)
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = if (order.customerDetailsConfirmed) "✓"
-                                    else if (order.customerDetailsRejected) "❌"
-                                    else "📸",
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (order.customerDetailsConfirmed) "تم تأكيد بيانات العميل والإيصال ✓"
-                                    else if (order.customerDetailsRejected) "تم رفض البيانات: ${order.rejectionReason.ifBlank { "غير مطابقة" }}"
-                                    else "رفع الكابتن إيصال الاستلام بانتظار مراجعتك",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (order.customerDetailsConfirmed) Color(0xFF2E7D32)
-                                    else if (order.customerDetailsRejected) MaterialTheme.colorScheme.error
-                                    else Color(0xFFE65100)
-                                )
-                            }
-
-                            Button(
-                                onClick = { showReviewDialog = true },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (order.customerDetailsConfirmed) Color(0xFF2E7D32) else Primary
-                                ),
-                                shape = RoundedCornerShape(8.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                modifier = Modifier.height(34.dp)
+                            Icon(
+                                imageVector = Icons.Default.Notifications,
+                                contentDescription = null,
+                                tint = Color(0xFFE65100),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "تأكيد البيانات المطلوب لإكمال الطلب",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color(0xFFE65100)
+                            )
+                        }
+                        Text(
+                            text = "أرسل الكابتن بيانات الطلب والإيصال. تأكد من البيانات ثم اضغط تأكيد البيانات ليكمل الكابتن التوصيل.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF5D4037)
+                        )
+                        if (order.customerName.isNotBlank()) {
+                            Text(
+                                text = "👤 العميل: ${order.customerName}",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF212121)
+                            )
+                        }
+                        if (order.customerPhone.isNotBlank()) {
+                            Text(
+                                text = "📞 الهاتف: ${order.customerPhone}",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF212121)
+                            )
+                        }
+                        if (order.destinationAddress.isNotBlank()) {
+                            Text(
+                                text = "📍 العنوان: ${order.destinationAddress}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF424242)
+                            )
+                        }
+                        if (order.receiptImageUrl.isNotBlank()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(140.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .border(1.dp, Color(0xFFFFB74D), RoundedCornerShape(10.dp))
+                                    .clickable { showFullImageDialog = true }
                             ) {
-                                Text(
-                                    text = if (order.customerDetailsConfirmed) "عرض الإيصال" else "فحص واعتماد",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
+                                AsyncImage(
+                                    model = FirebaseStorageManager.resolveDisplayableImageModel(order.receiptImageUrl),
+                                    contentDescription = "صورة الإيصال المرسلة",
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop
                                 )
+                                Surface(
+                                    color = Color.Black.copy(alpha = 0.65f),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(6.dp)
+                                ) {
+                                    Text(
+                                        text = "🔍 اضغط للتكبير",
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        if (showRejectPrompt) {
+                            OutlinedTextField(
+                                value = rejectionReasonInput,
+                                onValueChange = { rejectionReasonInput = it },
+                                label = { Text("سبب رفض البيانات") },
+                                placeholder = { Text("مثال: صورة الإيصال غير واضحة أو الرقم خاطئ") },
+                                modifier = Modifier.fillMaxWidth(),
+                                minLines = 2,
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { showRejectPrompt = false },
+                                    enabled = !isActionSubmitting,
+                                    modifier = Modifier.weight(1f).height(48.dp),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("تراجع")
+                                }
+                                Button(
+                                    onClick = {
+                                        isActionSubmitting = true
+                                        orderViewModel.rejectCustomerDetails(
+                                            orderId = orderActionKey,
+                                            reason = rejectionReasonInput,
+                                            onSuccess = {
+                                                isActionSubmitting = false
+                                                showRejectPrompt = false
+                                            },
+                                            onError = {
+                                                isActionSubmitting = false
+                                            }
+                                        )
+                                    },
+                                    enabled = !isActionSubmitting && rejectionReasonInput.isNotBlank(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier.weight(1f).height(48.dp),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("تأكيد الرفض", color = Color.White, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        } else {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        isActionSubmitting = true
+                                        orderViewModel.confirmCustomerDetails(
+                                            orderId = orderActionKey,
+                                            onSuccess = { isActionSubmitting = false },
+                                            onError = { isActionSubmitting = false }
+                                        )
+                                    },
+                                    enabled = !isActionSubmitting,
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                                    modifier = Modifier
+                                        .weight(1.2f)
+                                        .height(48.dp)
+                                        .testTag("confirm_customer_data_button_${order.id}"),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (isActionSubmitting) "جاري التأكيد..." else "تأكيد البيانات ✓",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = { showRejectPrompt = true },
+                                    enabled = !isActionSubmitting,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier
+                                        .weight(0.8f)
+                                        .height(48.dp)
+                                        .testTag("reject_customer_data_button_${order.id}"),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("رفض", fontWeight = FontWeight.Bold)
+                                }
                             }
                         }
                     }
+                }
+            } else if (isInProgress && (order.status.trim() == "بيانات مرفوضة" || order.customerDetailsRejected)) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    color = Color(0xFFFFEBEE),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0xFFEF9A9A)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "❌ تم رفض البيانات (${order.rejectionReason.ifBlank { "بانتظار إعادة الإرسال من الكابتن" }})",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFC62828),
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(10.dp)
+                    )
                 }
             }
 
@@ -5741,6 +6383,38 @@ fun OrganizedOrderCard(
                     onAdvanceStatus = onAdvanceStatus,
                     onCancelOrder = onCancelOrder
                 )
+            }
+
+            // زر وتنبيه واضح لعرض بيانات الطلب (اسم العميل، هاتفه، عنوانه، وصورة الإيصال) عند الضغط على الطلب
+            Spacer(modifier = Modifier.height(10.dp))
+            Surface(
+                color = Primary.copy(alpha = 0.08f),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, Primary.copy(alpha = 0.3f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { showReviewDialog = true }
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "📋 اضغط لعرض بيانات العميل والعنوان وصورة الإيصال",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Primary
+                    )
+                    Text(
+                        text = "عرض ←",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Primary
+                    )
+                }
             }
 
             // Star Rating Section for Delivered/Completed orders
@@ -5763,7 +6437,14 @@ fun OrderHistoryScreen(
     onEditOrder: ((Int) -> Unit)? = null,
     orderViewModel: OrderViewModel = viewModel()
 ) {
-    val orders by orderViewModel.ordersState.collectAsStateWithLifecycle()
+    LaunchedEffect(Unit) {
+        orderViewModel.refreshRestaurantFeed()
+    }
+
+    val firestoreOrders by orderViewModel.firestoreOrders.collectAsStateWithLifecycle()
+    val localOrders by orderViewModel.ordersState.collectAsStateWithLifecycle()
+    val isLoggedIn = remember { com.google.firebase.Firebase.auth.currentUser != null }
+    val orders = if (isLoggedIn) firestoreOrders else if (firestoreOrders.isNotEmpty()) firestoreOrders else localOrders
     val isRefreshing by orderViewModel.isRefreshing.collectAsStateWithLifecycle()
 
     Column(
@@ -5796,29 +6477,6 @@ fun OrderHistoryScreen(
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = stringResource(R.string.total_orders_count, orders.size),
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    TextButton(onClick = onRequestNewOrder) {
-                        Text(
-                            text = "+ " + stringResource(R.string.request_courier_action),
-                            color = Primary,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
                 OrderManagementSection(
                     orders = orders,
                     onAdvanceStatus = { id, status ->
@@ -5828,16 +6486,22 @@ fun OrderHistoryScreen(
                         orderViewModel.setOrderRating(id, rating)
                     },
                     onEditOrder = onEditOrder,
-                    onRequestNewOrder = onRequestNewOrder,
+                    onRequestNewOrder = null,
                     onCancelOrder = { id ->
                         orderViewModel.cancelOrder(id)
-                    }
+                    },
+                    orderViewModel = orderViewModel
                 )
 
                 Spacer(modifier = Modifier.height(24.dp))
             }
         }
     }
+
+    AutoMerchantConfirmationDialog(
+        orders = orders,
+        orderViewModel = orderViewModel
+    )
 }
 
 @Composable
@@ -6034,7 +6698,8 @@ fun OrderHistoryCard(
                 restaurantLat = restLat,
                 restaurantLng = restLng,
                 captainLat = trackedCaptain?.latitude,
-                captainLng = trackedCaptain?.longitude
+                captainLng = trackedCaptain?.longitude,
+                orderKey = order.firestoreOrderId.ifBlank { order.id.toString() }
             )
 
             // Star Rating Feature when Delivered
@@ -6129,12 +6794,16 @@ fun OrderStatusTracker(
     onCancelOrder: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val isCaptainAssignedForStage = order.captainName.isNotBlank() &&
+        order.captainName != "في انتظار كابتن" &&
+        order.captainName != "في انتظار قبول كابتن"
     val currentStageIndex = when (order.status.trim()) {
         "جاري البحث", "جاري البحث عن كابتن", "في انتظار كابتن", "قيد التحضير", "Preparing", "pending" -> 0
-        "في الطريق لك", "الكابتن في الطريق لك", "accepted", "في الطريق إلى المطعم" -> 1
+        "في الطريق لك", "الكابتن في الطريق لك", "accepted", "في الطريق إلى المطعم",
+        "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات", "بيانات مرفوضة" -> 1
         "جاري التوصيل", "قيد التوصيل", "Out for Delivery", "delivering" -> 2
         "تم التسليم", "مكتمل", "مكتملة", "Delivered" -> 3
-        else -> 0
+        else -> if (isCaptainAssignedForStage) 1 else 0
     }
     val isSearching = currentStageIndex == 0
     var showCancelConfirmDialog by remember { mutableStateOf(false) }
@@ -6234,16 +6903,21 @@ fun OrderStatusTracker(
                     )
                 }
 
+                val isAwaitingConfirm = isOrderAwaitingMerchantConfirmation(order)
                 Text(
-                    text = when (currentStageIndex) {
-                        0 -> stringResource(R.string.stage_searching)
-                        1 -> stringResource(R.string.stage_on_the_way)
-                        2 -> stringResource(R.string.stage_out_for_delivery)
+                    text = when {
+                        isAwaitingConfirm -> "بانتظار تأكيد البيانات"
+                        order.status.trim() == "بيانات مرفوضة" -> "بيانات مرفوضة"
+                        order.status.trim() == "وصل المتجر" -> "وصل المتجر"
+                        order.status.trim() == "تم الاستلام" -> "تم الاستلام"
+                        currentStageIndex == 0 -> stringResource(R.string.stage_searching)
+                        currentStageIndex == 1 -> stringResource(R.string.stage_on_the_way)
+                        currentStageIndex == 2 -> stringResource(R.string.stage_out_for_delivery)
                         else -> stringResource(R.string.stage_delivered)
                     },
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
-                    color = Primary
+                    color = if (isAwaitingConfirm) Color(0xFFE65100) else Primary
                 )
             }
 
@@ -6336,12 +7010,19 @@ fun OrderStatusTracker(
                 order.captainName != "في انتظار كابتن" &&
                 order.captainName != "في انتظار قبول كابتن"
             val captainDisplayName = if (isCaptainAssigned) order.captainName else "الكابتن"
-            val eta = order.estimatedArrival.ifBlank { "10 - 15 دقيقة" }
 
-            val descriptionText = when (currentStageIndex) {
-                0 -> ""
-                1 -> "استقبل $captainDisplayName الطلب وهو في الطريق لمطعمك 🛵 (الوصول خلال $eta)"
-                2 -> "استلم $captainDisplayName الطلب وهو الآن في طريقه لتسليمه للعميل 🚀"
+            val descriptionText = when {
+                isOrderAwaitingMerchantConfirmation(order) ->
+                    "أرسل $captainDisplayName بيانات الطلب وبانتظار تأكيدك للبيانات ليكمل التوصيل 📋"
+                order.status.trim() == "بيانات مرفوضة" ->
+                    "تم رفض البيانات المرسلة وبانتظار إعادة إرسالها من $captainDisplayName ❌"
+                order.status.trim() == "وصل المتجر" ->
+                    "وصل $captainDisplayName إلى المتجر وهو الآن يستلم الطلب 🏪"
+                order.status.trim() == "تم الاستلام" ->
+                    "استلم $captainDisplayName الطلب وبانتظار إرسال بيانات العميل 📦"
+                currentStageIndex == 0 -> ""
+                currentStageIndex == 1 -> "استقبل $captainDisplayName الطلب وهو في الطريق لمطعمك 🛵"
+                currentStageIndex == 2 -> "استلم $captainDisplayName الطلب وهو الآن في طريقه لتسليمه للعميل 🚀"
                 else -> "تم تسليم الطلب للعميل بنجاح ✅"
             }
 

@@ -255,8 +255,10 @@ object AutoDispatchManager {
                                 "status" to "accepted",
                                 "dispatchStatus" to "assigned",
                                 "assignedAt" to FieldValue.serverTimestamp(),
+                                "acceptedAt" to FieldValue.serverTimestamp(),
+                                "acceptedAtMillis" to System.currentTimeMillis(),
                                 "distanceToRestaurantKm" to (round(candidate.distanceKm * 100) / 100),
-                                "estimatedArrival" to "$estimatedMins دقيقة",
+                                "estimatedArrival" to "20 دقيقة",
                                 "updatedAt" to FieldValue.serverTimestamp()
                             )
                         )

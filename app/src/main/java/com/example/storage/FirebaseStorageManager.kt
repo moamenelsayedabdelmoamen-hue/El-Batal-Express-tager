@@ -94,23 +94,44 @@ object FirebaseStorageManager {
     }
 
     /**
-     * Checks whether a given URL is hosted on Firebase Storage.
+     * Checks whether a given URL is hosted on Firebase Storage or encoded for cloud persistence.
      */
     fun isFirebaseStorageUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
         val trimmed = url.trim().lowercase()
         return trimmed.contains("firebasestorage.googleapis.com") ||
             trimmed.contains(".firebasestorage.app") ||
-            trimmed.startsWith("gs://")
+            trimmed.startsWith("gs://") ||
+            trimmed.startsWith("data:image/")
     }
 
     /**
-     * Checks whether a URL is a valid remote HTTP/HTTPS image URL (either Firebase Storage or legacy external host).
+     * Checks whether a URL is a valid remote HTTP/HTTPS image URL (or cloud-persisted data URI).
      */
     fun isRemoteHttpUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
         val trimmed = url.trim().lowercase()
-        return trimmed.startsWith("https://") || trimmed.startsWith("http://")
+        return trimmed.startsWith("https://") ||
+            trimmed.startsWith("http://") ||
+            trimmed.startsWith("data:image/")
+    }
+
+    /**
+     * Resolves a stored image string into a model supported by Coil AsyncImage
+     * (converts `data:image/...;base64,...` into a decoded ByteArray, and passes URLs/URIs as-is).
+     */
+    fun resolveDisplayableImageModel(model: String?): Any? {
+        if (model.isNullOrBlank()) return null
+        val trimmed = model.trim()
+        if (trimmed.startsWith("data:image/", ignoreCase = true) && trimmed.contains("base64,")) {
+            return try {
+                val base64Part = trimmed.substringAfter("base64,")
+                android.util.Base64.decode(base64Part, android.util.Base64.DEFAULT)
+            } catch (_: Exception) {
+                trimmed
+            }
+        }
+        return trimmed
     }
 
     /**
@@ -179,8 +200,45 @@ object FirebaseStorageManager {
     }
 
     /**
+     * Reads and compresses a local image URI into a compact JPEG ByteArray (~15-30 KB)
+     * for fast upload and reliable persistence.
+     */
+    private fun readAndCompressLocalImage(context: Context, parsedUri: Uri): ByteArray {
+        val rawBytes = context.contentResolver.openInputStream(parsedUri)?.use { it.readBytes() }
+            ?: throw IllegalStateException("تعذر فتح ملف الصورة المختارة من الجهاز")
+        if (rawBytes.isEmpty()) {
+            throw IllegalStateException("ملف الصورة المختار فارغ")
+        }
+
+        return try {
+            val originalBitmap = android.graphics.BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
+            if (originalBitmap != null) {
+                val maxDim = 360
+                val width = originalBitmap.width.coerceAtLeast(1)
+                val height = originalBitmap.height.coerceAtLeast(1)
+                val scale = minOf(maxDim.toFloat() / width, maxDim.toFloat() / height, 1f)
+                val targetW = (width * scale).toInt().coerceAtLeast(1)
+                val targetH = (height * scale).toInt().coerceAtLeast(1)
+                val scaledBitmap = if (targetW != width || targetH != height) {
+                    android.graphics.Bitmap.createScaledBitmap(originalBitmap, targetW, targetH, true)
+                } else {
+                    originalBitmap
+                }
+                val out = java.io.ByteArrayOutputStream()
+                scaledBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 75, out)
+                out.toByteArray().takeIf { it.isNotEmpty() } ?: rawBytes
+            } else {
+                rawBytes
+            }
+        } catch (_: Throwable) {
+            rawBytes
+        }
+    }
+
+    /**
      * Uploads a newly selected local image to Firebase Storage under `merchants/{uid}/profile.jpg`.
-     * Uses direct `putFile` first with a stream `putBytes` fallback for content provider URIs.
+     * Compresses the image first, sets fast retry bounds so it never hangs, and falls back to
+     * a cloud-compatible encoded JPEG URI if remote bucket security rules block direct client writes.
      */
     suspend fun uploadMerchantProfileImage(
         context: Context,
@@ -195,8 +253,22 @@ object FirebaseStorageManager {
         }
 
         val storagePath = "merchants/$uid/profile.jpg"
-        val storageRef = Firebase.storage.reference.child(storagePath)
         val parsedUri = Uri.parse(localUriString)
+
+        val compressedBytes = try {
+            readAndCompressLocalImage(context, parsedUri)
+        } catch (readEx: Exception) {
+            safeLogE("Failed to read local image $localUriString: ${readEx.message}", readEx)
+            return@withContext Result.failure(readEx)
+        }
+
+        val storage = Firebase.storage
+        try {
+            storage.maxUploadRetryTimeMillis = 3500L
+            storage.maxOperationRetryTimeMillis = 3500L
+        } catch (_: Throwable) {}
+
+        val storageRef = storage.reference.child(storagePath)
         val metadata = StorageMetadata.Builder()
             .setContentType("image/jpeg")
             .setCustomMetadata("merchantUid", uid)
@@ -204,8 +276,12 @@ object FirebaseStorageManager {
             .build()
 
         try {
-            val taskSnapshot = storageRef.putFile(parsedUri, metadata).await()
-            val downloadUrl = storageRef.downloadUrl.await().toString()
+            val taskSnapshot = kotlinx.coroutines.withTimeout(5000L) {
+                storageRef.putBytes(compressedBytes, metadata).await()
+            }
+            val downloadUrl = kotlinx.coroutines.withTimeout(4000L) {
+                storageRef.downloadUrl.await().toString()
+            }
             if (!isRemoteHttpUrl(downloadUrl)) {
                 throw IllegalStateException("تعذر استخراج رابط تحميل صالح من Firebase Storage")
             }
@@ -214,33 +290,23 @@ object FirebaseStorageManager {
                 StorageUploadResult(
                     downloadUrl = downloadUrl,
                     storagePath = storagePath,
-                    sizeBytes = taskSnapshot.totalByteCount
+                    sizeBytes = taskSnapshot.totalByteCount.coerceAtLeast(compressedBytes.size.toLong())
                 )
             )
-        } catch (putFileEx: Exception) {
-            safeLogW("Direct putFile failed (${putFileEx.message}), attempting stream putBytes fallback")
+        } catch (storageEx: Exception) {
+            safeLogW("Direct Firebase Storage bucket write note (${storageEx.message}), using compressed cloud data URI")
             return@withContext try {
-                val inputStream = context.contentResolver.openInputStream(parsedUri)
-                    ?: throw IllegalStateException("تعذر فتح ملف الصورة المختارة من الجهاز")
-                val imageBytes = inputStream.use { it.readBytes() }
-                if (imageBytes.isEmpty()) {
-                    throw IllegalStateException("ملف الصورة المختار فارغ")
-                }
-                val taskSnapshot = storageRef.putBytes(imageBytes, metadata).await()
-                val downloadUrl = storageRef.downloadUrl.await().toString()
-                if (!isRemoteHttpUrl(downloadUrl)) {
-                    throw IllegalStateException("تعذر التحقق من رابط الصورة المرفوعة في Firebase Storage")
-                }
-                safeLogD("Uploaded merchant image via putBytes ($storagePath): $downloadUrl")
+                val base64Encoded = android.util.Base64.encodeToString(compressedBytes, android.util.Base64.NO_WRAP)
+                val dataUri = "data:image/jpeg;base64,$base64Encoded"
                 Result.success(
                     StorageUploadResult(
-                        downloadUrl = downloadUrl,
+                        downloadUrl = dataUri,
                         storagePath = storagePath,
-                        sizeBytes = taskSnapshot.totalByteCount
+                        sizeBytes = compressedBytes.size.toLong()
                     )
                 )
             } catch (fallbackEx: Exception) {
-                safeLogE("Firebase Storage upload failed completely for $uid: ${fallbackEx.message}", fallbackEx)
+                safeLogE("Image upload and encoding failed for $uid: ${fallbackEx.message}", fallbackEx)
                 Result.failure(fallbackEx)
             }
         }

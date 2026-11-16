@@ -1,0 +1,52 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // دالة مساعدة للتحقق من تسجيل دخول المستخدم
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // دالة للتحقق من أن الملف المرفوع صورة وحجمه أقل من 10 ميجابايت
+    function isValidImage() {
+      return request.resource != null
+          && request.resource.size < 10 * 1024 * 1024
+          && request.resource.contentType.matches('image/.*');
+    }
+
+    // 1. صور وشعارات المتاجر والمطاعم: merchants/{uid}/...
+    match /merchants/{uid}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSignedIn() && request.auth.uid == uid && isValidImage();
+    }
+
+    // 2. مسار المطاعم الإضافي: restaurants/{uid}/...
+    match /restaurants/{uid}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSignedIn() && request.auth.uid == uid && isValidImage();
+    }
+
+    // 3. صور الكباتن والمناديب: captains/{captainId}/...
+    match /captains/{captainId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSignedIn() && (request.auth.uid == captainId || isValidImage());
+    }
+
+    // 4. إيصالات الطلبات وصور الاستلام: orders/... و receipts/...
+    match /orders/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && isValidImage();
+    }
+
+    match /receipts/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && isValidImage();
+    }
+
+    // 5. السماح لأي مستخدم مسجل الدخول برفع وقراءة الصور في المسارات الأخرى داخل التطبيق
+    match /{allPaths=**} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+  }
+}

@@ -111,8 +111,7 @@ class MainActivity : ComponentActivity() {
         val isOnline by NetworkHelper.isOnline.collectAsStateWithLifecycle()
         val currentUser = Firebase.auth.currentUser
         val initialRoute = androidx.compose.runtime.remember {
-          val isGoogleUser = currentUser?.providerData?.any { it.providerId == "google.com" } == true
-          if (currentUser != null && (currentUser.isEmailVerified || isGoogleUser)) {
+          if (currentUser != null) {
             RestaurantDashboardRoute
           } else {
             LoginRoute
@@ -163,22 +162,35 @@ class MainActivity : ComponentActivity() {
             ) {
               composable<LoginRoute> {
                 LoginScreen(
-                  onLoginSuccess = { navController.navigate(SubscriptionRoute) },
+                  onLoginSuccess = {
+                    orderViewModel.listenToFirestore()
+                    navController.navigate(RestaurantDashboardRoute) {
+                      popUpTo(LoginRoute) { inclusive = true }
+                    }
+                  },
                   onRegisterClick = { navController.navigate(RegisterRoute) }
                 )
               }
               composable<RegisterRoute> {
                 RegisterScreen(
                   onRegisterSuccess = {
-                    navController.navigate(LoginRoute) {
-                      popUpTo(LoginRoute) { inclusive = true }
+                    if (Firebase.auth.currentUser != null) {
+                      orderViewModel.listenToFirestore()
+                      navController.navigate(RestaurantDashboardRoute) {
+                        popUpTo(0) { inclusive = true }
+                      }
+                    } else {
+                      navController.navigate(LoginRoute) {
+                        popUpTo(LoginRoute) { inclusive = true }
+                      }
                     }
                   }
                 )
               }
               composable<SubscriptionRoute> {
                 SubscriptionPlansScreen(
-                  onSkip = { navController.navigate(RestaurantDashboardRoute) }
+                  onSkip = { navController.popBackStack() },
+                  orderViewModel = orderViewModel
                 )
               }
               composable<RestaurantDashboardRoute> {
@@ -186,6 +198,19 @@ class MainActivity : ComponentActivity() {
                   if (Firebase.auth.currentUser == null) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
+                    }
+                  } else {
+                    val sessionMerchant = com.example.auth.MerchantAuthManager.checkExistingMerchantSession(context)
+                    if (sessionMerchant == null) {
+                      android.widget.Toast.makeText(
+                        context,
+                        "لا يمكن الدخول إلا لحساب مسجل ومؤكد في قاعدة البيانات.",
+                        android.widget.Toast.LENGTH_LONG
+                      ).show()
+                      orderViewModel.clearListeners()
+                      navController.navigate(LoginRoute) {
+                        popUpTo(0) { inclusive = true }
+                      }
                     }
                   }
                 }
@@ -255,6 +280,7 @@ class MainActivity : ComponentActivity() {
                   OrderCourierScreen(
                     onBack = { navController.popBackStack() },
                     onOrderSubmitted = { navController.navigate(OrderHistoryRoute) },
+                    onSubscribeClick = { navController.navigate(SubscriptionRoute) },
                     orderViewModel = orderViewModel
                   )
                 }

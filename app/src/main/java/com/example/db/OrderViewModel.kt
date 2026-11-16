@@ -41,6 +41,50 @@ import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.tasks.await
 
+object OrderCountdownTracker {
+    const val TOTAL_COUNTDOWN_SECONDS = 20 * 60 // 20 minutes (1200 seconds)
+    private val orderStartTimestamps = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun registerServerAcceptanceTimestamp(orderKey: String, orderNumericKey: String, captainKey: String, timestampMs: Long) {
+        if (timestampMs <= 0L) return
+        if (orderKey.isNotBlank()) {
+            orderStartTimestamps[orderKey] = timestampMs
+        }
+        if (orderNumericKey.isNotBlank()) {
+            orderStartTimestamps[orderNumericKey] = timestampMs
+        }
+        if (captainKey.isNotBlank()) {
+            orderStartTimestamps[captainKey] = timestampMs
+        }
+    }
+
+    fun getOrInitStartTimestamp(orderKey: String, captainKey: String): Long {
+        if (orderKey.isNotBlank()) {
+            val byOrder = orderStartTimestamps[orderKey]
+            if (byOrder != null && byOrder > 0L) {
+                return byOrder
+            }
+        }
+        if (captainKey.isNotBlank()) {
+            val byCaptain = orderStartTimestamps[captainKey]
+            if (byCaptain != null && byCaptain > 0L) {
+                if (orderKey.isNotBlank()) {
+                    orderStartTimestamps.putIfAbsent(orderKey, byCaptain)
+                }
+                return byCaptain
+            }
+        }
+        val now = System.currentTimeMillis()
+        if (orderKey.isNotBlank()) {
+            orderStartTimestamps.putIfAbsent(orderKey, now)
+        }
+        if (captainKey.isNotBlank()) {
+            orderStartTimestamps.putIfAbsent(captainKey, now)
+        }
+        return (if (orderKey.isNotBlank()) orderStartTimestamps[orderKey] else orderStartTimestamps[captainKey]) ?: now
+    }
+}
+
 // Safe string extraction helpers for Firestore documents to prevent ClassCastException / RuntimeException
 fun DocumentSnapshot.safeString(field: String): String? {
     try {
@@ -113,13 +157,14 @@ data class RestaurantProfile(
     val status: String = "active",
     val rating: Double = 5.0,
     val ratingCount: Long = 0L,
-    val subscriptionStatus: String = "active",
+    val subscriptionStatus: String = "unsubscribed",
     val subscriptionId: String? = null,
     val ownerId: String = "",
     val uid: String = "",
     val location: GeoPoint? = null,
     val latitude: Double? = location?.latitude,
-    val longitude: Double? = location?.longitude
+    val longitude: Double? = location?.longitude,
+    val locationUrl: String = ""
 )
 
 data class DriverProfile(
@@ -151,17 +196,20 @@ data class CaptainProfile(
 )
 
 data class SubscriptionStatusState(
+    val isSubscribed: Boolean = false,
     val isExpired: Boolean = false,
-    val status: String = "active",
+    val status: String = "unsubscribed",
+    val startDateMillis: Long? = null,
     val endDateMillis: Long? = null,
     val message: String? = null,
     val isChecking: Boolean = false,
-    val planId: Int = 1,
-    val planName: String = "الباقة الأساسية",
-    val maxCaptains: Int = 2,
+    val planId: Int = 0,
+    val planName: String = "غير مشترك",
+    val maxCaptains: Int = 0,
+    val price: Int = 0,
     val activeCaptainsCount: Int = 0,
-    val availableCaptainSlots: Int = 2,
-    val paymentStatus: String = "paid"
+    val availableCaptainSlots: Int = 0,
+    val paymentStatus: String = "unpaid"
 )
 
 class OrderViewModel(application: Application) : AndroidViewModel(application) {
@@ -208,24 +256,24 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     }
 
                     try {
-                        val ordersSnap = Firebase.firestore.collection("orders")
-                            .whereEqualTo("userId", uid)
-                            .get()
-                            .await()
-                        val firestoreList = ordersSnap.documents.mapNotNull { oDoc ->
-                            try {
-                                mapDocToOrder(oDoc)
-                            } catch (e: Exception) {
-                                Log.w("OrderViewModel", "Failed to map order doc ${oDoc.id}: ${e.message}")
-                                null
-                            }
-                        }
-                        _firestoreOrders.value = firestoreList
+                        val db = Firebase.firestore
+                        val byUser = try { db.collection("orders").whereEqualTo("userId", uid).get().await().documents } catch (_: Exception) { emptyList() }
+                        val byRest = try { db.collection("orders").whereEqualTo("restaurantId", uid).get().await().documents } catch (_: Exception) { emptyList() }
+                        val byMerch = try { db.collection("orders").whereEqualTo("merchantId", uid).get().await().documents } catch (_: Exception) { emptyList() }
+
+                        userOrdersDocs.clear()
+                        byUser.forEach { userOrdersDocs[it.id] = it }
+                        restaurantOrdersDocs.clear()
+                        byRest.forEach { restaurantOrdersDocs[it.id] = it }
+                        merchantOrdersDocs.clear()
+                        byMerch.forEach { merchantOrdersDocs[it.id] = it }
+
+                        rebuildMergedFirestoreOrders()
                     } catch (e: Exception) {
                         Log.w("OrderViewModel", "Failed to refresh orders directly: ${e.message}")
                     }
                 }
-                delay(600)
+                delay(400)
             } finally {
                 _isRefreshing.value = false
             }
@@ -323,11 +371,18 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private var profileListener: ListenerRegistration? = null
     private var merchantProfileListener: ListenerRegistration? = null
     private var ordersListener: ListenerRegistration? = null
+    private var restaurantOrdersListener: ListenerRegistration? = null
+    private var merchantOrdersListener: ListenerRegistration? = null
     private var pendingListener: ListenerRegistration? = null
     private var captainOrdersListener: ListenerRegistration? = null
     private var driverListener: ListenerRegistration? = null
     private var restaurantSubListener: ListenerRegistration? = null
     private var orderTrackingListener: ListenerRegistration? = null
+
+    private val userOrdersDocs = mutableMapOf<String, DocumentSnapshot>()
+    private val restaurantOrdersDocs = mutableMapOf<String, DocumentSnapshot>()
+    private val merchantOrdersDocs = mutableMapOf<String, DocumentSnapshot>()
+    private val captainInfoCache = mutableMapOf<String, CaptainLocationInfo>()
 
     private val _trackedCaptainInfo = MutableStateFlow<CaptainLocationInfo?>(null)
     val trackedCaptainInfo: StateFlow<CaptainLocationInfo?> = _trackedCaptainInfo.asStateFlow()
@@ -425,7 +480,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
     private val authStateListener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { auth ->
         val user = auth.currentUser
-        if (user != null && user.isEmailVerified) {
+        if (user != null) {
             listenToFirestore()
             listenToFirestoreCaptain()
         } else {
@@ -450,7 +505,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         Firebase.auth.addAuthStateListener(authStateListener)
 
         val currentUser = Firebase.auth.currentUser
-        if (currentUser != null && currentUser.isEmailVerified) {
+        if (currentUser != null) {
             listenToFirestore()
             listenToFirestoreCaptain()
         }
@@ -473,10 +528,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val status = doc.safeString("status") ?: "active"
         val rating = (doc.get("rating") as? Number)?.toDouble() ?: 5.0
         val ratingCount = (doc.get("ratingCount") as? Number)?.toLong() ?: 0L
-        val subStatus = doc.safeString("subscriptionStatus") ?: "active"
+        val subStatus = doc.safeString("subscriptionStatus") ?: "unsubscribed"
         val subId = doc.safeString("subscriptionId")
         val ownerId = doc.safeString("ownerId") ?: defaultUid
         val uid = doc.safeString("uid") ?: defaultUid
+
+        val locationUrl = doc.safeString("locationUrl")
+            ?: doc.getAnyString("mapLink", "mapUrl", "locationLink")
+            ?: ""
 
         val locationGeoPoint = doc.getGeoPoint("location")
             ?: run {
@@ -502,7 +561,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             subscriptionId = subId,
             ownerId = ownerId,
             uid = uid,
-            location = locationGeoPoint
+            location = locationGeoPoint,
+            locationUrl = locationUrl
         )
     }
 
@@ -589,7 +649,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
     fun listenToFirestore() {
         val currentUser = Firebase.auth.currentUser
-        if (currentUser == null || !currentUser.isEmailVerified) {
+        if (currentUser == null) {
             clearListeners()
             return
         }
@@ -618,6 +678,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     val mStoragePath = mSnap.safeString("storagePath")
                     val mEmail = mSnap.safeString("email")
                     val mAddress = mSnap.safeString("address")
+                    val mLocationUrl = mSnap.safeString("locationUrl")
+                        ?: mSnap.getAnyString("mapLink", "mapUrl", "locationLink")
 
                     _restaurantProfile.value = _restaurantProfile.value.copy(
                         name = if (!mName.isNullOrBlank()) mName else _restaurantProfile.value.name,
@@ -627,7 +689,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         imageUri = if (!mPhoto.isNullOrBlank()) mPhoto else _restaurantProfile.value.imageUri,
                         storagePath = if (!mStoragePath.isNullOrBlank()) mStoragePath else _restaurantProfile.value.storagePath,
                         email = if (!mEmail.isNullOrBlank()) mEmail else _restaurantProfile.value.email,
-                        address = if (!mAddress.isNullOrBlank()) mAddress else _restaurantProfile.value.address
+                        address = if (!mAddress.isNullOrBlank()) mAddress else _restaurantProfile.value.address,
+                        locationUrl = if (!mLocationUrl.isNullOrBlank()) mLocationUrl else _restaurantProfile.value.locationUrl
                     )
                 }
             }
@@ -684,33 +747,197 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-        // 2. Read / Listen to real-time orders for current user from Firestore
+        // 2. Read / Listen to real-time orders for current merchant from Firestore across userId, restaurantId, and merchantId
         ordersListener?.remove()
+        restaurantOrdersListener?.remove()
+        merchantOrdersListener?.remove()
+
         ordersListener = Firebase.firestore.collection("orders")
             .whereEqualTo("userId", uid)
             .addSnapshotListener { querySnapshot, error ->
                 if (error != null) {
                     if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        Log.w("OrderViewModel", "Orders stream PERMISSION_DENIED; detaching listener")
                         ordersListener?.remove()
                         ordersListener = null
-                    } else {
-                        Log.w("OrderViewModel", "Error reading orders from Firestore: ${error.message}")
                     }
                     return@addSnapshotListener
                 }
                 if (querySnapshot != null) {
-                    val firestoreList = querySnapshot.documents.mapNotNull { doc ->
-                        try {
-                            mapDocToOrder(doc)
-                        } catch (e: Exception) {
-                            Log.w("OrderViewModel", "Failed to map order doc ${doc.id}: ${e.message}")
-                            null
-                        }
-                    }
-                    _firestoreOrders.value = firestoreList
+                    userOrdersDocs.clear()
+                    querySnapshot.documents.forEach { userOrdersDocs[it.id] = it }
+                    rebuildMergedFirestoreOrders()
                 }
             }
+
+        restaurantOrdersListener = Firebase.firestore.collection("orders")
+            .whereEqualTo("restaurantId", uid)
+            .addSnapshotListener { querySnapshot, error ->
+                if (error != null) {
+                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        restaurantOrdersListener?.remove()
+                        restaurantOrdersListener = null
+                    }
+                    return@addSnapshotListener
+                }
+                if (querySnapshot != null) {
+                    restaurantOrdersDocs.clear()
+                    querySnapshot.documents.forEach { restaurantOrdersDocs[it.id] = it }
+                    rebuildMergedFirestoreOrders()
+                }
+            }
+
+        merchantOrdersListener = Firebase.firestore.collection("orders")
+            .whereEqualTo("merchantId", uid)
+            .addSnapshotListener { querySnapshot, error ->
+                if (error != null) {
+                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        merchantOrdersListener?.remove()
+                        merchantOrdersListener = null
+                    }
+                    return@addSnapshotListener
+                }
+                if (querySnapshot != null) {
+                    merchantOrdersDocs.clear()
+                    querySnapshot.documents.forEach { merchantOrdersDocs[it.id] = it }
+                    rebuildMergedFirestoreOrders()
+                }
+            }
+    }
+
+    private fun rebuildMergedFirestoreOrders() {
+        val mergedDocs = LinkedHashMap<String, DocumentSnapshot>()
+        userOrdersDocs.forEach { (k, v) -> mergedDocs[k] = v }
+        restaurantOrdersDocs.forEach { (k, v) -> mergedDocs[k] = v }
+        merchantOrdersDocs.forEach { (k, v) -> mergedDocs[k] = v }
+
+        val sortedDocs = mergedDocs.values.sortedByDescending { doc ->
+            val ts = doc.getTimestamp("created_at") ?: doc.getTimestamp("createdAt")
+            ts?.toDate()?.time ?: 0L
+        }
+
+        val missingCaptainIds = mutableSetOf<String>()
+
+        val mappedOrders = sortedDocs.mapNotNull { doc ->
+            try {
+                val baseOrder = mapDocToOrder(doc)
+                val captId = baseOrder.captainId?.trim().orEmpty()
+                if (captId.isNotEmpty()) {
+                    val cachedCaptain = captainInfoCache[captId]
+                    if (cachedCaptain != null) {
+                        val enrichedName = if (baseOrder.captainName.isBlank() || baseOrder.captainName == "في انتظار كابتن" || baseOrder.captainName == "الكابتن") {
+                            cachedCaptain.name.ifBlank { baseOrder.captainName }
+                        } else baseOrder.captainName
+                        val enrichedPhone = baseOrder.captainPhone.ifBlank { cachedCaptain.phone }
+                        val enrichedPhoto = baseOrder.captainPhotoUrl.ifBlank { cachedCaptain.photoUrl }
+                        baseOrder.copy(
+                            captainName = enrichedName,
+                            captainPhone = enrichedPhone,
+                            captainPhotoUrl = enrichedPhoto
+                        )
+                    } else {
+                        if (baseOrder.captainPhone.isBlank() || baseOrder.captainPhotoUrl.isBlank() || baseOrder.captainName == "الكابتن") {
+                            missingCaptainIds.add(captId)
+                        }
+                        baseOrder
+                    }
+                } else {
+                    baseOrder
+                }
+            } catch (e: Exception) {
+                Log.w("OrderViewModel", "Failed to map order doc ${doc.id}: ${e.message}")
+                null
+            }
+        }
+
+        _firestoreOrders.value = mappedOrders
+        recalculateActiveCaptainsForSubscription(mappedOrders)
+
+        // Alert merchant when a captain sends customer/order details awaiting confirmation
+        val newlyAwaiting = mappedOrders.filter { order ->
+            isOrderActiveForCaptainLimit(order.status) &&
+                (order.status == "بانتظار تأكيد البيانات" || (order.customerDetailsSubmitted && !order.customerDetailsConfirmed && !order.customerDetailsRejected))
+        }
+        for (awaitingOrder in newlyAwaiting) {
+            val notifyKey = "${awaitingOrder.firestoreOrderId.ifBlank { awaitingOrder.id.toString() }}_${awaitingOrder.receiptImageUrl}_${awaitingOrder.customerPhone}"
+            if (notifiedAwaitingConfirmationKeys.add(notifyKey)) {
+                val timeStr = SimpleDateFormat("hh:mm a", Locale("ar")).format(Date())
+                val codeLabel = if (awaitingOrder.orderCode.isNotBlank()) "#${awaitingOrder.orderCode}" else "#${awaitingOrder.id}"
+                val captLabel = awaitingOrder.captainName.ifBlank { "الكابتن" }
+                _pushNotificationState.value = PushNotificationBanner(
+                    title = "بانتظار تأكيد البيانات ($codeLabel) 📋",
+                    body = "أرسل $captLabel بيانات الطلب — يرجى تأكيد البيانات لكي يكمل الكابتن التوصيل.",
+                    timestamp = timeStr
+                )
+            }
+        }
+
+        if (missingCaptainIds.isNotEmpty()) {
+            fetchAndCacheCaptains(missingCaptainIds)
+        }
+    }
+
+    private val notifiedAwaitingConfirmationKeys = mutableSetOf<String>()
+
+    fun isOrderActiveForCaptainLimit(status: String): Boolean {
+        val s = status.trim().lowercase(Locale.ROOT)
+        val isCompleted = s in listOf("completed", "delivered", "تم التسليم", "تم التوصيل", "مكتمل", "مكتملة", "تم") ||
+            s.contains("مكتمل") || s.contains("تسليم") || s.contains("توصيل بنجاح") || s.contains("deliver")
+        val isCancelled = s in listOf("cancelled", "canceled", "ملغي", "ملغية", "تم الإلغاء", "تم الالغاء") ||
+            s.contains("ملغ") || s.contains("cancel")
+        return !isCompleted && !isCancelled
+    }
+
+    private fun recalculateActiveCaptainsForSubscription(orders: List<DeliveryOrderEntity> = _firestoreOrders.value) {
+        val currentSub = _subscriptionStatus.value
+        val activeOrdersCount = orders.count { isOrderActiveForCaptainLimit(it.status) }
+        val allowed = if (currentSub.isSubscribed && !currentSub.isExpired && currentSub.status == "active") {
+            currentSub.maxCaptains
+        } else {
+            0
+        }
+        val available = (allowed - activeOrdersCount).coerceAtLeast(0)
+        _subscriptionStatus.value = currentSub.copy(
+            activeCaptainsCount = activeOrdersCount,
+            availableCaptainSlots = available
+        )
+    }
+
+    private fun fetchAndCacheCaptains(captainIds: Set<String>) {
+        viewModelScope.launch(Dispatchers.IO) {
+            var updatedAny = false
+            val db = Firebase.firestore
+            for (captId in captainIds) {
+                if (captainInfoCache.containsKey(captId)) continue
+                try {
+                    var snap = try { db.collection("captains").document(captId).get().await() } catch (_: Exception) { null }
+                    if (snap == null || !snap.exists()) {
+                        snap = try { db.collection("drivers").document(captId).get().await() } catch (_: Exception) { null }
+                    }
+                    if (snap == null || !snap.exists()) {
+                        snap = try { db.collection("users").document(captId).get().await() } catch (_: Exception) { null }
+                    }
+                    if (snap != null && snap.exists()) {
+                        val name = snap.getAnyString("name", "driver_name", "displayName", "captainName") ?: ""
+                        val phone = snap.getAnyString("phone", "captainPhone", "driverPhone", "phoneNumber") ?: ""
+                        val photo = snap.getAnyString("profileImageUrl", "photoUrl", "driverPhotoUrl", "captainPhotoUrl", "avatarUrl") ?: ""
+                        captainInfoCache[captId] = CaptainLocationInfo(
+                            captainId = captId,
+                            name = name,
+                            phone = phone,
+                            photoUrl = photo
+                        )
+                        updatedAny = true
+                    }
+                } catch (e: Exception) {
+                    Log.w("OrderViewModel", "Could not fetch captain $captId info: ${e.message}")
+                }
+            }
+            if (updatedAny) {
+                withContext(Dispatchers.Main) {
+                    rebuildMergedFirestoreOrders()
+                }
+            }
+        }
     }
 
     fun listenToFirestoreCaptain() {
@@ -1010,13 +1237,18 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun mapDocToOrder(doc: DocumentSnapshot): DeliveryOrderEntity {
         val rawStatus = doc.getAnyString("status", "orderStatus", "status_ar") ?: "pending"
-        val mappedStatus = when (rawStatus.trim().lowercase(Locale.ROOT)) {
+        val rawStatusLower = rawStatus.trim().lowercase(Locale.ROOT)
+        val initialMappedStatus = when (rawStatusLower) {
             "pending", "قيد التحضير", "preparing", "جاري البحث عن كابتن", "في انتظار كابتن", "جاري البحث" -> "جاري البحث"
             "accepted", "الكابتن في الطريق لك", "في الطريق إلى المطعم", "في الطريق لك" -> "في الطريق لك"
             "captain_reached_store", "reached_store", "وصل المتجر" -> "وصل المتجر"
             "order_picked_up", "picked_up", "تم الاستلام" -> "تم الاستلام"
-            "waiting_merchant_confirmation", "waiting_confirmation", "بانتظار تأكيد البيانات" -> "بانتظار تأكيد البيانات"
-            "customer_confirmed", "تم تأكيد البيانات" -> "جاري التوصيل"
+            "waiting_merchant_confirmation", "waiting_confirmation", "waiting_merchant_approval",
+            "pending_confirmation", "pending_merchant_confirmation", "awaiting_confirmation",
+            "awaiting_merchant_confirmation", "details_submitted", "data_submitted",
+            "customer_details_submitted", "بانتظار تأكيد البيانات", "في انتظار تأكيد البيانات",
+            "بانتظار التأكيد", "تأكيد البيانات", "تم إرسال البيانات", "تم ارسال البيانات" -> "بانتظار تأكيد البيانات"
+            "customer_confirmed", "confirmed_by_merchant", "تم تأكيد البيانات" -> "جاري التوصيل"
             "customer_rejected", "بيانات مرفوضة" -> "بيانات مرفوضة"
             "in_progress", "out_for_delivery", "جاري التوصيل", "delivering", "في الطريق إلى العميل" -> "جاري التوصيل"
             "completed", "delivered", "تم التسليم", "مكتمل", "مكتملة", "تم التوصيل" -> "تم التسليم"
@@ -1024,24 +1256,22 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             else -> rawStatus
         }
 
-        val captainId = doc.safeString("captainId")
-        val rawDriverName = doc.getAnyString("driver_name", "captainName", "driverName")
+        val captainId = doc.getAnyString("captainId", "driverId", "captain_id")
+        val rawDriverName = doc.getAnyString("captainName", "driver_name", "driverName", "captain_name")
         val captName = if (!rawDriverName.isNullOrBlank()) rawDriverName else if (!captainId.isNullOrBlank()) "الكابتن" else "في انتظار كابتن"
 
-        val rawAddress = doc.getAnyString("address", "deliveryAddress", "destinationAddress") ?: ""
+        val rawAddress = doc.getAnyString("destinationAddress", "deliveryAddress", "address", "customerAddress", "clientAddress", "receiverAddress") ?: ""
 
-        val rawPrice = doc.getAnyString("price", "totalAmount", "serviceFee") ?: "30 جنيه"
+        val rawPrice = doc.getAnyString("serviceFee", "price", "totalAmount") ?: "30 جنيه"
 
         val formattedDate = (doc.getTimestamp("created_at") ?: doc.getTimestamp("createdAt"))?.let {
             SimpleDateFormat("dd MMMM yyyy - hh:mm a", Locale("ar")).format(it.toDate())
         } ?: doc.getAnyString("orderDate") ?: "الآن"
 
-        val restaurant = doc.getAnyString("restaurant name", "restaurantName", "restaurant") ?: "مطعم"
+        val itemsText = doc.getAnyString("orderDetails", "items", "details", "order_details") ?: ""
 
-        val itemsText = doc.getAnyString("items", "orderDetails", "details", "order_details") ?: ""
-
-        val custName = doc.getAnyString("customerName", "customer_name", "clientName") ?: restaurant
-        val custPhone = doc.getAnyString("customerPhone", "customer_phone", "clientPhone", "captainPhone", "phone") ?: ""
+        val custName = doc.getAnyString("customerName", "customer_name", "clientName", "receiverName") ?: ""
+        val custPhone = doc.getAnyString("customerPhone", "customer_phone", "clientPhone", "receiverPhone") ?: ""
         val notes = doc.getAnyString("deliveryNotes", "notes", "customerNotes") ?: ""
 
         val customerLoc = doc.getGeoPoint("customerLocation")
@@ -1049,22 +1279,71 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val custLng = customerLoc?.longitude ?: (doc.get("customerLongitude") as? Number)?.toDouble()
 
         val docRating = (doc.get("rating") as? Number)?.toInt() ?: 0
-        val captPhone = doc.getAnyString("captainPhone", "captain_phone", "driverPhone") ?: ""
-        val captPhoto = doc.getAnyString("captainPhotoUrl", "captain_photo", "driverPhoto")
-            ?: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
+        val captPhone = doc.getAnyString("captainPhone", "captain_phone", "driverPhone", "driver_phone") ?: ""
+        val captPhoto = doc.getAnyString("captainPhotoUrl", "captain_photo", "driverPhoto", "driverPhotoUrl", "captainImage") ?: ""
         val captEta = doc.getAnyString("estimatedArrival", "captainEta", "eta")
-            ?: (if (captName != "في انتظار كابتن" && captName != "في انتظار قبول كابتن") "10 - 15 دقيقة" else "")
+            ?: (if (captName != "في انتظار كابتن" && captName != "في انتظار قبول كابتن") "20 دقيقة" else "")
 
-        val receiptUrl = doc.getAnyString("receiptImageUrl", "receiptUrl", "customerReceiptUrl") ?: ""
-        val custSubmitted = doc.getBoolean("customerDetailsSubmitted") ?: (receiptUrl.isNotBlank() || mappedStatus == "بانتظار تأكيد البيانات")
-        val custConfirmed = doc.getBoolean("customerDetailsConfirmed") ?: (mappedStatus == "جاري التوصيل" && custSubmitted)
-        val custRejected = doc.getBoolean("customerDetailsRejected") ?: (mappedStatus == "بيانات مرفوضة")
+        val receiptUrl = doc.getAnyString(
+            "receiptImageUrl", "receiptUrl", "customerReceiptUrl",
+            "invoiceImageUrl", "receiptImage", "receipt_image",
+            "receipt", "receiptPhotoUrl", "invoiceUrl", "orderImageUrl"
+        ) ?: ""
+
+        val custConfirmed = (doc.getBoolean("customerDetailsConfirmed") == true) ||
+            (doc.getBoolean("merchantConfirmed") == true) ||
+            (doc.getBoolean("isConfirmed") == true) ||
+            rawStatusLower in listOf("customer_confirmed", "confirmed_by_merchant", "تم تأكيد البيانات")
+
+        val custRejected = !custConfirmed && (
+            initialMappedStatus == "بيانات مرفوضة" ||
+                (doc.getBoolean("customerDetailsRejected") == true && initialMappedStatus != "بانتظار تأكيد البيانات")
+            )
+
+        val custSubmitted = (doc.getBoolean("customerDetailsSubmitted") == true) ||
+            (doc.getBoolean("detailsSubmitted") == true) ||
+            (doc.getBoolean("isDetailsSubmitted") == true) ||
+            (doc.getBoolean("dataSubmitted") == true) ||
+            (doc.getBoolean("waitingMerchantConfirmation") == true) ||
+            (doc.getBoolean("waitingConfirmation") == true) ||
+            receiptUrl.isNotBlank() ||
+            initialMappedStatus == "بانتظار تأكيد البيانات" ||
+            custConfirmed
+
+        val isFinalDoneOrCancelled = initialMappedStatus in listOf("تم التسليم", "ملغي")
+        val mappedStatus = when {
+            isFinalDoneOrCancelled -> initialMappedStatus
+            custConfirmed -> "جاري التوصيل"
+            custRejected -> "بيانات مرفوضة"
+            custSubmitted -> "بانتظار تأكيد البيانات"
+            else -> initialMappedStatus
+        }
+
         val rejReason = doc.getAnyString("rejectionReason", "rejectReason") ?: ""
         val reachedStore = doc.getBoolean("captainReachedStore") ?: (mappedStatus == "وصل المتجر")
         val pickedUp = doc.getBoolean("orderPickedUp") ?: (mappedStatus in listOf("تم الاستلام", "بانتظار تأكيد البيانات", "جاري التوصيل", "تم التسليم"))
 
         val realFirestoreId = doc.safeString("orderId") ?: doc.id
         val orderCode = doc.getAnyString("orderCode", "code") ?: ""
+
+        val isCaptainAssignedNow = captName.isNotBlank() &&
+            captName != "في انتظار كابتن" &&
+            captName != "في انتظار قبول كابتن"
+        if (isCaptainAssignedNow) {
+            val serverAcceptedMs = (doc.getTimestamp("acceptedAt")
+                ?: doc.getTimestamp("assignedAt")
+                ?: doc.getTimestamp("accepted_at"))?.toDate()?.time
+                ?: (doc.get("acceptedAtMillis") as? Number)?.toLong()
+                ?: (doc.get("assignedAtMillis") as? Number)?.toLong()
+            if (serverAcceptedMs != null && serverAcceptedMs > 0L) {
+                OrderCountdownTracker.registerServerAcceptanceTimestamp(
+                    orderKey = realFirestoreId,
+                    orderNumericKey = realFirestoreId.hashCode().toString(),
+                    captainKey = "${captName.trim()}_${captPhone.trim()}",
+                    timestampMs = serverAcceptedMs
+                )
+            }
+        }
 
         return DeliveryOrderEntity(
             id = realFirestoreId.hashCode(),
@@ -1109,11 +1388,12 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val currentCaptainPhoto = _driverProfile.value.photoUrl.ifBlank {
             "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
         }
-        val estimatedArrivalDuration = "12 - 15 دقيقة"
+        val estimatedArrivalDuration = "20 دقيقة"
 
         viewModelScope.launch {
             try {
                 _isLoading.value = true
+                val acceptNowMs = System.currentTimeMillis()
                 val updates = hashMapOf<String, Any?>(
                     "status" to "accepted",
                     "driver_name" to currentCaptainName,
@@ -1121,7 +1401,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     "captainPhone" to currentCaptainPhone,
                     "captainPhotoUrl" to currentCaptainPhoto,
                     "captainId" to uid,
-                    "estimatedArrival" to estimatedArrivalDuration
+                    "estimatedArrival" to estimatedArrivalDuration,
+                    "acceptedAt" to FieldValue.serverTimestamp(),
+                    "assignedAt" to FieldValue.serverTimestamp(),
+                    "acceptedAtMillis" to acceptNowMs
                 )
 
                 val collectionRef = Firebase.firestore.collection("orders")
@@ -1286,22 +1569,30 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val currentUser = Firebase.auth.currentUser
-            val email = currentUser?.email.orEmpty().trim().lowercase()
-            val isSysAdmin = email == "moamen.elsayed.abdelmoamen@gmail.com" || email == "admin@elbatalexpress.com"
+            val currentSub = _subscriptionStatus.value
 
-            // Local cache subscription check (strictly for verified expired state, skipping admins)
-            if (!isSysAdmin && _subscriptionStatus.value.isExpired && _subscriptionStatus.value.status == "expired") {
-                val subMsg = "لا يمكن إنشاء الطلب: باقة اشتراك المطعم منتهية. يرجى تجديد الاشتراك."
+            // Strict check: user cannot request a captain unless subscribed to an active plan and payment succeeded
+            if (!currentSub.isSubscribed || currentSub.status != "active" || currentSub.paymentStatus == "failed" || currentSub.paymentStatus == "unpaid" || currentSub.isExpired || currentSub.maxCaptains <= 0) {
+                val subMsg = when {
+                    currentSub.paymentStatus == "failed" || currentSub.status == "payment_failed" ->
+                        "لا يمكن عمل طلب كابتن: فشلت عملية الدفع للباقة ولم يتم تأكيد الاشتراك من السيرفر. يرجى إتمام الدفع بنجاح أولاً."
+                    currentSub.isExpired || currentSub.status == "expired" ->
+                        "لا يمكن إنشاء الطلب: باقة اشتراك المطعم منتهية. يرجى تجديد الاشتراك."
+                    else ->
+                        "لا يمكن عمل طلب كابتن: أنت غير مشترك في أي باقة حالياً. يرجى الاشتراك في باقة أولاً."
+                }
                 _snackbarMessage.value = subMsg
                 onError?.invoke(subMsg)
                 return@launch
             }
 
-            // Check concurrent captain capacity limit (skipping admins)
-            val allowedCaptains = _subscriptionStatus.value.maxCaptains
-            val activeCaptains = _subscriptionStatus.value.activeCaptainsCount
-            if (!isSysAdmin && activeCaptains >= allowedCaptains && allowedCaptains > 0) {
-                val limitMsg = "لقد وصلت للحد الأقصى لعدد الكباتن المتزامنين المسموح بهم في باقتك ($allowedCaptains كباتن). يرجى انتظار انتهاء أحد الطلبات الجارية أو ترقية الباقة."
+            // Check concurrent captain capacity limit (2 -> blocks 3rd, 4 -> blocks 5th, 6 -> blocks 7th, 8 -> blocks 9th)
+            val allowedCaptains = currentSub.maxCaptains
+            val liveActiveOrdersCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) }
+            val activeCaptains = maxOf(currentSub.activeCaptainsCount, liveActiveOrdersCount)
+            if (activeCaptains >= allowedCaptains && allowedCaptains > 0) {
+                val nextCaptainNumber = allowedCaptains + 1
+                val limitMsg = "لا يمكنك طلب الكابتن رقم $nextCaptainNumber حالياً لأنك مشترك في باقة $allowedCaptains كابتن ولديك $activeCaptains طلبات نشطة في نفس الوقت. يمكنك طلب كابتن جديد فور انتهاء أي طلب من الطلبات النشطة."
                 _snackbarMessage.value = limitMsg
                 onError?.invoke(limitMsg)
                 return@launch
@@ -1372,39 +1663,42 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             if (uid.isNotEmpty()) {
                 try {
                     firestore.runTransaction { transaction ->
-                        // 1. Subscription verification (admins always pass)
-                        if (!isSysAdmin) {
-                            val subRef = firestore.collection("subscriptions").document(uid)
-                            val subDoc = transaction.get(subRef)
-                            if (subDoc.exists()) {
-                                val subStatus = subDoc.safeString("status")
-                                    ?: subDoc.safeString("subscriptionStatus")
-                                    ?: "active"
-                                val endDate = subDoc.getTimestamp("endDate")
-                                    ?: subDoc.getTimestamp("subscriptionEndDate")
-                                if (subStatus in listOf("expired", "suspended", "cancelled")) {
-                                    throw IllegalStateException("باقة الاشتراك غير نشطة ($subStatus). يرجى تجديد الاشتراك.")
-                                }
-                                if (endDate != null && endDate.toDate().before(Date())) {
-                                    throw IllegalStateException("باقة الاشتراك منتهية الصلاحية. يرجى تجديد الاشتراك.")
-                                }
-                            } else {
-                                // Fallback to restaurants document
-                                val restRef = firestore.collection("restaurants").document(uid)
-                                val restDoc = transaction.get(restRef)
-                                if (restDoc.exists()) {
-                                    val restSubStatus = restDoc.safeString("subscriptionStatus")
-                                        ?: restDoc.safeString("status")
-                                        ?: "active"
-                                    val restEndDate = restDoc.getTimestamp("subscriptionEndDate")
-                                        ?: restDoc.getTimestamp("endDate")
-                                    if (restSubStatus in listOf("expired", "suspended", "cancelled")) {
-                                        throw IllegalStateException("اشتراك المطعم غير نشط ($restSubStatus).")
-                                    }
-                                    if (restEndDate != null && restEndDate.toDate().before(Date())) {
-                                        throw IllegalStateException("باقة اشتراك المطعم منتهية الصلاحية.")
-                                    }
-                                }
+                        // 1. Strict Subscription verification in Firestore (checks subscriptions/{uid} and restaurants/{uid})
+                        val subRef = firestore.collection("subscriptions").document(uid)
+                        val restRef = firestore.collection("restaurants").document(uid)
+                        val subSnap = try { transaction.get(subRef) } catch (_: Exception) { null }
+                        val restSnap = try { transaction.get(restRef) } catch (_: Exception) { null }
+                        val activeDoc = when {
+                            subSnap != null && subSnap.exists() -> subSnap
+                            restSnap != null && restSnap.exists() -> restSnap
+                            else -> null
+                        }
+                        if (activeDoc != null) {
+                            val subStatus = activeDoc.safeString("status")
+                                ?: activeDoc.safeString("subscriptionStatus")
+                                ?: "active"
+                            val subPaymentStatus = activeDoc.safeString("paymentStatus")?.lowercase(Locale.ROOT) ?: "paid"
+                            val endDate = activeDoc.getTimestamp("endDate")
+                                ?: activeDoc.getTimestamp("subscriptionEndDate")
+                            if (subPaymentStatus in listOf("failed", "unpaid", "pending") || subStatus.equals("payment_failed", ignoreCase = true)) {
+                                throw IllegalStateException("لا يمكن عمل طلب كابتن: فشلت عملية الدفع للباقة ولم يتم تأكيد الاشتراك.")
+                            }
+                            if (!subStatus.equals("active", ignoreCase = true)) {
+                                throw IllegalStateException("باقة الاشتراك غير نشطة ($subStatus). يرجى الاشتراك في باقة أولاً.")
+                            }
+                            if (endDate != null && endDate.toDate().before(Date())) {
+                                throw IllegalStateException("باقة الاشتراك منتهية الصلاحية. يرجى تجديد الاشتراك.")
+                            }
+                            val subMaxCaptains = (activeDoc.get("maxCaptains") as? Number)?.toInt()
+                                ?: (activeDoc.get("captains") as? Number)?.toInt()
+                                ?: activeDoc.safeString("maxCaptains")?.toIntOrNull()
+                                ?: currentSub.maxCaptains
+                            if (subMaxCaptains <= 0) {
+                                throw IllegalStateException("لا يمكن عمل طلب كابتن: أنت غير مشترك في باقة صالحة.")
+                            }
+                            val currentActiveCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) }
+                            if (currentActiveCount >= subMaxCaptains) {
+                                throw IllegalStateException("لا يمكنك طلب الكابتن رقم ${subMaxCaptains + 1} حالياً لأن باقتك تسمح بـ $subMaxCaptains كابتن فقط في نفس الوقت. انتظر انتهاء أحد الطلبات النشطة أولاً.")
                             }
                         }
 
@@ -1454,7 +1748,19 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         val orderDocRef = firestore.collection("orders").document(orderId)
                         transaction.set(orderDocRef, orderMap)
                     }.await()
+                } catch (ruleError: IllegalStateException) {
+                    val errorMsg = ruleError.message ?: "لا يمكن عمل طلب كابتن حالياً"
+                    _snackbarMessage.value = errorMsg
+                    onError?.invoke(errorMsg)
+                    return@launch
                 } catch (e: Exception) {
+                    val causeIllegalState = (e.cause as? IllegalStateException)
+                    if (causeIllegalState != null) {
+                        val errorMsg = causeIllegalState.message ?: "لا يمكن عمل طلب كابتن حالياً"
+                        _snackbarMessage.value = errorMsg
+                        onError?.invoke(errorMsg)
+                        return@launch
+                    }
                     Log.w("OrderViewModel", "Transaction failed, attempting direct order creation fallback: ${e.message}", e)
                     try {
                         val fallbackCode = if (allocatedCode.isNotBlank()) allocatedCode else generateDistinct6DigitCode()
@@ -1485,7 +1791,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } else {
-                allocatedCode = generateDistinct6DigitCode()
+                val noAuthMsg = "يرجى تسجيل الدخول أولاً لطلب كابتن"
+                _snackbarMessage.value = noAuthMsg
+                onError?.invoke(noAuthMsg)
+                return@launch
             }
 
             // Save to local Room database
@@ -1566,7 +1875,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 val assignedCaptainPhoto = _driverProfile.value.photoUrl.ifBlank {
                     "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
                 }
-                val assignedEta = "12 - 15 دقيقة"
+                val assignedEta = "20 دقيقة"
 
                 repository.updateOrder(
                     targetOrder.copy(
@@ -1632,6 +1941,49 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun findMerchantOrderDocument(orderId: Any): DocumentSnapshot? {
+        val idStr = orderId.toString().trim()
+        val numericId = idStr.toIntOrNull()
+        val firestore = Firebase.firestore
+
+        // 1. Check in-memory live orders cache for exact Firestore document ID
+        val cachedMatch = _firestoreOrders.value.find {
+            it.firestoreOrderId == idStr || it.id.toString() == idStr || (numericId != null && it.id == numericId)
+        }
+        val candidateDocId = cachedMatch?.firestoreOrderId?.takeIf { it.isNotBlank() } ?: idStr
+
+        // 2. Direct document lookup (allowed by Firestore rules for owner)
+        if (candidateDocId.isNotBlank()) {
+            try {
+                val directSnap = firestore.collection("orders").document(candidateDocId).get().await()
+                if (directSnap.exists()) return directSnap
+            } catch (e: Exception) {
+                Log.w("OrderViewModel", "Direct order lookup note for $candidateDocId: ${e.message}")
+            }
+        }
+
+        // 3. Scoped queries restricted to current merchant UID (compliant with Firestore rules)
+        val uid = Firebase.auth.currentUser?.uid ?: return null
+        val ownerFields = listOf("restaurantId", "merchantId", "userId")
+        for (field in ownerFields) {
+            try {
+                val snap = firestore.collection("orders")
+                    .whereEqualTo(field, uid)
+                    .get()
+                    .await()
+                val match = snap.documents.find { doc ->
+                    doc.id == idStr ||
+                        doc.safeString("orderId") == idStr ||
+                        (numericId != null && (doc.id.hashCode() == numericId || doc.safeString("orderId")?.hashCode() == numericId))
+                }
+                if (match != null) return match
+            } catch (e: Exception) {
+                Log.w("OrderViewModel", "Scoped order query ($field) note: ${e.message}")
+            }
+        }
+        return null
+    }
+
     fun confirmCustomerDetails(
         orderId: Any,
         onSuccess: () -> Unit = {},
@@ -1646,36 +1998,45 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
             try {
                 _isLoading.value = true
-                val uid = Firebase.auth.currentUser?.uid ?: ""
-                val collectionRef = Firebase.firestore.collection("orders")
-                val querySnapshot = collectionRef.get().await()
-
-                val matchedDoc = querySnapshot.documents.find { doc ->
-                    doc.id == orderId.toString() ||
-                    doc.safeString("orderId") == orderId.toString() ||
-                    doc.id.hashCode() == orderId.toString().toIntOrNull() ||
-                    doc.safeString("orderId")?.hashCode() == orderId.toString().toIntOrNull()
-                }
+                val matchedDoc = findMerchantOrderDocument(orderId)
 
                 if (matchedDoc != null) {
                     val updates = hashMapOf<String, Any?>(
                         "customerDetailsConfirmed" to true,
+                        "merchantConfirmed" to true,
+                        "isConfirmed" to true,
                         "customerDetailsRejected" to false,
+                        "rejectionReason" to "",
                         "confirmedAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp(),
                         "status" to "customer_confirmed",
+                        "orderStatus" to "customer_confirmed",
                         "status_ar" to "جاري التوصيل"
                     )
                     matchedDoc.reference.update(updates).await()
 
+                    // Update in-memory list immediately so UI reflects confirmation right away
+                    val docRealId = matchedDoc.safeString("orderId") ?: matchedDoc.id
+                    _firestoreOrders.value = _firestoreOrders.value.map { item ->
+                        if (item.firestoreOrderId == docRealId || item.id == docRealId.hashCode() || item.id.toString() == orderId.toString()) {
+                            item.copy(
+                                status = "جاري التوصيل",
+                                customerDetailsConfirmed = true,
+                                customerDetailsRejected = false,
+                                rejectionReason = ""
+                            )
+                        } else item
+                    }
+
                     // Also update local Room database
                     try {
-                        val intId = orderId.toString().toIntOrNull() ?: matchedDoc.id.hashCode()
+                        val intId = orderId.toString().toIntOrNull() ?: docRealId.hashCode()
                         repository.updateOrderStatus(intId, "جاري التوصيل")
                     } catch (e: Exception) {
                         Log.w("OrderViewModel", "Failed to update local status: ${e.message}")
                     }
 
-                    _snackbarMessage.value = "تم تأكيد بيانات العميل والإيصال بنجاح ✓ الكابتن سيواصل التوصيل الآن."
+                    _snackbarMessage.value = "تم تأكيد البيانات بنجاح ✓ يمكن للكابتن إكمال توصيل الطلب الآن."
                     onSuccess()
                 } else {
                     val notFound = "الطلب غير موجود في قاعدة البيانات"
@@ -1714,29 +2075,39 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
             try {
                 _isLoading.value = true
-                val collectionRef = Firebase.firestore.collection("orders")
-                val querySnapshot = collectionRef.get().await()
-
-                val matchedDoc = querySnapshot.documents.find { doc ->
-                    doc.id == orderId.toString() ||
-                    doc.safeString("orderId") == orderId.toString() ||
-                    doc.id.hashCode() == orderId.toString().toIntOrNull() ||
-                    doc.safeString("orderId")?.hashCode() == orderId.toString().toIntOrNull()
-                }
+                val matchedDoc = findMerchantOrderDocument(orderId)
 
                 if (matchedDoc != null) {
                     val updates = hashMapOf<String, Any?>(
                         "customerDetailsRejected" to true,
                         "customerDetailsConfirmed" to false,
+                        "merchantConfirmed" to false,
+                        "isConfirmed" to false,
+                        "customerDetailsSubmitted" to false,
                         "rejectionReason" to reason.trim(),
                         "rejectedAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp(),
                         "status" to "customer_rejected",
+                        "orderStatus" to "customer_rejected",
                         "status_ar" to "بيانات مرفوضة"
                     )
                     matchedDoc.reference.update(updates).await()
 
+                    val docRealId = matchedDoc.safeString("orderId") ?: matchedDoc.id
+                    _firestoreOrders.value = _firestoreOrders.value.map { item ->
+                        if (item.firestoreOrderId == docRealId || item.id == docRealId.hashCode() || item.id.toString() == orderId.toString()) {
+                            item.copy(
+                                status = "بيانات مرفوضة",
+                                customerDetailsSubmitted = false,
+                                customerDetailsConfirmed = false,
+                                customerDetailsRejected = true,
+                                rejectionReason = reason.trim()
+                            )
+                        } else item
+                    }
+
                     try {
-                        val intId = orderId.toString().toIntOrNull() ?: matchedDoc.id.hashCode()
+                        val intId = orderId.toString().toIntOrNull() ?: docRealId.hashCode()
                         repository.updateOrderStatus(intId, "بيانات مرفوضة")
                     } catch (e: Exception) {
                         Log.w("OrderViewModel", "Failed to update local status: ${e.message}")
@@ -1921,13 +2292,26 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun parseCoordinatesFromUrl(url: String): GeoPoint? {
+        if (url.isBlank()) return null
+        val coordRegex = Regex("""(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})""")
+        val match = coordRegex.find(url) ?: return null
+        val lat = match.groupValues.getOrNull(1)?.toDoubleOrNull() ?: return null
+        val lng = match.groupValues.getOrNull(2)?.toDoubleOrNull() ?: return null
+        if (lat in -90.0..90.0 && lng in -180.0..180.0) {
+            return GeoPoint(lat, lng)
+        }
+        return null
+    }
+
     fun saveRestaurantProfile(
         name: String,
         phone: String,
         address: String,
         imageUri: String?,
         latitude: Double? = null,
-        longitude: Double? = null
+        longitude: Double? = null,
+        locationUrl: String = _restaurantProfile.value.locationUrl
     ) {
         if (!NetworkHelper.isNetworkAvailable(getApplication())) {
             val noNetMsg = "لا يمكن حفظ وتعديل البيانات: أنت غير متصل بالإنترنت!"
@@ -1953,6 +2337,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
         val uid = currentUser.uid
         val finalName = name.ifBlank { getApplication<Application>().getString(R.string.restaurant_name_default) }
+        val cleanLocationUrl = locationUrl.trim()
 
         _isSaving.value = true
         _errorMessage.value = null
@@ -1961,7 +2346,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withTimeout(20000L) {
-                    Log.d("FIREBASE_DEBUG", "START_SAVING: UID=$uid, Name='$finalName', Phone='$phone', Address='$address', RawImageUri='$imageUri'")
+                    Log.d("FIREBASE_DEBUG", "START_SAVING: UID=$uid, Name='$finalName', Phone='$phone', Address='$address', LocationUrl='$cleanLocationUrl'")
 
                     val restDocRef = Firebase.firestore.collection("restaurants").document(uid)
                     val merchantDocRef = Firebase.firestore.collection("merchants").document(uid)
@@ -1999,13 +2384,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         uploadResult = uploadOutcome
                     )
 
-                    Log.d("FIREBASE_DEBUG", "FIRESTORE_WRITE_STARTED | Target Project: $projectId | UID: $uid | finalLogoUrl=$finalLogoUrl | storagePath=$finalStoragePath")
+                    Log.d("FIREBASE_DEBUG", "FIRESTORE_WRITE_STARTED | Target Project: $projectId | UID: $uid | finalLogoUrl=${finalLogoUrl.take(60)} | storagePath=$finalStoragePath")
 
-                    val targetLocation = if (latitude != null && longitude != null) {
-                        GeoPoint(latitude, longitude)
-                    } else {
-                        _restaurantProfile.value.location
-                    }
+                    val targetLocation = parseCoordinatesFromUrl(cleanLocationUrl)
+                        ?: if (latitude != null && longitude != null) {
+                            GeoPoint(latitude, longitude)
+                        } else {
+                            _restaurantProfile.value.location
+                        }
 
                     if (existingDoc == null || !existingDoc.exists()) {
                         // المستند غير موجود بعد: إنشاؤه بالكامل مع الحقول الأساسية المطابقة للقواعد
@@ -2016,6 +2402,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             "phone" to phone.trim(),
                             "email" to (currentUser.email ?: ""),
                             "address" to address.trim(),
+                            "locationUrl" to cleanLocationUrl,
+                            "mapLink" to cleanLocationUrl,
                             "category" to "مطعم",
                             "logoUrl" to finalLogoUrl,
                             "photoUrl" to finalLogoUrl,
@@ -2023,7 +2411,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             "status" to "active",
                             "rating" to 5.0,
                             "ratingCount" to 0L,
-                            "subscriptionStatus" to "active",
+                            "subscriptionStatus" to "unsubscribed",
                             "subscriptionId" to "",
                             "createdAt" to FieldValue.serverTimestamp(),
                             "updatedAt" to FieldValue.serverTimestamp()
@@ -2042,6 +2430,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             "phone" to phone.trim(),
                             "email" to (currentUser.email ?: ""),
                             "address" to address.trim(),
+                            "locationUrl" to cleanLocationUrl,
+                            "mapLink" to cleanLocationUrl,
                             "category" to "مطعم",
                             "logoUrl" to finalLogoUrl,
                             "photoUrl" to finalLogoUrl,
@@ -2073,6 +2463,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             "phone" to phone.trim(),
                             "email" to (currentUser.email ?: ""),
                             "address" to address.trim(),
+                            "locationUrl" to cleanLocationUrl,
+                            "mapLink" to cleanLocationUrl,
                             "role" to "merchant",
                             "status" to "approved",
                             "isApproved" to true,
@@ -2097,6 +2489,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             "displayName" to finalName,
                             "phone" to phone.trim(),
                             "address" to address.trim(),
+                            "locationUrl" to cleanLocationUrl,
+                            "mapLink" to cleanLocationUrl,
                             "logoUrl" to finalLogoUrl,
                             "photoUrl" to finalLogoUrl,
                             "updatedAt" to FieldValue.serverTimestamp()
@@ -2121,7 +2515,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         email = Firebase.auth.currentUser?.email ?: "",
                         ownerId = uid,
                         uid = uid,
-                        location = targetLocation
+                        location = targetLocation,
+                        locationUrl = cleanLocationUrl
                     )
 
                     _isSaveSuccess.value = true
@@ -2161,43 +2556,108 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        val email = currentUser.email.orEmpty().trim().lowercase()
-        val isSysAdmin = email == "moamen.elsayed.abdelmoamen@gmail.com" || email == "admin@elbatalexpress.com"
-
-        if (isSysAdmin) {
-            _subscriptionStatus.value = SubscriptionStatusState(
-                isChecking = false,
-                isExpired = false,
-                status = "active",
-                planId = 4,
-                planName = "الباقة الإدارية الشاملة",
-                maxCaptains = 99,
-                activeCaptainsCount = 0,
-                availableCaptainSlots = 99,
-                paymentStatus = "paid"
-            )
-            return
-        }
-
         _subscriptionStatus.value = _subscriptionStatus.value.copy(isChecking = true)
 
         restaurantSubListener?.remove()
+
+        fun fallbackToRestaurantOrMerchantDoc() {
+            Firebase.firestore.collection("restaurants").document(uid).get()
+                .addOnSuccessListener { restSnapshot ->
+                    val restSubStatus = restSnapshot?.safeString("subscriptionStatus")?.lowercase(Locale.ROOT)
+                    val restPayStatus = restSnapshot?.safeString("paymentStatus")?.lowercase(Locale.ROOT)
+                    val hasExplicitPlan = restSnapshot != null && restSnapshot.exists() && (
+                        (restSnapshot.getBoolean("isSubscribed") == true &&
+                            (((restSnapshot.get("planId") as? Number)?.toInt() ?: 0) > 0 ||
+                                ((restSnapshot.get("maxCaptains") as? Number)?.toInt() ?: 0) > 0)) ||
+                            restSubStatus == "payment_failed" || restPayStatus == "failed"
+                        )
+                    if (hasExplicitPlan && restSnapshot != null) {
+                        processSubscriptionDocument(uid, "restaurants", restSnapshot)
+                    } else {
+                        Firebase.firestore.collection("merchants").document(uid).get()
+                            .addOnSuccessListener { merchSnapshot ->
+                                val merchSubStatus = merchSnapshot?.safeString("subscriptionStatus")?.lowercase(Locale.ROOT)
+                                val merchPayStatus = merchSnapshot?.safeString("paymentStatus")?.lowercase(Locale.ROOT)
+                                val hasMerchantPlan = merchSnapshot != null && merchSnapshot.exists() && (
+                                    (merchSnapshot.getBoolean("isSubscribed") == true &&
+                                        (((merchSnapshot.get("planId") as? Number)?.toInt() ?: 0) > 0 ||
+                                            ((merchSnapshot.get("maxCaptains") as? Number)?.toInt() ?: 0) > 0)) ||
+                                        merchSubStatus == "payment_failed" || merchPayStatus == "failed"
+                                    )
+                                if (hasMerchantPlan && merchSnapshot != null) {
+                                    processSubscriptionDocument(uid, "merchants", merchSnapshot)
+                                } else {
+                                    _subscriptionStatus.value = SubscriptionStatusState(
+                                        isChecking = false,
+                                        isSubscribed = false,
+                                        isExpired = false,
+                                        status = "unsubscribed",
+                                        startDateMillis = null,
+                                        endDateMillis = null,
+                                        message = "أنت غير مشترك في أي باقة حالياً",
+                                        planId = 0,
+                                        planName = "غير مشترك",
+                                        maxCaptains = 0,
+                                        price = 0,
+                                        activeCaptainsCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) },
+                                        availableCaptainSlots = 0,
+                                        paymentStatus = "unpaid"
+                                    )
+                                }
+                            }
+                            .addOnFailureListener {
+                                _subscriptionStatus.value = SubscriptionStatusState(
+                                    isChecking = false,
+                                    isSubscribed = false,
+                                    isExpired = false,
+                                    status = "unsubscribed",
+                                    startDateMillis = null,
+                                    endDateMillis = null,
+                                    message = "أنت غير مشترك في أي باقة حالياً",
+                                    planId = 0,
+                                    planName = "غير مشترك",
+                                    maxCaptains = 0,
+                                    price = 0,
+                                    activeCaptainsCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) },
+                                    availableCaptainSlots = 0,
+                                    paymentStatus = "unpaid"
+                                )
+                            }
+                    }
+                }
+                .addOnFailureListener {
+                    _subscriptionStatus.value = SubscriptionStatusState(
+                        isChecking = false,
+                        isSubscribed = false,
+                        isExpired = false,
+                        status = "unsubscribed",
+                        startDateMillis = null,
+                        endDateMillis = null,
+                        message = "أنت غير مشترك في أي باقة حالياً",
+                        planId = 0,
+                        planName = "غير مشترك",
+                        maxCaptains = 0,
+                        price = 0,
+                        activeCaptainsCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) },
+                        availableCaptainSlots = 0,
+                        paymentStatus = "unpaid"
+                    )
+                }
+        }
 
         // 1. Listen directly to 'subscriptions' collection document for this merchant (Official primary source)
         restaurantSubListener = Firebase.firestore.collection("subscriptions").document(uid)
             .addSnapshotListener { subSnapshot, error ->
                 if (error != null) {
-                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        Log.w("OrderViewModel", "Subscriptions read PERMISSION_DENIED; falling back to query")
-                    } else {
-                        Log.w("OrderViewModel", "Error listening to subscriptions/$uid: ${error.message}")
-                    }
+                    Log.w("OrderViewModel", "Error listening to subscriptions/$uid: ${error.message}")
+                    fallbackToRestaurantOrMerchantDoc()
+                    return@addSnapshotListener
                 }
 
                 if (subSnapshot != null && subSnapshot.exists()) {
                     processSubscriptionDocument(uid, "subscriptions", subSnapshot)
                 } else {
-                    // Try querying 'subscriptions' collection by merchantId or restaurantId
+                    // Try querying 'subscriptions' collection by merchantId, restaurantId, or userId
                     Firebase.firestore.collection("subscriptions")
                         .whereEqualTo("merchantId", uid)
                         .limit(1)
@@ -2206,92 +2666,213 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             if (!qSnap.isEmpty) {
                                 processSubscriptionDocument(uid, "subscriptions", qSnap.documents[0])
                             } else {
-                                // Try where restaurantId == uid
-                                Firebase.firestore.collection("subscriptions")
-                                    .whereEqualTo("restaurantId", uid)
-                                    .limit(1)
-                                    .get()
-                                    .addOnSuccessListener { qSnap2 ->
-                                        if (!qSnap2.isEmpty) {
-                                            processSubscriptionDocument(uid, "subscriptions", qSnap2.documents[0])
-                                        } else {
-                                            // Fallback to 'restaurants' document
-                                            Firebase.firestore.collection("restaurants").document(uid).get()
-                                                .addOnSuccessListener { restSnapshot ->
-                                                    if (restSnapshot != null && restSnapshot.exists() && (restSnapshot.contains("subscriptionStatus") || restSnapshot.contains("subscriptionEndDate") || restSnapshot.contains("status"))) {
-                                                        processSubscriptionDocument(uid, "restaurants", restSnapshot)
-                                                    } else {
-                                                        // Auto-provision an active default subscription so the merchant is never blocked
-                                                        val thirtyDaysLater = Timestamp(Date(System.currentTimeMillis() + 30L * 24 * 3600 * 1000))
-                                                        val defaultSub = hashMapOf<String, Any>(
-                                                            "id" to uid,
-                                                            "merchantId" to uid,
-                                                            "restaurantId" to uid,
-                                                            "status" to "active",
-                                                            "subscriptionStatus" to "active",
-                                                            "planId" to 1,
-                                                            "planName" to "الباقة الأساسية",
-                                                            "maxCaptains" to 4,
-                                                            "startDate" to FieldValue.serverTimestamp(),
-                                                            "endDate" to thirtyDaysLater,
-                                                            "subscriptionEndDate" to thirtyDaysLater,
-                                                            "paymentStatus" to "paid",
-                                                            "createdAt" to FieldValue.serverTimestamp()
-                                                        )
-                                                        Firebase.firestore.collection("subscriptions").document(uid)
-                                                            .set(defaultSub, SetOptions.merge())
-
-                                                        _subscriptionStatus.value = SubscriptionStatusState(
-                                                            isChecking = false,
-                                                            isExpired = false,
-                                                            status = "active",
-                                                            planId = 1,
-                                                            planName = "الباقة الأساسية",
-                                                            maxCaptains = 4,
-                                                            activeCaptainsCount = 0,
-                                                            availableCaptainSlots = 4,
-                                                            paymentStatus = "paid"
-                                                        )
-                                                    }
-                                                }
-                                                .addOnFailureListener {
-                                                    // In case of network glitch, keep active fallback to prevent blocking
-                                                    _subscriptionStatus.value = SubscriptionStatusState(
-                                                        isChecking = false,
-                                                        isExpired = false,
-                                                        status = "active",
-                                                        planId = 1,
-                                                        planName = "الباقة الأساسية",
-                                                        maxCaptains = 4,
-                                                        activeCaptainsCount = 0,
-                                                        availableCaptainSlots = 4,
-                                                        paymentStatus = "paid"
-                                                    )
-                                                }
-                                        }
-                                    }
-                                    .addOnFailureListener {
-                                        // Fallback to restaurants
-                                        Firebase.firestore.collection("restaurants").document(uid).get()
-                                            .addOnSuccessListener { restSnapshot ->
-                                                if (restSnapshot != null && restSnapshot.exists()) {
-                                                    processSubscriptionDocument(uid, "restaurants", restSnapshot)
-                                                }
-                                            }
-                                    }
+                                fallbackToRestaurantOrMerchantDoc()
                             }
                         }
                         .addOnFailureListener {
-                            // Fallback to restaurants
-                            Firebase.firestore.collection("restaurants").document(uid).get()
-                                .addOnSuccessListener { restSnapshot ->
-                                    if (restSnapshot != null && restSnapshot.exists()) {
-                                        processSubscriptionDocument(uid, "restaurants", restSnapshot)
-                                    }
-                                }
+                            fallbackToRestaurantOrMerchantDoc()
                         }
                 }
             }
+    }
+
+    fun selectSubscriptionPlan(
+        planId: Int,
+        planName: String,
+        maxCaptains: Int,
+        price: Int,
+        walletPhone: String = "",
+        onSuccess: () -> Unit = {}
+    ) {
+        val currentSub = _subscriptionStatus.value
+        val nowMillis = System.currentTimeMillis()
+        val hasActiveUnexpiredSub = currentSub.isSubscribed &&
+            !currentSub.isExpired &&
+            currentSub.status == "active" &&
+            currentSub.maxCaptains > 0 &&
+            (currentSub.endDateMillis == null || nowMillis < currentSub.endDateMillis)
+        if (hasActiveUnexpiredSub) {
+            val expiryStr = currentSub.endDateMillis?.let {
+                SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(it))
+            } ?: "انتهاء الباقة الحالية"
+            _snackbarMessage.value = "لديك باقة نشطة حالياً (${currentSub.planName}). لا يمكن تبديل أو تغيير الباقة إلا بعد انتهاء الباقة الحالية في $expiryStr."
+            return
+        }
+
+        val uid = Firebase.auth.currentUser?.uid
+        val renewalMillis = nowMillis + 30L * 24 * 3600 * 1000
+        val renewalTimestamp = Timestamp(Date(renewalMillis))
+
+        // Optimistically update in-memory state after server confirmation so UI & captain requests work immediately
+        val currentActiveOrders = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) }
+        val slotsAvailable = (maxCaptains - currentActiveOrders).coerceAtLeast(0)
+        _subscriptionStatus.value = _subscriptionStatus.value.copy(
+            isChecking = false,
+            isSubscribed = true,
+            isExpired = false,
+            status = "active",
+            startDateMillis = nowMillis,
+            endDateMillis = renewalMillis,
+            planId = planId,
+            planName = planName,
+            maxCaptains = maxCaptains,
+            price = price,
+            activeCaptainsCount = currentActiveOrders,
+            availableCaptainSlots = slotsAvailable,
+            paymentStatus = "paid",
+            message = null
+        )
+
+        if (uid.isNullOrBlank()) {
+            _snackbarMessage.value = "تم تأكيد الاشتراك وتفعيل $planName بنجاح"
+            onSuccess()
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val subData = hashMapOf<String, Any>(
+                "id" to uid,
+                "userId" to uid,
+                "merchantId" to uid,
+                "restaurantId" to uid,
+                "planId" to planId,
+                "planName" to planName,
+                "maxCaptains" to maxCaptains,
+                "price" to price,
+                "isSubscribed" to true,
+                "isActive" to true,
+                "status" to "active",
+                "subscriptionStatus" to "active",
+                "paymentStatus" to "paid",
+                "paymentMethod" to "wallet",
+                "startDate" to FieldValue.serverTimestamp(),
+                "endDate" to renewalTimestamp,
+                "subscriptionEndDate" to renewalTimestamp,
+                "renewalDate" to renewalTimestamp,
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+            if (walletPhone.isNotBlank()) {
+                subData["walletPhone"] = walletPhone
+            }
+
+            try {
+                Firebase.firestore.collection("subscriptions").document(uid)
+                    .set(subData, SetOptions.merge())
+                    .await()
+            } catch (e: Exception) {
+                Log.w("OrderViewModel", "Note writing to subscriptions/$uid: ${e.message}")
+            }
+
+            val profileSubFields = hashMapOf<String, Any>(
+                "planId" to planId,
+                "planName" to planName,
+                "maxCaptains" to maxCaptains,
+                "price" to price,
+                "isSubscribed" to true,
+                "subscriptionStatus" to "active",
+                "paymentStatus" to "paid",
+                "paymentMethod" to "wallet",
+                "subscriptionEndDate" to renewalTimestamp
+            )
+            if (walletPhone.isNotBlank()) {
+                profileSubFields["walletPhone"] = walletPhone
+            }
+
+            try {
+                Firebase.firestore.collection("restaurants").document(uid)
+                    .set(profileSubFields, SetOptions.merge())
+                    .await()
+            } catch (e: Exception) {
+                Log.w("OrderViewModel", "Note writing subscription to restaurants/$uid: ${e.message}")
+            }
+
+            try {
+                Firebase.firestore.collection("merchants").document(uid)
+                    .set(profileSubFields, SetOptions.merge())
+                    .await()
+            } catch (e: Exception) {
+                Log.w("OrderViewModel", "Note writing subscription to merchants/$uid: ${e.message}")
+            }
+
+            withContext(Dispatchers.Main) {
+                _snackbarMessage.value = "تم تأكيد الاشتراك وحفظ $planName في قاعدة البيانات بنجاح"
+                onSuccess()
+            }
+        }
+    }
+
+    fun markSubscriptionPaymentFailed(reason: String = "فشل عملية الدفع ولم يتم تأكيد الاشتراك من السيرفر") {
+        val currentSub = _subscriptionStatus.value
+        val nowMillis = System.currentTimeMillis()
+        val hasActiveUnexpiredSub = currentSub.isSubscribed &&
+            !currentSub.isExpired &&
+            currentSub.status == "active" &&
+            currentSub.maxCaptains > 0 &&
+            (currentSub.endDateMillis == null || nowMillis < currentSub.endDateMillis)
+        if (hasActiveUnexpiredSub) {
+            _snackbarMessage.value = "باقتك الحالية نشطة وسارية ولا يمكن تغييرها قبل انتهائها."
+            return
+        }
+
+        val uid = Firebase.auth.currentUser?.uid
+        val activeOrdersCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) }
+        _subscriptionStatus.value = SubscriptionStatusState(
+            isChecking = false,
+            isSubscribed = false,
+            isExpired = false,
+            status = "payment_failed",
+            startDateMillis = null,
+            endDateMillis = null,
+            message = "فشل عملية الدفع للباقة: لا يمكن طلب كابتن إلا بعد نجاح الدفع وتأكيد الاشتراك من السيرفر.",
+            planId = 0,
+            planName = "غير مشترك (فشل الدفع)",
+            maxCaptains = 0,
+            price = 0,
+            activeCaptainsCount = activeOrdersCount,
+            availableCaptainSlots = 0,
+            paymentStatus = "failed"
+        )
+        _snackbarMessage.value = reason
+
+        if (!uid.isNullOrBlank()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val failedMap = mapOf(
+                        "isSubscribed" to false,
+                        "isActive" to false,
+                        "status" to "payment_failed",
+                        "subscriptionStatus" to "payment_failed",
+                        "paymentStatus" to "failed",
+                        "maxCaptains" to 0,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                    Firebase.firestore.collection("subscriptions").document(uid)
+                        .set(failedMap, SetOptions.merge()).await()
+                    Firebase.firestore.collection("restaurants").document(uid)
+                        .set(
+                            mapOf(
+                                "isSubscribed" to false,
+                                "subscriptionStatus" to "payment_failed",
+                                "paymentStatus" to "failed",
+                                "maxCaptains" to 0
+                            ),
+                            SetOptions.merge()
+                        )
+                    Firebase.firestore.collection("merchants").document(uid)
+                        .set(
+                            mapOf(
+                                "isSubscribed" to false,
+                                "subscriptionStatus" to "payment_failed",
+                                "paymentStatus" to "failed",
+                                "maxCaptains" to 0
+                            ),
+                            SetOptions.merge()
+                        )
+                } catch (e: Exception) {
+                    Log.w("OrderViewModel", "Note updating failed payment state in Firestore: ${e.message}")
+                }
+            }
+        }
     }
 
     private fun processSubscriptionDocument(
@@ -2299,34 +2880,55 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         collectionName: String,
         snapshot: DocumentSnapshot
     ) {
-        val email = Firebase.auth.currentUser?.email.orEmpty().trim().lowercase()
-        val isSysAdmin = email == "moamen.elsayed.abdelmoamen@gmail.com" || email == "admin@elbatalexpress.com"
-        if (isSysAdmin) {
+        val rawStatus = snapshot.getAnyString("status", "subscriptionStatus", "planStatus")?.trim()?.lowercase() ?: "unsubscribed"
+        val rawPaymentStatus = snapshot.safeString("paymentStatus")?.trim()?.lowercase() ?: "paid"
+        val endDateMillis = parseSubscriptionDateFields(
+            snapshot,
+            listOf("endDate", "subscriptionEndDate", "renewalDate", "nextBillingDate", "expiryDate", "expiresAt")
+        )
+        val startDateMillis = parseSubscriptionDateFields(
+            snapshot,
+            listOf("startDate", "subscriptionStartDate", "createdAt")
+        )
+        val currentTime = System.currentTimeMillis()
+
+        val pId = (snapshot.get("planId") as? Number)?.toInt()
+            ?: snapshot.safeString("planId")?.toIntOrNull()
+            ?: 0
+        val rawPlanName = snapshot.getAnyString("planName", "plan_name", "packageName", "title")
+
+        val isPaymentFailed = rawStatus in listOf("payment_failed", "failed") || rawPaymentStatus in listOf("failed", "unpaid", "pending")
+        val hasValidPlan = pId > 0 || !rawPlanName.isNullOrBlank()
+        if (!hasValidPlan || isPaymentFailed || rawStatus in listOf("unsubscribed", "none", "inactive")) {
             _subscriptionStatus.value = SubscriptionStatusState(
+                isChecking = false,
+                isSubscribed = false,
                 isExpired = false,
-                status = "active",
-                planId = 4,
-                planName = "الباقة الإدارية الشاملة",
-                maxCaptains = 99,
-                activeCaptainsCount = 0,
-                availableCaptainSlots = 99,
-                paymentStatus = "paid"
+                status = if (isPaymentFailed) "payment_failed" else "unsubscribed",
+                startDateMillis = null,
+                endDateMillis = null,
+                message = if (isPaymentFailed) {
+                    "فشل عملية الدفع للباقة: لا يمكن طلب كابتن إلا بعد نجاح الدفع وتأكيد الاشتراك من السيرفر."
+                } else {
+                    "أنت غير مشترك في أي باقة حالياً"
+                },
+                planId = 0,
+                planName = if (isPaymentFailed) "غير مشترك (فشل الدفع)" else "غير مشترك",
+                maxCaptains = 0,
+                price = 0,
+                activeCaptainsCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) },
+                availableCaptainSlots = 0,
+                paymentStatus = if (isPaymentFailed) "failed" else "unpaid"
             )
             return
         }
 
-        val rawStatus = snapshot.safeString("status")
-            ?: snapshot.safeString("subscriptionStatus")
-            ?: "active"
-        val endDateMillis = parseSubscriptionEndDate(snapshot)
-        val currentTime = System.currentTimeMillis()
-
         var isExpired = false
-        if (rawStatus.equals("expired", ignoreCase = true) || rawStatus.equals("suspended", ignoreCase = true) || rawStatus.equals("cancelled", ignoreCase = true)) {
+        if (rawStatus in listOf("expired", "suspended", "cancelled")) {
             isExpired = true
         } else if (endDateMillis != null && currentTime >= endDateMillis) {
             isExpired = true
-            Firebase.firestore.collection(collectionName).document(uid)
+            Firebase.firestore.collection(collectionName).document(snapshot.id)
                 .set(mapOf("subscriptionStatus" to "expired", "status" to "expired"), com.google.firebase.firestore.SetOptions.merge())
                 .addOnFailureListener { e ->
                     Log.e("OrderViewModel", "Failed to update subscriptionStatus to expired in $collectionName", e)
@@ -2334,49 +2936,75 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val displayMessage = if (isExpired) {
-            "انتهت فترة اشتراكك، يرجى التواصل مع الإدارة لتجديد الاشتراك"
+            "انتهت فترة اشتراكك، يرجى تجديد الاشتراك"
         } else null
 
-        val pId = (snapshot.get("planId") as? Number)?.toInt() ?: 1
-        val pName = snapshot.safeString("planName") ?: when (pId) {
+        val effectivePlanId = if (pId > 0) pId else when {
+            rawPlanName?.contains("8") == true || rawPlanName?.contains("المتقدمة") == true -> 4
+            rawPlanName?.contains("6") == true || rawPlanName?.contains("المميزة") == true -> 3
+            rawPlanName?.contains("4") == true || rawPlanName?.contains("المتوسطة") == true -> 2
+            else -> 1
+        }
+        val pName = rawPlanName ?: when (effectivePlanId) {
             2 -> "الباقة المتوسطة"
             3 -> "الباقة المميزة"
             4 -> "الباقة المتقدمة"
             else -> "الباقة الأساسية"
         }
-        val allowedCaptains = (snapshot.get("maxCaptains") as? Number)?.toInt() ?: when (pId) {
-            2 -> 4
-            3 -> 6
-            4 -> 8
-            else -> 4
+        val allowedCaptains = (snapshot.get("maxCaptains") as? Number)?.toInt()
+            ?: (snapshot.get("captains") as? Number)?.toInt()
+            ?: snapshot.safeString("maxCaptains")?.toIntOrNull()
+            ?: when (effectivePlanId) {
+                1 -> 2
+                2 -> 4
+                3 -> 6
+                4 -> 8
+                else -> 2
+            }
+        val planPrice = (snapshot.get("price") as? Number)?.toInt()
+            ?: (snapshot.get("amount") as? Number)?.toInt()
+            ?: snapshot.safeString("price")?.toIntOrNull()
+            ?: when (effectivePlanId) {
+                1 -> 400
+                2 -> 800
+                3 -> 1200
+                4 -> 1600
+                else -> 400
+            }
+
+        // Calculate active concurrent captain orders for this restaurant
+        val currentOrders = _firestoreOrders.value
+        val activeConcurrentCaptains = currentOrders.count { o ->
+            isOrderActiveForCaptainLimit(o.status)
         }
 
-        // Calculate active concurrent captains for this restaurant
-        val currentOrders = _firestoreOrders.value
-        val activeConcurrentCaptains = currentOrders.filter { o ->
-            !o.captainId.isNullOrBlank() &&
-            o.status !in listOf("completed", "delivered", "تم التسليم", "مكتمل", "مكتملة", "cancelled", "ملغي")
-        }.mapNotNull { it.captainId }.distinct().size
-
         val availableSlots = (allowedCaptains - activeConcurrentCaptains).coerceAtLeast(0)
+        val explicitSubscribedFlag = snapshot.getBoolean("isSubscribed")
+        val isSubActive = !isExpired &&
+            (explicitSubscribedFlag != false) &&
+            allowedCaptains > 0 &&
+            rawStatus in listOf("active", "paid", "نشط", "نشطة", "سارية")
 
         _subscriptionStatus.value = SubscriptionStatusState(
+            isSubscribed = isSubActive,
             isExpired = isExpired,
-            status = if (isExpired) "expired" else rawStatus,
+            status = if (isExpired) "expired" else if (isSubActive) "active" else rawStatus,
+            startDateMillis = startDateMillis,
             endDateMillis = endDateMillis,
             message = displayMessage,
             isChecking = false,
-            planId = pId,
+            planId = effectivePlanId,
             planName = pName,
             maxCaptains = allowedCaptains,
+            price = planPrice,
             activeCaptainsCount = activeConcurrentCaptains,
-            availableCaptainSlots = availableSlots,
+            availableCaptainSlots = if (isSubActive) availableSlots else 0,
             paymentStatus = snapshot.safeString("paymentStatus") ?: "paid"
         )
     }
 
-    private fun parseSubscriptionEndDate(snapshot: DocumentSnapshot): Long? {
-        for (field in listOf("endDate", "subscriptionEndDate")) {
+    private fun parseSubscriptionDateFields(snapshot: DocumentSnapshot, fields: List<String>): Long? {
+        for (field in fields) {
             try {
                 val timestamp = snapshot.getTimestamp(field)
                 if (timestamp != null) return timestamp.toDate().time
@@ -2417,12 +3045,21 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         merchantProfileListener?.remove()
         merchantProfileListener = null
         ordersListener?.remove()
+        ordersListener = null
+        restaurantOrdersListener?.remove()
+        restaurantOrdersListener = null
+        merchantOrdersListener?.remove()
+        merchantOrdersListener = null
         pendingListener?.remove()
         captainOrdersListener?.remove()
         driverListener?.remove()
         restaurantSubListener?.remove()
         orderTrackingListener?.remove()
         orderTrackingListener = null
+        userOrdersDocs.clear()
+        restaurantOrdersDocs.clear()
+        merchantOrdersDocs.clear()
+        _firestoreOrders.value = emptyList()
         _subscriptionStatus.value = SubscriptionStatusState(isChecking = false, isExpired = false)
     }
 }

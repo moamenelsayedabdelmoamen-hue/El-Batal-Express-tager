@@ -99,8 +99,8 @@
     <string name="add_to_order">إضافة للطلب</string>
     <string name="search_menu_hint">ابحث عن وجبة أو مشروب...</string>
     <string name="clear_menu_selection">مسح القائمة المختارة</string>
-    <string name="tab_today_orders">👉 طلبات اليوم</string>
-    <string name="tab_previous_orders">👉 الطلبات السابقة</string>
+    <string name="tab_today_orders">طلبات اليوم</string>
+    <string name="tab_previous_orders">الطلبات السابقة</string>
     <string name="filter_all">الكل</string>
     <string name="filter_in_progress">🟡 طلبات جارية</string>
     <string name="filter_completed">🟢 طلبات مكتملة</string>

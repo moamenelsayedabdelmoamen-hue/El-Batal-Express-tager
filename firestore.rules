@@ -104,18 +104,13 @@ service cloud.firestore {
         (!('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid)
       );
 
-      // Updating: Admin has full access. Restaurant owner can update their own profile,
-      // but is strictly forbidden from changing protected administrative & subscription fields.
+      // Updating: Admin has full access. Restaurant owner can update their own profile and subscription plan,
+      // but cannot arbitrarily alter rating or ratingCount.
       allow update: if isAdmin() || (
         (isRestaurantOwner(restaurantId) || isMerchant(restaurantId)) &&
         !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'subscriptionStatus',
-          'subscriptionId',
-          'subscriptionStartDate',
-          'subscriptionEndDate',
           'rating',
-          'ratingCount',
-          'status'
+          'ratingCount'
         ]) &&
         (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid || (!('uid' in resource.data) && request.resource.data.uid == request.auth.uid)) &&
         (!('ownerId' in request.resource.data) || request.resource.data.ownerId == resource.data.ownerId || (!('ownerId' in resource.data) && request.resource.data.ownerId == request.auth.uid)) &&
@@ -132,13 +127,12 @@ service cloud.firestore {
     }
 
     // Captains collection
-    // Restaurant/Merchant is strictly forbidden from listing/scraping all captains
+    // Signed-in users (merchants/admins/captains) can read captain info for order assignment & display
     match /captains/{captainId} {
-      allow get: if isAdmin() || isCaptain(captainId);
-      allow list: if isAdmin();
+      allow read: if isSignedIn();
       allow create: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
       // Captains can update their availability status, online state, location, and fcmToken.
-      // Captains CANNOT modify their admin approval status or rating.
+      // Admin or active dispatch can update availabilityStatus and currentOrderId.
       allow update: if isAdmin() || (
         isCaptain(captainId) &&
         !request.resource.data.diff(resource.data).affectedKeys().hasAny([
@@ -146,6 +140,13 @@ service cloud.firestore {
           'rating',
           'ratingCount',
           'role'
+        ])
+      ) || (
+        isSignedIn() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'availabilityStatus',
+          'currentOrderId',
+          'updatedAt'
         ])
       );
       allow delete: if isAdmin();
