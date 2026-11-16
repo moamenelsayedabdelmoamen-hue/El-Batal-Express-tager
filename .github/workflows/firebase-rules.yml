@@ -1,0 +1,24 @@
+name: Firebase Rules Validation
+on:
+  pull_request:
+    paths:
+      - "firestore.rules"
+      - "storage.rules"
+      - "firebase.json"
+      - ".github/workflows/firebase-rules.yml"
+  push:
+    branches: [main]
+    paths:
+      - "firestore.rules"
+      - "storage.rules"
+      - "firebase.json"
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --global firebase-tools
+      - run: firebase emulators:exec --only firestore,storage --project demo-elbatal "echo Firebase rules compiled"
