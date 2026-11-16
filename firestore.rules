@@ -48,7 +48,8 @@ service cloud.firestore {
 
     // Admins collection: only admins can read or manage
     match /admins/{adminId} {
-      allow read: if isSignedIn();
+      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == adminId);
+      allow list: if isAdmin();
       allow write: if isAdmin();
     }
 
@@ -113,8 +114,8 @@ service cloud.firestore {
           isSignedIn()
           && hasMerchantAccount(request.auth.uid)
           && (
-            resource.data.activeMerchantId == request.auth.uid
-            || resource.data.currentMerchantId == request.auth.uid
+            ('activeMerchantId' in resource.data && resource.data.activeMerchantId == request.auth.uid)
+            || ('currentMerchantId' in resource.data && resource.data.currentMerchantId == request.auth.uid)
           )
         );
       allow list: if isAdmin();
@@ -166,7 +167,8 @@ service cloud.firestore {
         )) ||
         (isSignedIn() && (
           resource.data.captainId == request.auth.token.captainId ||
-          resource.data.captainId == request.auth.uid
+          resource.data.captainId == request.auth.uid ||
+          resource.data.offeredCaptainId == request.auth.uid
         ));
       
       // Merchant creates order with pending status and null captainId
@@ -246,9 +248,10 @@ service cloud.firestore {
 
     // Users collection (used for user profile synchronization)
     match /users/{userId} {
-      allow read: if isSignedIn();
+      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow list: if isAdmin();
       allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
-      allow delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow delete: if isAdmin();
     }
   }
 }
