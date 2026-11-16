@@ -182,12 +182,8 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   }
 
   // 4. Query eligible captains from 'captains' collection
-  // Criteria:
-  // - isOnline == true
-  // - availabilityStatus == 'available'
-  // - status == 'approved'
-  // - currentOrderId == null
   // isOnline is the stable shared field across the captain app and admin dashboard.
+  // A shared readiness predicate handles status, presence, reception toggles, and current order.
   // Older/current clients may use presenceStatus/canReceiveOrders instead of availabilityStatus.
   const captainsSnapshot = await db.collection("captains")
     .where("isOnline", "==", true)
@@ -214,11 +210,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
     const doc = captainsSnapshot.docs[captainIndex];
     if (!isCaptainCurrentlyInShift(scheduleSnapshots[captainIndex].data())) continue;
     const data = doc.data();
-
-    // Ensure no active order
-    if (data.currentOrderId && data.currentOrderId !== null && data.currentOrderId !== "") {
-      continue;
-    }
+    if (!isCaptainReadyForDispatch(data)) continue;
 
     // Validate location existence
     const loc = data.location;
