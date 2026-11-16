@@ -251,6 +251,9 @@ service cloud.firestore {
       // Captain can update delivery progress once assigned
       allow update: if isAdmin() || 
         (isMerchantAccount() && resource.data.merchantId == request.auth.uid &&
+          request.resource.data.merchantId == resource.data.merchantId &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.orderCode == resource.data.orderCode &&
           request.resource.data.captainId == resource.data.captainId &&
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId', 'dispatchStatus', 'assignedAt'])
         ) ||
