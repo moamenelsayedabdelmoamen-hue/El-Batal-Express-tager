@@ -191,8 +191,8 @@ service cloud.firestore {
     // 2. Initial order creation must have captainId == null, dispatchStatus == 'searching', status == 'pending'.
     // 3. Selection and assignment are handled atomically by Cloud Functions / backend transactions.
     match /orders/{orderId} {
-      allow read: if isAdmin() || 
-        (isSignedIn() && (
+      allow read: if isAdmin() ||
+        (isMerchantAccount() && (
           resource.data.merchantId == request.auth.uid ||
           resource.data.userId == request.auth.uid
         )) ||
@@ -218,7 +218,7 @@ service cloud.firestore {
       // Merchant can update order details or cancel prior to assignment, but CANNOT set captainId or dispatchStatus
       // Captain can update delivery progress once assigned
       allow update: if isAdmin() || 
-        (isSignedIn() && (resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid) &&
+        (isMerchantAccount() && (resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid) &&
           request.resource.data.captainId == resource.data.captainId &&
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'dispatchStatus', 'assignedAt'])
         ) ||
