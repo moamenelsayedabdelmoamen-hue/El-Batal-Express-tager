@@ -23,7 +23,7 @@ data class DeliveryOrderEntity(
     val captainId: String? = null,
     val captainName: String = "في انتظار كابتن",
     val captainPhone: String = "",
-    val captainPhotoUrl: String = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=250&q=80",
+    val captainPhotoUrl: String = "",
     val estimatedArrival: String = "",
     val receiptImageUrl: String = "",
     val customerDetailsSubmitted: Boolean = false,

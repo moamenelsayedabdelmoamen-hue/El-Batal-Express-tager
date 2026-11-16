@@ -80,33 +80,34 @@ object AutoDispatchManager {
                 return false
             }
 
-            val restaurantId = orderSnapshot.safeString("restaurantId")
+            val merchantId = orderSnapshot.safeString("merchantId")
+                ?: orderSnapshot.safeString("restaurantId")
                 ?: orderSnapshot.safeString("userId")
                 ?: ""
 
-            if (restaurantId.isBlank()) {
-                Log.w(TAG, "Order $orderId has no associated restaurantId.")
+            if (merchantId.isBlank()) {
+                Log.w(TAG, "Order $orderId has no associated merchantId.")
                 return false
             }
 
-            // Verify restaurant subscription
-            val restDoc = firestore.collection("restaurants").document(restaurantId).get().await()
-            if (restDoc.exists()) {
-                val subStatus = restDoc.safeString("subscriptionStatus") ?: "active"
+            // Verify merchant subscription exclusively in merchants/{merchantId}
+            val merchantDoc = firestore.collection("merchants").document(merchantId).get().await()
+            if (merchantDoc.exists()) {
+                val subStatus = merchantDoc.safeString("subscriptionStatus") ?: "active"
                 if (subStatus != "active") {
-                    Log.w(TAG, "Restaurant $restaurantId has inactive subscription: $subStatus")
+                    Log.w(TAG, "Merchant $merchantId has inactive subscription: $subStatus")
                     orderDocRef.update(
                         mapOf(
                             "status" to "cancelled",
                             "dispatchStatus" to "failed",
-                            "cancelReason" to "اشتراك المطعم غير مفعل"
+                            "cancelReason" to "اشتراك التاجر غير مفعل"
                         )
                     ).await()
                     return false
                 }
             }
 
-            // Determine restaurant location
+            // Determine merchant pickup location
             var pickupLat: Double? = null
             var pickupLng: Double? = null
 
@@ -121,14 +122,14 @@ object AutoDispatchManager {
                 if (lat != null && lng != null) {
                     pickupLat = lat
                     pickupLng = lng
-                } else if (restDoc.exists()) {
-                    val restGeo = restDoc.getGeoPoint("location")
-                    if (restGeo != null) {
-                        pickupLat = restGeo.latitude
-                        pickupLng = restGeo.longitude
+                } else if (merchantDoc.exists()) {
+                    val merchGeo = merchantDoc.getGeoPoint("location")
+                    if (merchGeo != null) {
+                        pickupLat = merchGeo.latitude
+                        pickupLng = merchGeo.longitude
                     } else {
-                        pickupLat = (restDoc.get("latitude") as? Number)?.toDouble()
-                        pickupLng = (restDoc.get("longitude") as? Number)?.toDouble()
+                        pickupLat = (merchantDoc.get("latitude") as? Number)?.toDouble()
+                        pickupLng = (merchantDoc.get("longitude") as? Number)?.toDouble()
                     }
                 }
             }
@@ -171,14 +172,26 @@ object AutoDispatchManager {
                 }
 
                 val distKm = calculateHaversineDistance(pickupLat, pickupLng, loc.latitude, loc.longitude)
+                val rawPhotoCandidate = listOf(
+                    "profileImageUrl", "photoUrl", "captainPhotoUrl", "driverPhotoUrl",
+                    "avatarUrl", "imageUrl", "profileImage", "profilePhoto", "photo",
+                    "image", "avatar", "storagePath", "profileStoragePath", "photoPath"
+                ).firstNotNullOfOrNull { field ->
+                    doc.safeString(field)?.takeIf { !com.example.storage.FirebaseStorageManager.isPlaceholderAvatarUrl(it) }
+                }.orEmpty()
+                val resolvedPhoto = if (rawPhotoCandidate.isNotBlank()) {
+                    com.example.storage.FirebaseStorageManager.resolveFirebaseStorageDownloadUrl(rawPhotoCandidate)
+                        .ifBlank { com.example.storage.FirebaseStorageManager.findCaptainPhotoInStorage(doc.id) }
+                } else {
+                    com.example.storage.FirebaseStorageManager.findCaptainPhotoInStorage(doc.id)
+                }
+
                 candidates.add(
                     CandidateCaptain(
                         uid = doc.id,
                         name = doc.safeString("name") ?: "الكابتن",
                         phone = doc.safeString("phone") ?: "",
-                        photoUrl = doc.safeString("profileImageUrl")
-                            ?: doc.safeString("photoUrl")
-                            ?: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
+                        photoUrl = resolvedPhoto,
                         location = loc,
                         lastUpdateMs = lastUpdateMs,
                         distanceKm = distKm,

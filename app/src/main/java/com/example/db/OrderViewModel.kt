@@ -39,6 +39,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.tasks.await
 
 object OrderCountdownTracker {
@@ -174,14 +175,14 @@ data class DriverProfile(
     val rating: String = "5.0",
     val totalTrips: Int = 0,
     val isOnline: Boolean = true,
-    val photoUrl: String = "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
+    val photoUrl: String = ""
 )
 
 data class CaptainProfile(
     val uid: String = "",
     val name: String = "",
     val phone: String = "",
-    val profileImageUrl: String = "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80",
+    val profileImageUrl: String = "",
     val role: String = "captain",
     val status: String = "approved", // approved, pending, suspended
     val isOnline: Boolean = true,
@@ -243,16 +244,17 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             _isRefreshing.value = true
             try {
                 listenToFirestore()
-                // Fetch restaurant profile and orders from Firestore to ensure immediate fresh data
-                val uid = Firebase.auth.currentUser?.uid
-                if (uid != null) {
+                // Fetch merchant profile and orders exclusively from merchants/{uid} and orders
+                val user = Firebase.auth.currentUser
+                val uid = user?.uid
+                if (uid != null && user.isEmailVerified) {
                     try {
-                        val doc = Firebase.firestore.collection("restaurants").document(uid).get().await()
-                        if (doc != null && doc.exists()) {
+                        val doc = Firebase.firestore.collection("merchants").document(uid).get().await()
+                        if (doc != null && doc.exists() && doc.safeString("accountType")?.trim()?.lowercase() == "merchant") {
                             _restaurantProfile.value = mapDocToRestaurantProfile(doc, uid)
                         }
                     } catch (e: Exception) {
-                        Log.w("OrderViewModel", "Failed to refresh profile directly: ${e.message}")
+                        Log.w("OrderViewModel", "Failed to refresh merchant profile directly: ${e.message}")
                     }
 
                     try {
@@ -378,11 +380,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private var driverListener: ListenerRegistration? = null
     private var restaurantSubListener: ListenerRegistration? = null
     private var orderTrackingListener: ListenerRegistration? = null
+    private var captainTrackingListener: ListenerRegistration? = null
+    private var currentTrackedCaptainId: String? = null
 
     private val userOrdersDocs = mutableMapOf<String, DocumentSnapshot>()
     private val restaurantOrdersDocs = mutableMapOf<String, DocumentSnapshot>()
     private val merchantOrdersDocs = mutableMapOf<String, DocumentSnapshot>()
-    private val captainInfoCache = mutableMapOf<String, CaptainLocationInfo>()
+    private val captainInfoCache = ConcurrentHashMap<String, CaptainLocationInfo>()
 
     private val _trackedCaptainInfo = MutableStateFlow<CaptainLocationInfo?>(null)
     val trackedCaptainInfo: StateFlow<CaptainLocationInfo?> = _trackedCaptainInfo.asStateFlow()
@@ -401,21 +405,32 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             latitude = lat,
             longitude = lng
         )
-        val uid = Firebase.auth.currentUser?.uid ?: return
+        val currentUser = Firebase.auth.currentUser
+        if (currentUser == null || !currentUser.isEmailVerified) {
+            onComplete?.invoke(false)
+            return
+        }
+        val uid = currentUser.uid
         viewModelScope.launch {
             try {
-                val restDocRef = Firebase.firestore.collection("restaurants").document(uid)
+                val merchantDocRef = Firebase.firestore.collection("merchants").document(uid)
+                val existing = merchantDocRef.get().await()
+                if (!existing.exists() || existing.safeString("accountType")?.trim()?.lowercase() != "merchant") {
+                    _snackbarMessage.value = "لا يمكن حفظ الموقع: حساب التاجر غير موجود في merchants"
+                    onComplete?.invoke(false)
+                    return@launch
+                }
                 val updates = hashMapOf<String, Any>(
                     "location" to geoPoint,
                     "latitude" to lat,
                     "longitude" to lng,
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
-                restDocRef.set(updates, SetOptions.merge()).await()
-                _snackbarMessage.value = "تم حفظ موقع المطعم بنجاح"
+                merchantDocRef.set(updates, SetOptions.merge()).await()
+                _snackbarMessage.value = "تم حفظ موقع المتجر بنجاح"
                 onComplete?.invoke(true)
             } catch (e: Exception) {
-                Log.e("OrderViewModel", "Failed to update restaurant location: ${e.message}", e)
+                Log.e("OrderViewModel", "Failed to update merchant location: ${e.message}", e)
                 _snackbarMessage.value = "تعذر حفظ الموقع: ${e.localizedMessage}"
                 onComplete?.invoke(false)
             }
@@ -425,44 +440,111 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     fun startTrackingOrderCaptain(orderId: String) {
         stopTrackingOrderCaptain()
         val uid = Firebase.auth.currentUser?.uid ?: return
+        val cleanOrderId = orderId.trim()
+        if (cleanOrderId.isEmpty()) return
 
         orderTrackingListener = Firebase.firestore.collection("orders")
-            .document(orderId)
+            .document(cleanOrderId)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
-                    Log.w("OrderViewModel", "Error tracking order $orderId: ${error.message}")
+                    Log.w("OrderViewModel", "Error tracking order $cleanOrderId: ${error.message}")
                     return@addSnapshotListener
                 }
                 if (snapshot != null && snapshot.exists()) {
-                    val orderOwnerId = snapshot.safeString("userId") ?: snapshot.safeString("restaurantId")
-                    // Only track if this order belongs to current restaurant
-                    if (orderOwnerId != uid) {
+                    val ownerIds = listOfNotNull(
+                        snapshot.safeString("userId"),
+                        snapshot.safeString("restaurantId"),
+                        snapshot.safeString("merchantId")
+                    )
+                    if (uid !in ownerIds) {
                         _trackedCaptainInfo.value = null
                         return@addSnapshotListener
                     }
 
-                    val captId = snapshot.safeString("captainId") ?: snapshot.safeString("driverId") ?: ""
-                    val captName = snapshot.getAnyString("captainName", "driver_name", "driverName") ?: ""
-                    val captPhone = snapshot.getAnyString("captainPhone", "driverPhone") ?: ""
-                    val captPhoto = snapshot.getAnyString("captainPhotoUrl", "driverPhoto") ?: ""
+                    val captId = snapshot.getAnyString(
+                        "captainId", "driverId", "captain_id", "driver_id",
+                        "assignedCaptainId", "acceptedBy", "captainUid", "driverUid"
+                    ) ?: ""
+                    val orderCaptName = snapshot.getAnyString(
+                        "captainName", "driver_name", "driverName", "captain_name", "captainFullName", "driverFullName"
+                    ) ?: ""
+                    val orderCaptPhone = snapshot.getAnyString(
+                        "captainPhone", "captain_phone", "driverPhone", "driver_phone",
+                        "captainMobile", "driverMobile", "captainPhoneNumber"
+                    ) ?: ""
+                    val rawCaptPhoto = snapshot.getAnyString(
+                        "captainPhotoUrl", "captain_photo_url", "captain_photo", "captainPhoto",
+                        "driverPhotoUrl", "driver_photo_url", "driverPhoto", "driver_photo",
+                        "captainImage", "captainImageUrl", "driverImage", "driverImageUrl",
+                        "captainAvatar", "driverAvatar", "captainProfileImage", "driverProfileImage",
+                        "captainLogo", "driverLogo", "captainStoragePath", "captainPhotoPath", "driverStoragePath"
+                    ) ?: ""
+                    val cachedCaptain = if (captId.isNotBlank()) captainInfoCache[captId] else null
+                    val resolvedOrderPath = if (rawCaptPhoto.isNotBlank() &&
+                        !FirebaseStorageManager.isRemoteHttpUrl(rawCaptPhoto) &&
+                        !FirebaseStorageManager.isPlaceholderAvatarUrl(rawCaptPhoto) &&
+                        !FirebaseStorageManager.isLocalDeviceUri(rawCaptPhoto)
+                    ) {
+                        resolvedOrderStoragePhotoCache[rawCaptPhoto].orEmpty()
+                    } else ""
+
+                    val mergedName = FirebaseStorageManager.selectAuthoritativeCaptainName(
+                        captainDocName = cachedCaptain?.name,
+                        orderDocName = orderCaptName,
+                        captainId = captId
+                    )
+                    val mergedPhone = FirebaseStorageManager.selectAuthoritativeCaptainPhone(
+                        captainDocPhone = cachedCaptain?.phone,
+                        orderDocPhone = orderCaptPhone
+                    )
+                    val mergedPhoto = FirebaseStorageManager.selectBestCaptainPhotoUrl(
+                        captainDocPhotoUrl = cachedCaptain?.photoUrl,
+                        resolvedOrderStorageUrl = resolvedOrderPath,
+                        orderDocPhotoUrl = rawCaptPhoto
+                    )
+
                     val status = snapshot.safeString("status") ?: ""
                     val eta = snapshot.safeString("estimatedArrival") ?: ""
-
                     val captainGeo = snapshot.getGeoPoint("captainLocation")
-                    val captLat = captainGeo?.latitude ?: (snapshot.get("captainLatitude") as? Number)?.toDouble()
-                    val captLng = captainGeo?.longitude ?: (snapshot.get("captainLongitude") as? Number)?.toDouble()
+                    val captLat = captainGeo?.latitude
+                        ?: (snapshot.get("captainLatitude") as? Number)?.toDouble()
+                        ?: cachedCaptain?.latitude
+                    val captLng = captainGeo?.longitude
+                        ?: (snapshot.get("captainLongitude") as? Number)?.toDouble()
+                        ?: cachedCaptain?.longitude
 
-                    if (captId.isNotBlank() || captName.isNotBlank()) {
+                    if (captId.isNotBlank() && captId != currentTrackedCaptainId) {
+                        attachCaptainProfileListener(captId)
+                    }
+
+                    if (captId.isNotBlank() || FirebaseStorageManager.isValidCaptainName(mergedName)) {
                         _trackedCaptainInfo.value = CaptainLocationInfo(
                             captainId = captId,
-                            name = captName,
-                            phone = captPhone,
-                            photoUrl = captPhoto,
+                            name = mergedName,
+                            phone = mergedPhone,
+                            photoUrl = mergedPhoto,
                             latitude = captLat,
                             longitude = captLng,
                             status = status,
                             estimatedArrival = eta
                         )
+                        if (captId.isNotBlank() && (
+                                cachedCaptain == null ||
+                                    !FirebaseStorageManager.isValidCaptainName(cachedCaptain.name) ||
+                                    cachedCaptain.phone.isBlank() ||
+                                    !FirebaseStorageManager.isFirebaseStorageUrl(cachedCaptain.photoUrl)
+                                )
+                        ) {
+                            fetchAndCacheCaptains(
+                                captainIds = setOf(captId),
+                                storagePathsToResolve = if (resolvedOrderPath.isBlank() &&
+                                    rawCaptPhoto.isNotBlank() &&
+                                    !FirebaseStorageManager.isRemoteHttpUrl(rawCaptPhoto) &&
+                                    !FirebaseStorageManager.isPlaceholderAvatarUrl(rawCaptPhoto) &&
+                                    !FirebaseStorageManager.isLocalDeviceUri(rawCaptPhoto)
+                                ) setOf(rawCaptPhoto) else emptySet()
+                            )
+                        }
                     } else {
                         _trackedCaptainInfo.value = null
                     }
@@ -472,17 +554,76 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
     }
 
+    private fun attachCaptainProfileListener(captId: String) {
+        captainTrackingListener?.remove()
+        captainTrackingListener = null
+        currentTrackedCaptainId = captId
+
+        captainTrackingListener = Firebase.firestore.collection("captains")
+            .document(captId)
+            .addSnapshotListener { captSnap, error ->
+                if (error != null) {
+                    Log.w("OrderViewModel", "Error listening to captain $captId: ${error.message}")
+                    return@addSnapshotListener
+                }
+                if (captSnap != null && captSnap.exists()) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        val realName = captSnap.getAnyString(
+                            "name", "fullName", "full_name", "driver_name", "driverName", "displayName", "captainName", "userName"
+                        ) ?: ""
+                        val realPhone = captSnap.getAnyString(
+                            "phone", "phoneNumber", "phone_number", "mobile", "mobileNumber", "captainPhone", "driverPhone"
+                        ) ?: ""
+                        val realPhoto = extractCaptainPhotoFromDoc(captSnap, captSnap.id, captId)
+                        val geo = captSnap.getGeoPoint("location") ?: captSnap.getGeoPoint("currentLocation")
+                        val lat = geo?.latitude ?: (captSnap.get("latitude") as? Number)?.toDouble()
+                        val lng = geo?.longitude ?: (captSnap.get("longitude") as? Number)?.toDouble()
+
+                        val info = CaptainLocationInfo(
+                            captainId = captId,
+                            name = realName,
+                            phone = realPhone,
+                            photoUrl = realPhoto,
+                            latitude = lat,
+                            longitude = lng
+                        )
+                        captainInfoCache[captId] = info
+                        if (realPhone.isNotBlank()) {
+                            captainInfoByPhoneCache[realPhone.trim()] = info
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            val currentTracked = _trackedCaptainInfo.value
+                            if (currentTracked != null && (currentTracked.captainId == captId || currentTracked.captainId.isBlank())) {
+                                _trackedCaptainInfo.value = currentTracked.copy(
+                                    captainId = captId,
+                                    name = FirebaseStorageManager.selectAuthoritativeCaptainName(realName, currentTracked.name, captId),
+                                    phone = FirebaseStorageManager.selectAuthoritativeCaptainPhone(realPhone, currentTracked.phone),
+                                    photoUrl = FirebaseStorageManager.selectBestCaptainPhotoUrl(realPhoto, null, currentTracked.photoUrl),
+                                    latitude = lat ?: currentTracked.latitude,
+                                    longitude = lng ?: currentTracked.longitude
+                                )
+                            }
+                            rebuildMergedFirestoreOrders()
+                        }
+                    }
+                }
+            }
+    }
+
     fun stopTrackingOrderCaptain() {
         orderTrackingListener?.remove()
         orderTrackingListener = null
+        captainTrackingListener?.remove()
+        captainTrackingListener = null
+        currentTrackedCaptainId = null
         _trackedCaptainInfo.value = null
     }
 
     private val authStateListener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { auth ->
         val user = auth.currentUser
-        if (user != null) {
+        if (user != null && user.isEmailVerified) {
             listenToFirestore()
-            listenToFirestoreCaptain()
         } else {
             clearListeners()
         }
@@ -505,9 +646,47 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         Firebase.auth.addAuthStateListener(authStateListener)
 
         val currentUser = Firebase.auth.currentUser
-        if (currentUser != null) {
+        if (currentUser != null && currentUser.isEmailVerified) {
             listenToFirestore()
-            listenToFirestoreCaptain()
+        }
+    }
+
+    fun applyAuthenticatedMerchant(merchant: com.example.auth.MerchantAccount) {
+        val resolvedImg = merchant.logo.ifBlank { merchant.photoUrl }.ifBlank { null }
+        _restaurantProfile.value = RestaurantProfile(
+            name = merchant.name,
+            phone = merchant.phone,
+            address = merchant.address,
+            imageUri = resolvedImg,
+            logoUrl = resolvedImg,
+            photoUrl = resolvedImg,
+            storagePath = merchant.storagePath,
+            email = merchant.email,
+            category = merchant.category.ifBlank { "مطعم" },
+            status = merchant.status.ifBlank { "approved" },
+            subscriptionStatus = merchant.subscriptionStatus.ifBlank { "unsubscribed" },
+            ownerId = merchant.uid,
+            uid = merchant.uid
+        )
+        if ((resolvedImg.isNullOrBlank() || !FirebaseStorageManager.isRemoteHttpUrl(resolvedImg)) &&
+            merchant.storagePath.isNotBlank()
+        ) {
+            resolveAndApplyStorageLogo(merchant.uid, merchant.storagePath)
+        }
+    }
+
+    private fun resolveAndApplyStorageLogo(uid: String, rawStoragePath: String) {
+        val candidatePath = rawStoragePath.trim().ifBlank { "merchants/$uid/profile.jpg" }
+        viewModelScope.launch {
+            val resolvedUrl = FirebaseStorageManager.resolveFirebaseStorageDownloadUrl(candidatePath)
+            if (resolvedUrl.isNotBlank() && _restaurantProfile.value.uid == uid) {
+                _restaurantProfile.value = _restaurantProfile.value.copy(
+                    imageUri = resolvedUrl,
+                    logoUrl = resolvedUrl,
+                    photoUrl = resolvedUrl,
+                    storagePath = candidatePath
+                )
+            }
         }
     }
 
@@ -515,17 +694,18 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val name = doc.safeString("name")
             ?: doc.safeString("restaurantName")
             ?: Firebase.auth.currentUser?.displayName
-            ?: "مطعم"
+            ?: "متجر"
         val phone = doc.safeString("phone") ?: ""
         val address = doc.safeString("address") ?: "العنوان غير محدد"
-        val logoUrl = doc.safeString("photoUrl")
+        val logoUrl = doc.safeString("logo")
+            ?: doc.safeString("photoUrl")
             ?: doc.safeString("logoUrl")
             ?: doc.getAnyString("imageUrl", "imageUri", "image")
             ?: ""
         val storagePath = doc.safeString("storagePath") ?: ""
         val email = doc.safeString("email") ?: (Firebase.auth.currentUser?.email ?: "")
         val category = doc.safeString("category") ?: "مطعم"
-        val status = doc.safeString("status") ?: "active"
+        val status = doc.safeString("status") ?: "approved"
         val rating = (doc.get("rating") as? Number)?.toDouble() ?: 5.0
         val ratingCount = (doc.get("ratingCount") as? Number)?.toLong() ?: 0L
         val subStatus = doc.safeString("subscriptionStatus") ?: "unsubscribed"
@@ -544,13 +724,20 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 if (lat != null && lng != null) GeoPoint(lat, lng) else null
             }
 
+        val resolvedLogoForUi = logoUrl.takeIf { it.isNotBlank() }
+        if (resolvedLogoForUi == null && storagePath.isNotBlank()) {
+            resolveAndApplyStorageLogo(uid, storagePath)
+        } else if (resolvedLogoForUi != null && !FirebaseStorageManager.isRemoteHttpUrl(resolvedLogoForUi)) {
+            resolveAndApplyStorageLogo(uid, resolvedLogoForUi)
+        }
+
         return RestaurantProfile(
             name = name,
             phone = phone,
             address = address,
-            imageUri = logoUrl.takeIf { it.isNotBlank() },
-            logoUrl = logoUrl.takeIf { it.isNotBlank() },
-            photoUrl = logoUrl.takeIf { it.isNotBlank() },
+            imageUri = resolvedLogoForUi,
+            logoUrl = resolvedLogoForUi,
+            photoUrl = resolvedLogoForUi,
             storagePath = storagePath,
             email = email,
             category = category,
@@ -566,90 +753,19 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun cleanAndNormalizeRestaurantDoc(doc: DocumentSnapshot) {
-        val data = doc.data ?: return
-        val docId = doc.id
-        val updates = mutableMapOf<String, Any>()
-
-        // 1. name vs restaurantName
-        val currentName = (data["name"] as? String)?.trim()
-        val currentRestaurantName = (data["restaurantName"] as? String)?.trim()
-        val finalName = when {
-            !currentName.isNullOrBlank() -> currentName
-            !currentRestaurantName.isNullOrBlank() -> currentRestaurantName
-            else -> "مطعم"
-        }
-        if (currentName != finalName) {
-            updates["name"] = finalName
-        }
-        if (data.containsKey("restaurantName")) {
-            updates["restaurantName"] = FieldValue.delete()
-        }
-
-        // 2. Images: adopt logoUrl only.
-        val currentLogoUrl = (data["logoUrl"] as? String)?.trim()
-        val currentImageUrl = (data["imageUrl"] as? String)?.trim()
-        val currentImageUri = (data["imageUri"] as? String)?.trim()
-        val currentImage = (data["image"] as? String)?.trim()
-
-        val finalLogoUrl = when {
-            !currentLogoUrl.isNullOrBlank() -> currentLogoUrl
-            !currentImageUrl.isNullOrBlank() -> currentImageUrl
-            !currentImageUri.isNullOrBlank() -> currentImageUri
-            !currentImage.isNullOrBlank() -> currentImage
-            else -> ""
-        }
-        if (currentLogoUrl != finalLogoUrl) {
-            updates["logoUrl"] = finalLogoUrl
-        }
-        if (data.containsKey("imageUrl")) {
-            updates["imageUrl"] = FieldValue.delete()
-        }
-        if (data.containsKey("imageUri")) {
-            updates["imageUri"] = FieldValue.delete()
-        }
-        if (data.containsKey("image")) {
-            updates["image"] = FieldValue.delete()
-        }
-
-        // Note: Protected fields (uid, ownerId, createdAt, subscriptionStatus, subscriptionId,
-        // subscriptionStartDate, subscriptionEndDate, rating, ratingCount, status) are strictly preserved and never modified on update.
-        if (updates.isNotEmpty()) {
-            updates["updatedAt"] = FieldValue.serverTimestamp()
-            Log.d("RESTAURANTS_CLEANUP", "Normalizing restaurant doc $docId: ${updates.keys}")
-            Firebase.firestore.collection("restaurants").document(docId)
-                .update(updates)
-                .addOnSuccessListener {
-                    Log.d("RESTAURANTS_CLEANUP", "Doc $docId normalized successfully in Firestore.")
-                }
-                .addOnFailureListener { e ->
-                    Log.w("RESTAURANTS_CLEANUP", "Could not normalize doc $docId: ${e.message}")
-                }
-        }
+        // Automatic migration/cleanup of restaurants collection is disabled for strict account isolation.
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun checkAndMigrateRestaurantDoc(uid: String) {
-        val prefs = getApplication<Application>().getSharedPreferences("restaurant_migration_prefs", android.content.Context.MODE_PRIVATE)
-        val isMigrated = prefs.getBoolean("schema_migrated_$uid", false)
-        if (isMigrated) return
-
-        viewModelScope.launch {
-            try {
-                val doc = Firebase.firestore.collection("restaurants").document(uid).get().await()
-                if (doc != null && doc.exists()) {
-                    cleanAndNormalizeRestaurantDoc(doc)
-                }
-                prefs.edit().putBoolean("schema_migrated_$uid", true).apply()
-                Log.d("RESTAURANTS_CLEANUP", "Single-run migration completed and flag set for $uid")
-            } catch (e: Exception) {
-                Log.w("RESTAURANTS_CLEANUP", "Migration note for restaurant $uid: ${e.message}")
-            }
-        }
+        // Automatic migration is disabled to avoid touching unrelated or conflicting accounts.
     }
 
     fun listenToFirestore() {
         val currentUser = Firebase.auth.currentUser
-        if (currentUser == null) {
+        if (currentUser == null || !currentUser.isEmailVerified) {
             clearListeners()
             return
         }
@@ -657,10 +773,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
         checkAndListenToRestaurantSubscription()
 
-        // 1. Read / Listen to current user profile from Firestore (restaurants and merchants)
+        // 1. Read / Listen EXCLUSIVELY to `merchants/{uid}` (never query restaurants, captains, or users)
         profileListener?.remove()
+        profileListener = null
         merchantProfileListener?.remove()
-        checkAndMigrateRestaurantDoc(uid)
 
         merchantProfileListener = Firebase.firestore.collection("merchants").document(uid)
             .addSnapshotListener { mSnap, mErr ->
@@ -668,82 +784,22 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     if (mErr.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
                         merchantProfileListener?.remove()
                         merchantProfileListener = null
+                    } else {
+                        Log.w("OrderViewModel", "Error reading merchants/$uid: ${mErr.message}")
                     }
                     return@addSnapshotListener
                 }
                 if (mSnap != null && mSnap.exists()) {
-                    val mName = mSnap.safeString("name")
-                    val mPhone = mSnap.safeString("phone")
-                    val mPhoto = mSnap.safeString("photoUrl")
-                    val mStoragePath = mSnap.safeString("storagePath")
-                    val mEmail = mSnap.safeString("email")
-                    val mAddress = mSnap.safeString("address")
-                    val mLocationUrl = mSnap.safeString("locationUrl")
-                        ?: mSnap.getAnyString("mapLink", "mapUrl", "locationLink")
-
-                    _restaurantProfile.value = _restaurantProfile.value.copy(
-                        name = if (!mName.isNullOrBlank()) mName else _restaurantProfile.value.name,
-                        phone = if (!mPhone.isNullOrBlank()) mPhone else _restaurantProfile.value.phone,
-                        photoUrl = if (!mPhoto.isNullOrBlank()) mPhoto else _restaurantProfile.value.photoUrl,
-                        logoUrl = if (!mPhoto.isNullOrBlank()) mPhoto else _restaurantProfile.value.logoUrl,
-                        imageUri = if (!mPhoto.isNullOrBlank()) mPhoto else _restaurantProfile.value.imageUri,
-                        storagePath = if (!mStoragePath.isNullOrBlank()) mStoragePath else _restaurantProfile.value.storagePath,
-                        email = if (!mEmail.isNullOrBlank()) mEmail else _restaurantProfile.value.email,
-                        address = if (!mAddress.isNullOrBlank()) mAddress else _restaurantProfile.value.address,
-                        locationUrl = if (!mLocationUrl.isNullOrBlank()) mLocationUrl else _restaurantProfile.value.locationUrl
-                    )
-                }
-            }
-
-        profileListener = Firebase.firestore.collection("restaurants").document(uid)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        Log.w("OrderViewModel", "Profile read PERMISSION_DENIED; detaching listener")
-                        profileListener?.remove()
-                        profileListener = null
+                    val accountType = mSnap.safeString("accountType")?.trim()?.lowercase()
+                    if (accountType == "merchant") {
+                        _restaurantProfile.value = mapDocToRestaurantProfile(mSnap, uid)
                     } else {
-                        Log.w("OrderViewModel", "Error reading restaurant profile: ${error.message}")
+                        Log.w("OrderViewModel", "Rejected non-merchant document in merchants/$uid: accountType=$accountType")
+                        _restaurantProfile.value = RestaurantProfile()
                     }
-                    return@addSnapshotListener
-                }
-                if (snapshot != null && snapshot.exists()) {
-                    _restaurantProfile.value = mapDocToRestaurantProfile(snapshot, uid)
                 } else {
-                    // Fallback to users collection
-                    Firebase.firestore.collection("users").document(uid).get()
-                        .addOnSuccessListener { userSnap ->
-                            if (userSnap != null && userSnap.exists()) {
-                                val name = userSnap.safeString("name")
-                                    ?: userSnap.safeString("restaurantName")
-                                    ?: Firebase.auth.currentUser?.displayName
-                                    ?: "مستخدم جديد"
-                                val phone = userSnap.safeString("phone") ?: ""
-                                val address = userSnap.safeString("address") ?: "العنوان غير محدد"
-                                val imageUri = userSnap.safeString("logoUrl")
-                                    ?: userSnap.getAnyString("imageUri", "imageUrl", "photoUrl")
-
-                                _restaurantProfile.value = RestaurantProfile(
-                                    name = name,
-                                    phone = phone,
-                                    address = address,
-                                    imageUri = imageUri,
-                                    logoUrl = imageUri,
-                                    ownerId = uid,
-                                    uid = uid
-                                )
-                            } else {
-                                val emailName = Firebase.auth.currentUser?.email?.substringBefore("@") ?: "مستخدم جديد"
-                                _restaurantProfile.value = RestaurantProfile(
-                                    name = emailName,
-                                    phone = Firebase.auth.currentUser?.phoneNumber ?: "",
-                                    address = "العنوان غير محدد",
-                                    imageUri = null,
-                                    ownerId = uid,
-                                    uid = uid
-                                )
-                            }
-                        }
+                    Log.w("OrderViewModel", "No document exists at merchants/$uid; never auto-creating on read.")
+                    _restaurantProfile.value = RestaurantProfile()
                 }
             }
 
@@ -816,32 +872,102 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val missingCaptainIds = mutableSetOf<String>()
+        val unresolvedStoragePaths = mutableSetOf<String>()
+        val captainsWithoutIdByPhone = mutableSetOf<String>()
+        val nowMs = System.currentTimeMillis()
 
         val mappedOrders = sortedDocs.mapNotNull { doc ->
             try {
                 val baseOrder = mapDocToOrder(doc)
                 val captId = baseOrder.captainId?.trim().orEmpty()
+                val rawPhoto = baseOrder.captainPhotoUrl.trim()
+                val hasValidRemotePhoto = FirebaseStorageManager.isValidDisplayableCaptainPhoto(rawPhoto)
+                val isStoragePathCandidate = rawPhoto.isNotBlank() &&
+                    !hasValidRemotePhoto &&
+                    !FirebaseStorageManager.isPlaceholderAvatarUrl(rawPhoto) &&
+                    !FirebaseStorageManager.isLocalDeviceUri(rawPhoto)
+                val cachedResolvedPath = if (isStoragePathCandidate) {
+                    resolvedOrderStoragePhotoCache[rawPhoto].orEmpty()
+                } else ""
+
+                if (isStoragePathCandidate && cachedResolvedPath.isBlank()) {
+                    unresolvedStoragePaths.add(rawPhoto)
+                }
+
                 if (captId.isNotEmpty()) {
                     val cachedCaptain = captainInfoCache[captId]
+                    val lastAttempt = captainLookupTimestampMs[captId] ?: 0L
+                    val canRefreshCaptain = (nowMs - lastAttempt) >= 12_000L
+
                     if (cachedCaptain != null) {
-                        val enrichedName = if (baseOrder.captainName.isBlank() || baseOrder.captainName == "في انتظار كابتن" || baseOrder.captainName == "الكابتن") {
-                            cachedCaptain.name.ifBlank { baseOrder.captainName }
-                        } else baseOrder.captainName
-                        val enrichedPhone = baseOrder.captainPhone.ifBlank { cachedCaptain.phone }
-                        val enrichedPhoto = baseOrder.captainPhotoUrl.ifBlank { cachedCaptain.photoUrl }
+                        val enrichedName = FirebaseStorageManager.selectAuthoritativeCaptainName(
+                            captainDocName = cachedCaptain.name,
+                            orderDocName = baseOrder.captainName,
+                            captainId = captId
+                        )
+                        val enrichedPhone = FirebaseStorageManager.selectAuthoritativeCaptainPhone(
+                            captainDocPhone = cachedCaptain.phone,
+                            orderDocPhone = baseOrder.captainPhone
+                        )
+                        val enrichedPhoto = FirebaseStorageManager.selectBestCaptainPhotoUrl(
+                            captainDocPhotoUrl = cachedCaptain.photoUrl,
+                            resolvedOrderStorageUrl = cachedResolvedPath,
+                            orderDocPhotoUrl = rawPhoto
+                        )
+
+                        val needsBetterCaptainData = !FirebaseStorageManager.isValidCaptainName(cachedCaptain.name) ||
+                            cachedCaptain.phone.isBlank() ||
+                            !FirebaseStorageManager.isFirebaseStorageUrl(cachedCaptain.photoUrl)
+                        if (needsBetterCaptainData && canRefreshCaptain) {
+                            missingCaptainIds.add(captId)
+                        }
+
                         baseOrder.copy(
                             captainName = enrichedName,
                             captainPhone = enrichedPhone,
                             captainPhotoUrl = enrichedPhoto
                         )
                     } else {
-                        if (baseOrder.captainPhone.isBlank() || baseOrder.captainPhotoUrl.isBlank() || baseOrder.captainName == "الكابتن") {
+                        val immediatePhoto = FirebaseStorageManager.selectBestCaptainPhotoUrl(
+                            captainDocPhotoUrl = null,
+                            resolvedOrderStorageUrl = cachedResolvedPath,
+                            orderDocPhotoUrl = rawPhoto
+                        )
+                        if (canRefreshCaptain) {
                             missingCaptainIds.add(captId)
                         }
-                        baseOrder
+                        baseOrder.copy(captainPhotoUrl = immediatePhoto)
                     }
                 } else {
-                    baseOrder
+                    val isAssignedByName = FirebaseStorageManager.isValidCaptainName(baseOrder.captainName)
+                    val cleanPhone = baseOrder.captainPhone.trim()
+                    val cachedByPhone = cleanPhone.takeIf { it.isNotBlank() }?.let { captainInfoByPhoneCache[it] }
+                    val resolvedName = if (cachedByPhone != null) {
+                        FirebaseStorageManager.selectAuthoritativeCaptainName(
+                            captainDocName = cachedByPhone.name,
+                            orderDocName = baseOrder.captainName,
+                            captainId = cachedByPhone.captainId
+                        )
+                    } else baseOrder.captainName
+                    val resolvedPhoto = FirebaseStorageManager.selectBestCaptainPhotoUrl(
+                        captainDocPhotoUrl = cachedByPhone?.photoUrl,
+                        resolvedOrderStorageUrl = cachedResolvedPath,
+                        orderDocPhotoUrl = rawPhoto
+                    )
+                    if ((isAssignedByName || cleanPhone.isNotBlank()) &&
+                        cleanPhone.isNotBlank() &&
+                        (cachedByPhone == null || !FirebaseStorageManager.isFirebaseStorageUrl(cachedByPhone.photoUrl))
+                    ) {
+                        val lastPhoneAttempt = captainLookupTimestampMs["phone:$cleanPhone"] ?: 0L
+                        if (nowMs - lastPhoneAttempt >= 12_000L) {
+                            captainsWithoutIdByPhone.add(cleanPhone)
+                        }
+                    }
+                    baseOrder.copy(
+                        captainId = baseOrder.captainId ?: cachedByPhone?.captainId?.takeIf { it.isNotBlank() },
+                        captainName = resolvedName,
+                        captainPhotoUrl = resolvedPhoto
+                    )
                 }
             } catch (e: Exception) {
                 Log.w("OrderViewModel", "Failed to map order doc ${doc.id}: ${e.message}")
@@ -871,12 +997,15 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        if (missingCaptainIds.isNotEmpty()) {
-            fetchAndCacheCaptains(missingCaptainIds)
+        if (missingCaptainIds.isNotEmpty() || unresolvedStoragePaths.isNotEmpty() || captainsWithoutIdByPhone.isNotEmpty()) {
+            fetchAndCacheCaptains(missingCaptainIds, unresolvedStoragePaths, captainsWithoutIdByPhone)
         }
     }
 
     private val notifiedAwaitingConfirmationKeys = mutableSetOf<String>()
+    private val resolvedOrderStoragePhotoCache = ConcurrentHashMap<String, String>()
+    private val captainInfoByPhoneCache = ConcurrentHashMap<String, CaptainLocationInfo>()
+    private val captainLookupTimestampMs = ConcurrentHashMap<String, Long>()
 
     fun isOrderActiveForCaptainLimit(status: String): Boolean {
         val s = status.trim().lowercase(Locale.ROOT)
@@ -902,38 +1031,198 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private fun fetchAndCacheCaptains(captainIds: Set<String>) {
+    private suspend fun extractCaptainPhotoFromDoc(doc: DocumentSnapshot, vararg lookupIds: String): String {
+        val storagePathFields = listOf(
+            "storagePath", "profileStoragePath", "photoPath", "imagePath", "avatarPath", "logoStoragePath"
+        )
+        val urlFields = listOf(
+            "profileImageUrl", "photoUrl", "driverPhotoUrl", "captainPhotoUrl",
+            "avatarUrl", "imageUrl", "logo", "logoUrl", "profileImage", "profilePhoto",
+            "photo", "image", "avatar", "picture", "profilePicture"
+        )
+
+        val candidateValues = (storagePathFields + urlFields)
+            .mapNotNull { field -> doc.safeString(field)?.trim()?.takeIf { it.isNotEmpty() } }
+            .filter { !FirebaseStorageManager.isPlaceholderAvatarUrl(it) && !FirebaseStorageManager.isLocalDeviceUri(it) }
+
+        // 1. Direct Firebase Storage URL on the captain document wins immediately
+        candidateValues.firstOrNull { FirebaseStorageManager.isFirebaseStorageUrl(it) && FirebaseStorageManager.isRemoteHttpUrl(it) }
+            ?.let { return it }
+
+        // 2. Resolve relative Storage paths or `gs://` URLs via Firebase Storage SDK
+        val pathCandidates = candidateValues.filter {
+            !FirebaseStorageManager.isRemoteHttpUrl(it) || it.startsWith("gs://", ignoreCase = true)
+        }
+        for (rawPath in pathCandidates) {
+            val resolved = FirebaseStorageManager.resolveFirebaseStorageDownloadUrl(rawPath)
+            if (resolved.isNotBlank() && FirebaseStorageManager.isRemoteHttpUrl(resolved)) {
+                return resolved
+            }
+        }
+
+        // 3. Search Firebase Storage folders (`captains/{id}/...`, etc.) for the captain's real uploaded photo
+        val distinctIds = (listOf(
+            doc.id,
+            doc.safeString("uid").orEmpty(),
+            doc.safeString("captainId").orEmpty()
+        ) + lookupIds.toList())
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+        for (id in distinctIds) {
+            val storageUrl = FirebaseStorageManager.findCaptainPhotoInStorage(id)
+            if (storageUrl.isNotBlank()) {
+                return storageUrl
+            }
+        }
+
+        // 4. Fallback to any valid remote HTTP/HTTPS URL on the document
+        return candidateValues.firstOrNull { FirebaseStorageManager.isValidDisplayableCaptainPhoto(it) }.orEmpty()
+    }
+
+    private fun fetchAndCacheCaptains(
+        captainIds: Set<String>,
+        storagePathsToResolve: Set<String> = emptySet(),
+        captainPhonesToLookup: Set<String> = emptySet()
+    ) {
+        val attemptTime = System.currentTimeMillis()
+        val idsToQuery = captainIds.filter { id ->
+            val prev = captainLookupTimestampMs[id] ?: 0L
+            attemptTime - prev >= 12_000L
+        }
+        idsToQuery.forEach { captainLookupTimestampMs[it] = attemptTime }
+
+        val phonesToQuery = captainPhonesToLookup.filter { phone ->
+            val prev = captainLookupTimestampMs["phone:$phone"] ?: 0L
+            attemptTime - prev >= 12_000L
+        }
+        phonesToQuery.forEach { captainLookupTimestampMs["phone:$it"] = attemptTime }
+
+        if (idsToQuery.isEmpty() && storagePathsToResolve.isEmpty() && phonesToQuery.isEmpty()) return
+
         viewModelScope.launch(Dispatchers.IO) {
             var updatedAny = false
             val db = Firebase.firestore
-            for (captId in captainIds) {
-                if (captainInfoCache.containsKey(captId)) continue
+
+            for (rawPath in storagePathsToResolve) {
+                if (resolvedOrderStoragePhotoCache[rawPath]?.isNotBlank() == true) continue
+                val resolved = FirebaseStorageManager.resolveFirebaseStorageDownloadUrl(rawPath)
+                if (resolved.isNotBlank()) {
+                    resolvedOrderStoragePhotoCache[rawPath] = resolved
+                    updatedAny = true
+                }
+            }
+
+            for (captId in idsToQuery) {
                 try {
                     var snap = try { db.collection("captains").document(captId).get().await() } catch (_: Exception) { null }
                     if (snap == null || !snap.exists()) {
-                        snap = try { db.collection("drivers").document(captId).get().await() } catch (_: Exception) { null }
+                        snap = try {
+                            db.collection("captains").whereEqualTo("captainId", captId).limit(1).get().await().documents.firstOrNull()
+                        } catch (_: Exception) { null }
                     }
                     if (snap == null || !snap.exists()) {
-                        snap = try { db.collection("users").document(captId).get().await() } catch (_: Exception) { null }
+                        snap = try {
+                            db.collection("captains").whereEqualTo("uid", captId).limit(1).get().await().documents.firstOrNull()
+                        } catch (_: Exception) { null }
                     }
                     if (snap != null && snap.exists()) {
-                        val name = snap.getAnyString("name", "driver_name", "displayName", "captainName") ?: ""
-                        val phone = snap.getAnyString("phone", "captainPhone", "driverPhone", "phoneNumber") ?: ""
-                        val photo = snap.getAnyString("profileImageUrl", "photoUrl", "driverPhotoUrl", "captainPhotoUrl", "avatarUrl") ?: ""
-                        captainInfoCache[captId] = CaptainLocationInfo(
+                        val name = snap.getAnyString(
+                            "name", "fullName", "full_name", "driver_name", "driverName", "displayName", "captainName", "userName"
+                        ) ?: ""
+                        val phone = snap.getAnyString(
+                            "phone", "phoneNumber", "phone_number", "mobile", "mobileNumber", "captainPhone", "driverPhone"
+                        ) ?: ""
+                        val photo = extractCaptainPhotoFromDoc(snap, captId)
+                        val info = CaptainLocationInfo(
                             captainId = captId,
                             name = name,
                             phone = phone,
                             photoUrl = photo
                         )
-                        updatedAny = true
+                        val previous = captainInfoCache[captId]
+                        captainInfoCache[captId] = info
+                        if (phone.isNotBlank()) {
+                            captainInfoByPhoneCache[phone.trim()] = info
+                        }
+                        if (previous != info) updatedAny = true
+                    } else {
+                        val storagePhoto = FirebaseStorageManager.findCaptainPhotoInStorage(captId)
+                        val previous = captainInfoCache[captId]
+                        if (storagePhoto.isNotBlank()) {
+                            captainInfoCache[captId] = CaptainLocationInfo(
+                                captainId = captId,
+                                name = previous?.name.orEmpty(),
+                                phone = previous?.phone.orEmpty(),
+                                photoUrl = storagePhoto
+                            )
+                            updatedAny = true
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w("OrderViewModel", "Could not fetch captain $captId info: ${e.message}")
                 }
             }
+
+            for (phone in phonesToQuery) {
+                try {
+                    val phoneFields = listOf("phone", "phoneNumber", "mobile", "captainPhone")
+                    var snap: DocumentSnapshot? = null
+                    for (field in phoneFields) {
+                        snap = try {
+                            db.collection("captains")
+                                .whereEqualTo(field, phone)
+                                .limit(1)
+                                .get()
+                                .await()
+                                .documents
+                                .firstOrNull()
+                        } catch (_: Exception) { null }
+                        if (snap != null && snap.exists()) break
+                    }
+                    if (snap != null && snap.exists()) {
+                        val name = snap.getAnyString(
+                            "name", "fullName", "full_name", "driver_name", "driverName", "displayName", "captainName", "userName"
+                        ) ?: ""
+                        val resolvedPhone = snap.getAnyString(
+                            "phone", "phoneNumber", "phone_number", "mobile", "mobileNumber", "captainPhone", "driverPhone"
+                        ) ?: phone
+                        val photo = extractCaptainPhotoFromDoc(snap)
+                        val info = CaptainLocationInfo(
+                            captainId = snap.id,
+                            name = name,
+                            phone = resolvedPhone,
+                            photoUrl = photo
+                        )
+                        captainInfoByPhoneCache[phone] = info
+                        captainInfoCache[snap.id] = info
+                        updatedAny = true
+                    }
+                } catch (e: Exception) {
+                    Log.w("OrderViewModel", "Could not lookup captain by phone $phone: ${e.message}")
+                }
+            }
+
             if (updatedAny) {
                 withContext(Dispatchers.Main) {
+                    val currentTracked = _trackedCaptainInfo.value
+                    if (currentTracked != null && currentTracked.captainId.isNotBlank()) {
+                        val cached = captainInfoCache[currentTracked.captainId]
+                        if (cached != null) {
+                            _trackedCaptainInfo.value = currentTracked.copy(
+                                name = FirebaseStorageManager.selectAuthoritativeCaptainName(
+                                    cached.name, currentTracked.name, currentTracked.captainId
+                                ),
+                                phone = FirebaseStorageManager.selectAuthoritativeCaptainPhone(
+                                    cached.phone, currentTracked.phone
+                                ),
+                                photoUrl = FirebaseStorageManager.selectBestCaptainPhotoUrl(
+                                    cached.photoUrl, null, currentTracked.photoUrl
+                                )
+                            )
+                        }
+                    }
                     rebuildMergedFirestoreOrders()
                 }
             }
@@ -941,298 +1230,23 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun listenToFirestoreCaptain() {
-        val uid = Firebase.auth.currentUser?.uid ?: return
-
-        // 1. Listen to captains collection for current captain profile & status
-        driverListener?.remove()
-        driverListener = Firebase.firestore.collection("captains").document(uid)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        Log.w("OrderViewModel", "Captain profile PERMISSION_DENIED; detaching listener")
-                        driverListener?.remove()
-                        driverListener = null
-                    } else {
-                        Log.w("OrderViewModel", "Error reading captain profile: ${error.message}")
-                    }
-                    return@addSnapshotListener
-                }
-                if (snapshot != null && snapshot.exists()) {
-                    val name = snapshot.getAnyString("name", "driver_name")
-                        ?: Firebase.auth.currentUser?.displayName
-                        ?: "الكابتن"
-                    val phone = snapshot.safeString("phone") ?: ""
-                    val vehicle = snapshot.getAnyString("vehicleType", "vehicle") ?: "دراجة نارية"
-                    val rating = snapshot.get("rating")?.toString() ?: "5.0"
-                    val trips = (snapshot.get("totalTrips") as? Number)?.toInt() ?: 0
-                    val isOnline = snapshot.getBoolean("isOnline") ?: true
-                    val availability = snapshot.safeString("availabilityStatus") ?: "available"
-                    val currentOrderId = snapshot.safeString("currentOrderId")
-                    val approvalStatus = snapshot.safeString("status") ?: "approved"
-                    val loc = snapshot.getGeoPoint("location")
-                    val lat = loc?.latitude ?: (snapshot.get("latitude") as? Number)?.toDouble() ?: 30.0444
-                    val lng = loc?.longitude ?: (snapshot.get("longitude") as? Number)?.toDouble() ?: 31.2357
-                    val lastUpdate = snapshot.getTimestamp("lastLocationUpdate")
-                    val photoUrl = snapshot.getAnyString("profileImageUrl", "photoUrl", "driverPhotoUrl")
-                        ?: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
-
-                    _captainProfile.value = CaptainProfile(
-                        uid = uid,
-                        name = name,
-                        phone = phone,
-                        profileImageUrl = photoUrl,
-                        role = "captain",
-                        status = approvalStatus,
-                        isOnline = isOnline,
-                        availabilityStatus = availability,
-                        currentOrderId = currentOrderId,
-                        latitude = lat,
-                        longitude = lng,
-                        lastLocationUpdate = lastUpdate,
-                        rating = rating,
-                        totalTrips = trips,
-                        vehicleType = vehicle
-                    )
-
-                    _driverProfile.value = DriverProfile(
-                        name = name,
-                        phone = phone,
-                        vehicleType = vehicle,
-                        rating = rating,
-                        totalTrips = trips,
-                        isOnline = isOnline,
-                        photoUrl = photoUrl
-                    )
-                } else {
-                    val defaultName = Firebase.auth.currentUser?.displayName
-                        ?: Firebase.auth.currentUser?.email?.substringBefore("@")
-                        ?: "الكابتن"
-                    val initialCaptainMap = hashMapOf<String, Any?>(
-                        "uid" to uid,
-                        "name" to defaultName,
-                        "driver_name" to defaultName,
-                        "phone" to (Firebase.auth.currentUser?.phoneNumber ?: "01000000000"),
-                        "vehicleType" to "دراجة نارية",
-                        "rating" to 5.0,
-                        "ratingCount" to 10L,
-                        "totalTrips" to 0,
-                        "isOnline" to true,
-                        "availabilityStatus" to "available",
-                        "status" to "approved",
-                        "currentOrderId" to null,
-                        "location" to GeoPoint(30.0444, 31.2357),
-                        "latitude" to 30.0444,
-                        "longitude" to 31.2357,
-                        "lastLocationUpdate" to FieldValue.serverTimestamp(),
-                        "profileImageUrl" to "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
-                    )
-                    Firebase.firestore.collection("captains").document(uid).set(initialCaptainMap)
-                    _captainProfile.value = CaptainProfile(uid = uid, name = defaultName)
-                    _driverProfile.value = DriverProfile(name = defaultName)
-                }
-            }
-
-        // 2. Real-time stream for pending orders (status == "pending")
-        _isLoading.value = true
-        pendingListener?.remove()
-        pendingListener = Firebase.firestore.collection("orders")
-            .whereEqualTo("status", "pending")
-            .addSnapshotListener { querySnapshot, error ->
-                _isLoading.value = false
-                if (error != null) {
-                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        Log.w("OrderViewModel", "Pending orders PERMISSION_DENIED; detaching listener")
-                        pendingListener?.remove()
-                        pendingListener = null
-                    } else {
-                        Log.w("OrderViewModel", "Error fetching pending orders: ${error.message}")
-                    }
-                    _snackbarMessage.value = "تعذر جلب الطلبات المتاحة، يرجى التأكد من الاتصال"
-                    return@addSnapshotListener
-                }
-                if (querySnapshot != null) {
-                    val list = querySnapshot.documents.mapNotNull {
-                        try {
-                            mapDocToOrder(it)
-                        } catch (e: Exception) {
-                            Log.w("OrderViewModel", "Failed to map pending order ${it.id}: ${e.message}")
-                            null
-                        }
-                    }
-                    _pendingOrders.value = list
-                }
-            }
-
-        // 3. Real-time stream for captain's assigned/completed orders
-        captainOrdersListener?.remove()
-        captainOrdersListener = Firebase.firestore.collection("orders")
-            .addSnapshotListener { querySnapshot, error ->
-                if (error != null) {
-                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        Log.w("OrderViewModel", "Captain orders PERMISSION_DENIED; detaching listener")
-                        captainOrdersListener?.remove()
-                        captainOrdersListener = null
-                    } else {
-                        Log.w("OrderViewModel", "Error fetching captain orders: ${error.message}")
-                    }
-                    return@addSnapshotListener
-                }
-                if (querySnapshot != null) {
-                    val activeList = mutableListOf<DeliveryOrderEntity>()
-                    val completedList = mutableListOf<DeliveryOrderEntity>()
-                    var totalEarnings = 0.0
-
-                    querySnapshot.documents.forEach { doc ->
-                        try {
-                            val order = mapDocToOrder(doc)
-                            val captId = doc.safeString("captainId")
-                            val captName = doc.getAnyString("driver_name", "captainName")
-                            val status = doc.safeString("status")?.lowercase(Locale.ROOT) ?: ""
-
-                            val isMyOrder = (captId == uid) || (!captName.isNullOrBlank() && captName == _driverProfile.value.name)
-
-                            if (isMyOrder) {
-                                if (status in listOf("accepted", "in_progress", "out_for_delivery", "جاري التوصيل", "قيد التحضير", "الكابتن في الطريق لك", "في الطريق لك", "جاري البحث عن كابتن", "جاري البحث")) {
-                                    activeList.add(order)
-                                } else if (status in listOf("delivered", "completed", "تم التسليم", "مكتمل", "مكتملة", "تم التوصيل")) {
-                                    completedList.add(order)
-                                    val priceStr = doc.getAnyString("price", "totalAmount") ?: "0"
-                                    val numericPrice = priceStr.replace(Regex("[^0-9.]"), "").toDoubleOrNull() ?: 0.0
-                                    totalEarnings += numericPrice
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.w("OrderViewModel", "Error processing captain order ${doc.id}: ${e.message}")
-                        }
-                    }
-                    _captainActiveOrders.value = activeList
-                    _captainCompletedOrders.value = completedList
-                    _walletEarnings.value = totalEarnings
-                }
-            }
+        // Strictly disabled in Merchant App to guarantee complete separation from captains collection
+        Log.d("OrderViewModel", "listenToFirestoreCaptain skipped: Merchant App only handles merchant accounts.")
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun toggleCaptainOnlineStatus(isOnline: Boolean) {
-        if (!NetworkHelper.isNetworkAvailable(getApplication())) {
-            val noNetMsg = "لا يمكن تغيير الحالة: أنت غير متصل بالإنترنت!"
-            _snackbarMessage.value = noNetMsg
-            NetworkHelper.notifyNoInternet(getApplication(), "تغيير حالة اتصال الكابتن")
-            return
-        }
-        val uid = Firebase.auth.currentUser?.uid ?: return
-        viewModelScope.launch {
-            try {
-                val availability = if (isOnline) {
-                    if (!_captainProfile.value.currentOrderId.isNullOrBlank()) "busy" else "available"
-                } else {
-                    "offline"
-                }
-                Firebase.firestore.collection("captains").document(uid).update(
-                    mapOf(
-                        "isOnline" to isOnline,
-                        "availabilityStatus" to availability,
-                        "lastLocationUpdate" to FieldValue.serverTimestamp()
-                    )
-                ).await()
-                _captainProfile.value = _captainProfile.value.copy(
-                    isOnline = isOnline,
-                    availabilityStatus = availability
-                )
-                _driverProfile.value = _driverProfile.value.copy(isOnline = isOnline)
-                _snackbarMessage.value = if (isOnline) "أنت الآن متصل ومستعد لاستقبال الطلبات 🟢" else "تم تغيير حالتك إلى غير متصل 🔴"
-            } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error toggling online status: ${e.message}", e)
-            }
-        }
+        Log.w("OrderViewModel", "toggleCaptainOnlineStatus is disabled in Merchant App.")
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun updateCaptainLocation(lat: Double, lng: Double) {
-        if (!NetworkHelper.isNetworkAvailable(getApplication())) {
-            val noNetMsg = "لا يمكن تحديث الموقع: أنت غير متصل بالإنترنت!"
-            _snackbarMessage.value = noNetMsg
-            NetworkHelper.notifyNoInternet(getApplication(), "تحديث موقع الكابتن")
-            return
-        }
-        val uid = Firebase.auth.currentUser?.uid ?: return
-        viewModelScope.launch {
-            try {
-                val geoPoint = GeoPoint(lat, lng)
-                val updates = mapOf(
-                    "location" to geoPoint,
-                    "latitude" to lat,
-                    "longitude" to lng,
-                    "lastLocationUpdate" to FieldValue.serverTimestamp()
-                )
-                Firebase.firestore.collection("captains").document(uid).set(updates, com.google.firebase.firestore.SetOptions.merge()).await()
-                _captainProfile.value = _captainProfile.value.copy(
-                    latitude = lat,
-                    longitude = lng,
-                    lastLocationUpdate = Timestamp.now()
-                )
-
-                val activeOrderId = _captainProfile.value.currentOrderId
-                if (!activeOrderId.isNullOrBlank()) {
-                    val ordersSnap = Firebase.firestore.collection("orders").get().await()
-                    val activeDoc = ordersSnap.documents.find { it.id == activeOrderId || it.safeString("orderId") == activeOrderId }
-                    activeDoc?.reference?.update(
-                        mapOf(
-                            "captainLocation" to geoPoint,
-                            "captainLatitude" to lat,
-                            "captainLongitude" to lng
-                        )
-                    )
-                }
-                _snackbarMessage.value = "تم تحديث موقعك الجغرافي بنجاح 📍"
-            } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error updating captain location: ${e.message}", e)
-            }
-        }
+        Log.w("OrderViewModel", "updateCaptainLocation is disabled in Merchant App.")
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun rejectCaptainOrder(orderDocId: String, onSuccess: () -> Unit = {}) {
-        val uid = Firebase.auth.currentUser?.uid ?: return
-        viewModelScope.launch {
-            try {
-                _isLoading.value = true
-                val collectionRef = Firebase.firestore.collection("orders")
-                val querySnapshot = collectionRef.get().await()
-                val matchedDoc = querySnapshot.documents.find { doc ->
-                    doc.id == orderDocId || doc.safeString("orderId") == orderDocId || doc.id.hashCode() == orderDocId.toIntOrNull()
-                }
-
-                if (matchedDoc != null) {
-                    matchedDoc.reference.update(
-                        mapOf(
-                            "captainId" to null,
-                            "driver_name" to null,
-                            "captainName" to null,
-                            "status" to "pending",
-                            "dispatchStatus" to "searching"
-                        )
-                    ).await()
-                }
-
-                Firebase.firestore.collection("captains").document(uid).update(
-                    mapOf(
-                        "currentOrderId" to null,
-                        "availabilityStatus" to "available"
-                    )
-                ).await()
-
-                if (matchedDoc != null) {
-                    val realOrderId = matchedDoc.safeString("orderId") ?: matchedDoc.id
-                    AutoDispatchManager.dispatchOrder(getApplication(), realOrderId)
-                }
-
-                _snackbarMessage.value = "تم الاعتذار عن الطلب وإعادة توجيهه لكابتن آخر بنجاح"
-                onSuccess()
-            } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error rejecting order: ${e.message}", e)
-                _snackbarMessage.value = "حدث خطأ أثناء رفض الطلب: ${e.localizedMessage}"
-            } finally {
-                _isLoading.value = false
-            }
-        }
+        Log.w("OrderViewModel", "rejectCaptainOrder is disabled in Merchant App.")
     }
 
     private fun mapDocToOrder(doc: DocumentSnapshot): DeliveryOrderEntity {
@@ -1256,8 +1270,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             else -> rawStatus
         }
 
-        val captainId = doc.getAnyString("captainId", "driverId", "captain_id")
-        val rawDriverName = doc.getAnyString("captainName", "driver_name", "driverName", "captain_name")
+        val captainId = doc.getAnyString(
+            "captainId", "driverId", "captain_id", "driver_id",
+            "assignedCaptainId", "acceptedBy", "captainUid", "driverUid"
+        )
+        val rawDriverName = doc.getAnyString(
+            "captainName", "driver_name", "driverName", "captain_name", "captainFullName", "driverFullName"
+        )
         val captName = if (!rawDriverName.isNullOrBlank()) rawDriverName else if (!captainId.isNullOrBlank()) "الكابتن" else "في انتظار كابتن"
 
         val rawAddress = doc.getAnyString("destinationAddress", "deliveryAddress", "address", "customerAddress", "clientAddress", "receiverAddress") ?: ""
@@ -1279,8 +1298,21 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val custLng = customerLoc?.longitude ?: (doc.get("customerLongitude") as? Number)?.toDouble()
 
         val docRating = (doc.get("rating") as? Number)?.toInt() ?: 0
-        val captPhone = doc.getAnyString("captainPhone", "captain_phone", "driverPhone", "driver_phone") ?: ""
-        val captPhoto = doc.getAnyString("captainPhotoUrl", "captain_photo", "driverPhoto", "driverPhotoUrl", "captainImage") ?: ""
+        val captPhone = doc.getAnyString(
+            "captainPhone", "captain_phone", "driverPhone", "driver_phone",
+            "captainMobile", "driverMobile", "captainPhoneNumber"
+        ) ?: ""
+        val rawCaptPhoto = doc.getAnyString(
+            "captainPhotoUrl", "captain_photo_url", "captain_photo", "captainPhoto",
+            "driverPhotoUrl", "driver_photo_url", "driverPhoto", "driver_photo",
+            "captainImage", "captainImageUrl", "driverImage", "driverImageUrl",
+            "captainAvatar", "driverAvatar", "captainProfileImage", "driverProfileImage",
+            "captainLogo", "driverLogo", "captainStoragePath", "captainPhotoPath", "driverStoragePath"
+        ) ?: ""
+        val captPhoto = if (
+            FirebaseStorageManager.isPlaceholderAvatarUrl(rawCaptPhoto) ||
+            FirebaseStorageManager.isLocalDeviceUri(rawCaptPhoto)
+        ) "" else rawCaptPhoto.trim()
         val captEta = doc.getAnyString("estimatedArrival", "captainEta", "eta")
             ?: (if (captName != "في انتظار كابتن" && captName != "في انتظار قبول كابتن") "20 دقيقة" else "")
 
@@ -1375,145 +1407,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun acceptOrderInFirestore(orderDocId: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
-        val uid = Firebase.auth.currentUser?.uid ?: return
-        val currentCaptainName = _driverProfile.value.name.ifBlank {
-            Firebase.auth.currentUser?.displayName
-                ?: Firebase.auth.currentUser?.email?.substringBefore("@")
-                ?: "الكابتن أحمد محمود"
-        }
-        val currentCaptainPhone = _driverProfile.value.phone.ifBlank {
-            Firebase.auth.currentUser?.phoneNumber ?: "01098765432"
-        }
-        val currentCaptainPhoto = _driverProfile.value.photoUrl.ifBlank {
-            "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
-        }
-        val estimatedArrivalDuration = "20 دقيقة"
-
-        viewModelScope.launch {
-            try {
-                _isLoading.value = true
-                val acceptNowMs = System.currentTimeMillis()
-                val updates = hashMapOf<String, Any?>(
-                    "status" to "accepted",
-                    "driver_name" to currentCaptainName,
-                    "captainName" to currentCaptainName,
-                    "captainPhone" to currentCaptainPhone,
-                    "captainPhotoUrl" to currentCaptainPhoto,
-                    "captainId" to uid,
-                    "estimatedArrival" to estimatedArrivalDuration,
-                    "acceptedAt" to FieldValue.serverTimestamp(),
-                    "assignedAt" to FieldValue.serverTimestamp(),
-                    "acceptedAtMillis" to acceptNowMs
-                )
-
-                val collectionRef = Firebase.firestore.collection("orders")
-                val querySnapshot = collectionRef.get().await()
-
-                var matchedDoc = querySnapshot.documents.find { doc ->
-                    doc.id == orderDocId || doc.safeString("orderId") == orderDocId || doc.id.hashCode() == orderDocId.toIntOrNull()
-                }
-
-                if (matchedDoc == null && querySnapshot.documents.isNotEmpty()) {
-                    matchedDoc = querySnapshot.documents.firstOrNull { doc -> doc.safeString("status") == "pending" }
-                }
-
-                if (matchedDoc != null) {
-                    matchedDoc.reference.update(updates).await()
-
-                    // Also update local Room database if order matches
-                    try {
-                        val orders = repository.allOrders.firstOrNull() ?: emptyList()
-                        val localMatch = orders.find { it.id.toString() == orderDocId || it.id == orderDocId.toIntOrNull() || it.id == matchedDoc?.id.hashCode() }
-                        if (localMatch != null) {
-                            repository.updateOrder(
-                                localMatch.copy(
-                                    status = "في الطريق لك",
-                                    captainName = currentCaptainName,
-                                    captainPhone = currentCaptainPhone,
-                                    captainPhotoUrl = currentCaptainPhoto,
-                                    estimatedArrival = estimatedArrivalDuration
-                                )
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Log.w("OrderViewModel", "Failed to update local room on accept: ${e.message}")
-                    }
-
-                    _snackbarMessage.value = "تم قبول الطلب بنجاح! أنت الآن في الطريق للمطعم."
-                    onSuccess()
-                } else {
-                    _snackbarMessage.value = "تعذر العثور على الطلب المحدد"
-                    onError("الطلب غير موجود")
-                }
-            } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error accepting order in Firestore", e)
-                _snackbarMessage.value = "حدث خطأ أثناء قبول الطلب: ${e.localizedMessage}"
-                onError(e.localizedMessage ?: "خطأ بالاتصال")
-            } finally {
-                _isLoading.value = false
-            }
-        }
+        onError("هذا التطبيق مخصص للتاجر فقط ولا يدعم قبول الطلبات ككابتن")
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun completeOrderInFirestore(orderDocId: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
-        val uid = Firebase.auth.currentUser?.uid
-        viewModelScope.launch {
-            try {
-                _isLoading.value = true
-                val updates = hashMapOf<String, Any?>(
-                    "status" to "delivered",
-                    "dispatchStatus" to "completed"
-                )
-
-                val collectionRef = Firebase.firestore.collection("orders")
-                val querySnapshot = collectionRef.get().await()
-
-                val matchedDoc = querySnapshot.documents.find { doc ->
-                    doc.id == orderDocId || doc.safeString("orderId") == orderDocId || doc.id.hashCode() == orderDocId.toIntOrNull()
-                }
-
-                if (matchedDoc != null) {
-                    matchedDoc.reference.update(updates).await()
-                    try {
-                        val orders = repository.allOrders.firstOrNull() ?: emptyList()
-                        val localMatch = orders.find { it.id.toString() == orderDocId || it.id == orderDocId.toIntOrNull() || it.id == matchedDoc?.id.hashCode() }
-                        if (localMatch != null) {
-                            repository.updateOrderStatus(localMatch.id, "تم التسليم")
-                        }
-                    } catch (e: Exception) {
-                        Log.w("OrderViewModel", "Failed to update local room on complete: ${e.message}")
-                    }
-
-                    // Free the captain and increment trips
-                    if (uid != null) {
-                        try {
-                            Firebase.firestore.collection("captains").document(uid).update(
-                                mapOf(
-                                    "currentOrderId" to null,
-                                    "availabilityStatus" to "available",
-                                    "totalTrips" to FieldValue.increment(1)
-                                )
-                            ).await()
-                        } catch (e: Exception) {
-                            Log.w("OrderViewModel", "Failed to update captain availability on complete: ${e.message}")
-                        }
-                    }
-
-                    _snackbarMessage.value = "تم إكمال وتسليم الطلب بنجاح! تم إضافة الأرباح للمحفظة."
-                    onSuccess()
-                } else {
-                    _snackbarMessage.value = "تعذر العثور على الطلب لإنهائه"
-                    onError("الطلب غير موجود")
-                }
-            } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error completing order", e)
-                _snackbarMessage.value = "خطأ أثناء إكمال الطلب: ${e.localizedMessage}"
-                onError(e.localizedMessage ?: "خطأ بالاتصال")
-            } finally {
-                _isLoading.value = false
-            }
-        }
+        onError("هذا التطبيق مخصص للتاجر فقط ولا يدعم إنهاء التوصيل ككابتن")
     }
 
     fun clearSnackbarMessage() {
@@ -1663,15 +1564,17 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             if (uid.isNotEmpty()) {
                 try {
                     firestore.runTransaction { transaction ->
-                        // 1. Strict Subscription verification in Firestore (checks subscriptions/{uid} and restaurants/{uid})
+                        // 1. Strict Merchant verification & Subscription check (checks merchants/{uid} and subscriptions/{uid})
                         val subRef = firestore.collection("subscriptions").document(uid)
-                        val restRef = firestore.collection("restaurants").document(uid)
+                        val merchRef = firestore.collection("merchants").document(uid)
+                        val merchSnap = try { transaction.get(merchRef) } catch (_: Exception) { null }
+                        if (merchSnap == null || !merchSnap.exists() || merchSnap.safeString("accountType")?.trim()?.lowercase() != "merchant") {
+                            throw IllegalStateException("حساب التاجر غير مسجل أو غير مفعل في merchants.")
+                        }
                         val subSnap = try { transaction.get(subRef) } catch (_: Exception) { null }
-                        val restSnap = try { transaction.get(restRef) } catch (_: Exception) { null }
                         val activeDoc = when {
                             subSnap != null && subSnap.exists() -> subSnap
-                            restSnap != null && restSnap.exists() -> restSnap
-                            else -> null
+                            else -> merchSnap
                         }
                         if (activeDoc != null) {
                             val subStatus = activeDoc.safeString("status")
@@ -1813,7 +1716,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 status = "جاري البحث",
                 captainName = "في انتظار كابتن",
                 captainPhone = "",
-                captainPhotoUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=250&q=80"
+                captainPhotoUrl = ""
             )
             repository.insertOrder(newOrder)
 
@@ -1869,28 +1772,31 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             val orders = repository.allOrders.firstOrNull() ?: emptyList()
             val targetOrder = orders.find { it.id == orderId }
 
-            if ((nextStatus == "في الطريق لك" || nextStatus == "جاري التوصيل") && targetOrder != null && (targetOrder.captainName.isBlank() || targetOrder.captainName == "في انتظار كابتن" || targetOrder.captainName == "في انتظار قبول كابتن")) {
-                val assignedCaptainName = _driverProfile.value.name.ifBlank { "الكابتن أحمد محمود" }
-                val assignedCaptainPhone = _driverProfile.value.phone.ifBlank { "01098765432" }
-                val assignedCaptainPhoto = _driverProfile.value.photoUrl.ifBlank {
-                    "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=250&q=80"
-                }
-                val assignedEta = "20 دقيقة"
+            val currentDriverName = _driverProfile.value.name.trim()
+            val currentDriverPhone = _driverProfile.value.phone.trim()
+            val currentDriverPhoto = _driverProfile.value.photoUrl.trim().takeIf {
+                FirebaseStorageManager.isValidDisplayableCaptainPhoto(it)
+            } ?: ""
 
+            if ((nextStatus == "في الطريق لك" || nextStatus == "جاري التوصيل") &&
+                targetOrder != null &&
+                !FirebaseStorageManager.isValidCaptainName(targetOrder.captainName) &&
+                currentDriverName.isNotBlank()
+            ) {
                 repository.updateOrder(
                     targetOrder.copy(
                         status = nextStatus,
-                        captainName = assignedCaptainName,
-                        captainPhone = assignedCaptainPhone,
-                        captainPhotoUrl = assignedCaptainPhoto,
-                        estimatedArrival = assignedEta
+                        captainName = currentDriverName,
+                        captainPhone = currentDriverPhone.ifBlank { targetOrder.captainPhone },
+                        captainPhotoUrl = currentDriverPhoto.ifBlank { targetOrder.captainPhotoUrl },
+                        estimatedArrival = targetOrder.estimatedArrival.ifBlank { "20 دقيقة" }
                     )
                 )
             } else {
                 repository.updateOrderStatus(orderId, nextStatus)
             }
 
-            // Sync with Firestore
+            // Sync status with Firestore without ever overwriting real captain fields with placeholders
             try {
                 val firestoreStatus = when (nextStatus) {
                     "في الطريق لك" -> "accepted"
@@ -1903,14 +1809,15 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 val matchedDoc = querySnapshot.documents.find { doc ->
                     doc.id == orderId.toString() || doc.safeString("orderId") == orderId.toString() || doc.id.hashCode() == orderId
                 }
-                matchedDoc?.reference?.update(
-                    mapOf(
-                        "status" to firestoreStatus,
-                        "driver_name" to (_driverProfile.value.name.ifBlank { "الكابتن أحمد محمود" }),
-                        "captainName" to (_driverProfile.value.name.ifBlank { "الكابتن أحمد محمود" }),
-                        "captainPhone" to (_driverProfile.value.phone.ifBlank { "01098765432" })
-                    )
-                )?.await()
+                val updates = hashMapOf<String, Any>("status" to firestoreStatus)
+                if (currentDriverName.isNotBlank()) {
+                    updates["driver_name"] = currentDriverName
+                    updates["captainName"] = currentDriverName
+                }
+                if (currentDriverPhone.isNotBlank()) {
+                    updates["captainPhone"] = currentDriverPhone
+                }
+                matchedDoc?.reference?.update(updates)?.await()
             } catch (e: Exception) {
                 Log.w("OrderViewModel", "Could not sync advance status to Firestore: ${e.message}")
             }
@@ -2311,7 +2218,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         imageUri: String?,
         latitude: Double? = null,
         longitude: Double? = null,
-        locationUrl: String = _restaurantProfile.value.locationUrl
+        locationUrl: String = _restaurantProfile.value.locationUrl,
+        category: String = _restaurantProfile.value.category
     ) {
         if (!NetworkHelper.isNetworkAvailable(getApplication())) {
             val noNetMsg = "لا يمكن حفظ وتعديل البيانات: أنت غير متصل بالإنترنت!"
@@ -2328,8 +2236,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val projectId = try { Firebase.app.options.projectId } catch (e: Exception) { "unknown" }
         Log.d("FIREBASE_DEBUG", "saveRestaurantProfile called | Current UID: ${currentUser?.uid} | Firebase Project ID: $projectId")
 
-        if (currentUser == null) {
-            val err = "يرجى تسجيل الدخول أولاً لحفظ البيانات (UID is null)"
+        if (currentUser == null || !currentUser.isEmailVerified) {
+            val err = "يرجى تسجيل الدخول بحساب تاجر مؤكد البريد الإلكتروني أولاً"
             Log.e("FIREBASE_DEBUG", "AUTH_ERROR: $err")
             _errorMessage.value = err
             return
@@ -2346,22 +2254,24 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withTimeout(20000L) {
-                    Log.d("FIREBASE_DEBUG", "START_SAVING: UID=$uid, Name='$finalName', Phone='$phone', Address='$address', LocationUrl='$cleanLocationUrl'")
+                    Log.d("FIREBASE_DEBUG", "START_SAVING merchants/$uid: Name='$finalName', Phone='$phone', Address='$address'")
 
-                    val restDocRef = Firebase.firestore.collection("restaurants").document(uid)
                     val merchantDocRef = Firebase.firestore.collection("merchants").document(uid)
-                    val userDocRef = Firebase.firestore.collection("users").document(uid)
+                    val existingDoc = merchantDocRef.get().await()
+                    if (!existingDoc.exists() || existingDoc.safeString("accountType")?.trim()?.lowercase() != "merchant") {
+                        throw IllegalStateException("لا يوجد حساب تاجر صالح مسجل لهذا المستخدم في merchants/$uid")
+                    }
 
-                    val existingDoc = restDocRef.get().await()
-                    val existingRemoteLogoUrl = existingDoc?.safeString("photoUrl")
-                        ?: existingDoc?.safeString("logoUrl")
+                    val existingRemoteLogoUrl = existingDoc.safeString("logo")
+                        ?: existingDoc.safeString("photoUrl")
+                        ?: existingDoc.safeString("logoUrl")
                         ?: _restaurantProfile.value.photoUrl
                         ?: _restaurantProfile.value.logoUrl
                         ?: ""
-                    val existingStoragePath = existingDoc?.safeString("storagePath")
+                    val existingStoragePath = existingDoc.safeString("storagePath")
                         ?: _restaurantProfile.value.storagePath
 
-                    // 1. معالجة ورفع الصورة الجديدة حصرياً إلى Firebase Storage مع حماية الصورة السابقة عند الفشل
+                    // 1. رفع الصورة الجديدة حصرياً إلى Firebase Storage مع حماية الصورة السابقة عند الفشل
                     val currentImg = imageUri?.trim()
                     val uploadOutcome = if (FirebaseStorageManager.isLocalDeviceUri(currentImg)) {
                         val result = FirebaseStorageManager.uploadMerchantProfileImage(
@@ -2384,8 +2294,6 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         uploadResult = uploadOutcome
                     )
 
-                    Log.d("FIREBASE_DEBUG", "FIRESTORE_WRITE_STARTED | Target Project: $projectId | UID: $uid | finalLogoUrl=${finalLogoUrl.take(60)} | storagePath=$finalStoragePath")
-
                     val targetLocation = parseCoordinatesFromUrl(cleanLocationUrl)
                         ?: if (latitude != null && longitude != null) {
                             GeoPoint(latitude, longitude)
@@ -2393,117 +2301,39 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             _restaurantProfile.value.location
                         }
 
-                    if (existingDoc == null || !existingDoc.exists()) {
-                        // المستند غير موجود بعد: إنشاؤه بالكامل مع الحقول الأساسية المطابقة للقواعد
-                        val initialData = hashMapOf<String, Any>(
-                            "uid" to uid,
-                            "ownerId" to uid,
-                            "name" to finalName,
-                            "phone" to phone.trim(),
-                            "email" to (currentUser.email ?: ""),
-                            "address" to address.trim(),
-                            "locationUrl" to cleanLocationUrl,
-                            "mapLink" to cleanLocationUrl,
-                            "category" to "مطعم",
-                            "logoUrl" to finalLogoUrl,
-                            "photoUrl" to finalLogoUrl,
-                            "storagePath" to finalStoragePath,
-                            "status" to "active",
-                            "rating" to 5.0,
-                            "ratingCount" to 0L,
-                            "subscriptionStatus" to "unsubscribed",
-                            "subscriptionId" to "",
-                            "createdAt" to FieldValue.serverTimestamp(),
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                        if (targetLocation != null) {
-                            initialData["location"] = targetLocation
-                            initialData["latitude"] = targetLocation.latitude
-                            initialData["longitude"] = targetLocation.longitude
-                        }
-                        restDocRef.set(initialData).await()
-                        Log.d("FIREBASE_DEBUG", "RESTAURANTS_DOC_CREATED: restaurants/$uid")
-                    } else {
-                        // المستند موجود بالفعل: تحديث الحقول المسموح بها فقط دون لمس الحقول الإدارية المحمية
-                        val updateMap = mutableMapOf<String, Any>(
-                            "name" to finalName,
-                            "phone" to phone.trim(),
-                            "email" to (currentUser.email ?: ""),
-                            "address" to address.trim(),
-                            "locationUrl" to cleanLocationUrl,
-                            "mapLink" to cleanLocationUrl,
-                            "category" to "مطعم",
-                            "logoUrl" to finalLogoUrl,
-                            "photoUrl" to finalLogoUrl,
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                        if (finalStoragePath.isNotBlank()) {
-                            updateMap["storagePath"] = finalStoragePath
-                        }
-                        if (targetLocation != null) {
-                            updateMap["location"] = targetLocation
-                            updateMap["latitude"] = targetLocation.latitude
-                            updateMap["longitude"] = targetLocation.longitude
-                        }
-                        // تنظيف الحقول القديمة المكررة فقط إذا كانت موجودة في المستند
-                        if (existingDoc.contains("restaurantName")) updateMap["restaurantName"] = FieldValue.delete()
-                        if (existingDoc.contains("image")) updateMap["image"] = FieldValue.delete()
-                        if (existingDoc.contains("imageUri")) updateMap["imageUri"] = FieldValue.delete()
-                        if (existingDoc.contains("imageUrl")) updateMap["imageUrl"] = FieldValue.delete()
-
-                        restDocRef.update(updateMap).await()
-                        Log.d("FIREBASE_DEBUG", "RESTAURANTS_DOC_UPDATED: restaurants/$uid")
+                    val finalCategory = category.trim().ifBlank {
+                        existingDoc.safeString("category")?.takeIf { it.isNotBlank() }
+                            ?: _restaurantProfile.value.category.ifBlank { "مطعم" }
                     }
 
-                    // 3. مزامنة وحفظ مستند التاجر merchants/$uid لضمان بقاء البيانات عند تسجيل الدخول من أي جهاز
-                    try {
-                        val merchantMap = hashMapOf<String, Any>(
-                            "uid" to uid,
-                            "name" to finalName,
-                            "phone" to phone.trim(),
-                            "email" to (currentUser.email ?: ""),
-                            "address" to address.trim(),
-                            "locationUrl" to cleanLocationUrl,
-                            "mapLink" to cleanLocationUrl,
-                            "role" to "merchant",
-                            "status" to "approved",
-                            "isApproved" to true,
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                        if (finalLogoUrl.isNotBlank()) {
-                            merchantMap["photoUrl"] = finalLogoUrl
-                        }
-                        if (finalStoragePath.isNotBlank()) {
-                            merchantMap["storagePath"] = finalStoragePath
-                        }
-                        merchantDocRef.set(merchantMap, SetOptions.merge()).await()
-                        Log.d("FIREBASE_DEBUG", "MERCHANTS_DOC_SYNCED: merchants/$uid")
-                    } catch (mEx: Exception) {
-                        Log.w("FIREBASE_DEBUG", "merchants/$uid sync warning: ${mEx.message}")
+                    // التحديث الحصري في مستند merchants/{uid} فقط دون لمس restaurants أو captains أو users
+                    val updateMap = mutableMapOf<String, Any>(
+                        "uid" to uid,
+                        "name" to finalName,
+                        "phone" to phone.trim(),
+                        "email" to (currentUser.email ?: ""),
+                        "address" to address.trim(),
+                        "category" to finalCategory,
+                        "locationUrl" to cleanLocationUrl,
+                        "mapLink" to cleanLocationUrl,
+                        "logo" to finalLogoUrl,
+                        "photoUrl" to finalLogoUrl,
+                        "logoUrl" to finalLogoUrl,
+                        "accountType" to "merchant",
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                    if (finalStoragePath.isNotBlank()) {
+                        updateMap["storagePath"] = finalStoragePath
+                    }
+                    if (targetLocation != null) {
+                        updateMap["location"] = targetLocation
+                        updateMap["latitude"] = targetLocation.latitude
+                        updateMap["longitude"] = targetLocation.longitude
                     }
 
-                    // مزامنة مستند users/$uid بأمان
-                    try {
-                        val userData = hashMapOf<String, Any>(
-                            "name" to finalName,
-                            "displayName" to finalName,
-                            "phone" to phone.trim(),
-                            "address" to address.trim(),
-                            "locationUrl" to cleanLocationUrl,
-                            "mapLink" to cleanLocationUrl,
-                            "logoUrl" to finalLogoUrl,
-                            "photoUrl" to finalLogoUrl,
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                        if (finalStoragePath.isNotBlank()) {
-                            userData["storagePath"] = finalStoragePath
-                        }
-                        userDocRef.set(userData, SetOptions.merge()).await()
-                    } catch (userEx: Exception) {
-                        Log.w("FIREBASE_DEBUG", "Users collection sync note: ${userEx.message}")
-                    }
+                    merchantDocRef.set(updateMap, SetOptions.merge()).await()
+                    Log.d("FIREBASE_DEBUG", "MERCHANTS_DOC_UPDATED_EXCLUSIVELY: merchants/$uid")
 
-                    // تحديث الـ StateFlow الخاص بالبروفايل فوراً
                     _restaurantProfile.value = RestaurantProfile(
                         name = finalName,
                         phone = phone.trim(),
@@ -2513,6 +2343,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         photoUrl = finalLogoUrl.ifBlank { existingRemoteLogoUrl.ifBlank { null } },
                         storagePath = finalStoragePath,
                         email = Firebase.auth.currentUser?.email ?: "",
+                        category = finalCategory,
                         ownerId = uid,
                         uid = uid,
                         location = targetLocation,
@@ -2529,13 +2360,11 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 _isSaveSuccess.value = false
             } catch (e: Exception) {
                 Log.e("FIREBASE_DEBUG", "FIRESTORE_WRITE_EXCEPTION: ${e.javaClass.simpleName} - ${e.message}", e)
-                e.printStackTrace()
-                val detailedError = e.localizedMessage ?: e.message ?: "فشل حفظ بيانات المطعم"
+                val detailedError = e.localizedMessage ?: e.message ?: "فشل حفظ بيانات التاجر"
                 _errorMessage.value = detailedError
                 _isSaveSuccess.value = false
             } finally {
                 _isSaving.value = false
-                Log.d("FIREBASE_DEBUG", "saveRestaurantProfile finished | isSaving reset to false")
             }
         }
     }
@@ -2560,69 +2389,36 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
         restaurantSubListener?.remove()
 
-        fun fallbackToRestaurantOrMerchantDoc() {
-            Firebase.firestore.collection("restaurants").document(uid).get()
-                .addOnSuccessListener { restSnapshot ->
-                    val restSubStatus = restSnapshot?.safeString("subscriptionStatus")?.lowercase(Locale.ROOT)
-                    val restPayStatus = restSnapshot?.safeString("paymentStatus")?.lowercase(Locale.ROOT)
-                    val hasExplicitPlan = restSnapshot != null && restSnapshot.exists() && (
-                        (restSnapshot.getBoolean("isSubscribed") == true &&
-                            (((restSnapshot.get("planId") as? Number)?.toInt() ?: 0) > 0 ||
-                                ((restSnapshot.get("maxCaptains") as? Number)?.toInt() ?: 0) > 0)) ||
-                            restSubStatus == "payment_failed" || restPayStatus == "failed"
+        fun fallbackToMerchantDoc() {
+            Firebase.firestore.collection("merchants").document(uid).get()
+                .addOnSuccessListener { merchSnapshot ->
+                    val merchSubStatus = merchSnapshot?.safeString("subscriptionStatus")?.lowercase(Locale.ROOT)
+                    val merchPayStatus = merchSnapshot?.safeString("paymentStatus")?.lowercase(Locale.ROOT)
+                    val hasMerchantPlan = merchSnapshot != null && merchSnapshot.exists() && (
+                        (merchSnapshot.getBoolean("isSubscribed") == true &&
+                            (((merchSnapshot.get("planId") as? Number)?.toInt() ?: 0) > 0 ||
+                                ((merchSnapshot.get("maxCaptains") as? Number)?.toInt() ?: 0) > 0)) ||
+                            merchSubStatus == "payment_failed" || merchPayStatus == "failed"
                         )
-                    if (hasExplicitPlan && restSnapshot != null) {
-                        processSubscriptionDocument(uid, "restaurants", restSnapshot)
+                    if (hasMerchantPlan && merchSnapshot != null) {
+                        processSubscriptionDocument(uid, "merchants", merchSnapshot)
                     } else {
-                        Firebase.firestore.collection("merchants").document(uid).get()
-                            .addOnSuccessListener { merchSnapshot ->
-                                val merchSubStatus = merchSnapshot?.safeString("subscriptionStatus")?.lowercase(Locale.ROOT)
-                                val merchPayStatus = merchSnapshot?.safeString("paymentStatus")?.lowercase(Locale.ROOT)
-                                val hasMerchantPlan = merchSnapshot != null && merchSnapshot.exists() && (
-                                    (merchSnapshot.getBoolean("isSubscribed") == true &&
-                                        (((merchSnapshot.get("planId") as? Number)?.toInt() ?: 0) > 0 ||
-                                            ((merchSnapshot.get("maxCaptains") as? Number)?.toInt() ?: 0) > 0)) ||
-                                        merchSubStatus == "payment_failed" || merchPayStatus == "failed"
-                                    )
-                                if (hasMerchantPlan && merchSnapshot != null) {
-                                    processSubscriptionDocument(uid, "merchants", merchSnapshot)
-                                } else {
-                                    _subscriptionStatus.value = SubscriptionStatusState(
-                                        isChecking = false,
-                                        isSubscribed = false,
-                                        isExpired = false,
-                                        status = "unsubscribed",
-                                        startDateMillis = null,
-                                        endDateMillis = null,
-                                        message = "أنت غير مشترك في أي باقة حالياً",
-                                        planId = 0,
-                                        planName = "غير مشترك",
-                                        maxCaptains = 0,
-                                        price = 0,
-                                        activeCaptainsCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) },
-                                        availableCaptainSlots = 0,
-                                        paymentStatus = "unpaid"
-                                    )
-                                }
-                            }
-                            .addOnFailureListener {
-                                _subscriptionStatus.value = SubscriptionStatusState(
-                                    isChecking = false,
-                                    isSubscribed = false,
-                                    isExpired = false,
-                                    status = "unsubscribed",
-                                    startDateMillis = null,
-                                    endDateMillis = null,
-                                    message = "أنت غير مشترك في أي باقة حالياً",
-                                    planId = 0,
-                                    planName = "غير مشترك",
-                                    maxCaptains = 0,
-                                    price = 0,
-                                    activeCaptainsCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) },
-                                    availableCaptainSlots = 0,
-                                    paymentStatus = "unpaid"
-                                )
-                            }
+                        _subscriptionStatus.value = SubscriptionStatusState(
+                            isChecking = false,
+                            isSubscribed = false,
+                            isExpired = false,
+                            status = "unsubscribed",
+                            startDateMillis = null,
+                            endDateMillis = null,
+                            message = "أنت غير مشترك في أي باقة حالياً",
+                            planId = 0,
+                            planName = "غير مشترك",
+                            maxCaptains = 0,
+                            price = 0,
+                            activeCaptainsCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) },
+                            availableCaptainSlots = 0,
+                            paymentStatus = "unpaid"
+                        )
                     }
                 }
                 .addOnFailureListener {
@@ -2650,14 +2446,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             .addSnapshotListener { subSnapshot, error ->
                 if (error != null) {
                     Log.w("OrderViewModel", "Error listening to subscriptions/$uid: ${error.message}")
-                    fallbackToRestaurantOrMerchantDoc()
+                    fallbackToMerchantDoc()
                     return@addSnapshotListener
                 }
 
                 if (subSnapshot != null && subSnapshot.exists()) {
                     processSubscriptionDocument(uid, "subscriptions", subSnapshot)
                 } else {
-                    // Try querying 'subscriptions' collection by merchantId, restaurantId, or userId
                     Firebase.firestore.collection("subscriptions")
                         .whereEqualTo("merchantId", uid)
                         .limit(1)
@@ -2666,11 +2461,11 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                             if (!qSnap.isEmpty) {
                                 processSubscriptionDocument(uid, "subscriptions", qSnap.documents[0])
                             } else {
-                                fallbackToRestaurantOrMerchantDoc()
+                                fallbackToMerchantDoc()
                             }
                         }
                         .addOnFailureListener {
-                            fallbackToRestaurantOrMerchantDoc()
+                            fallbackToMerchantDoc()
                         }
                 }
             }
@@ -2779,14 +2574,6 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             try {
-                Firebase.firestore.collection("restaurants").document(uid)
-                    .set(profileSubFields, SetOptions.merge())
-                    .await()
-            } catch (e: Exception) {
-                Log.w("OrderViewModel", "Note writing subscription to restaurants/$uid: ${e.message}")
-            }
-
-            try {
                 Firebase.firestore.collection("merchants").document(uid)
                     .set(profileSubFields, SetOptions.merge())
                     .await()
@@ -2848,16 +2635,6 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     Firebase.firestore.collection("subscriptions").document(uid)
                         .set(failedMap, SetOptions.merge()).await()
-                    Firebase.firestore.collection("restaurants").document(uid)
-                        .set(
-                            mapOf(
-                                "isSubscribed" to false,
-                                "subscriptionStatus" to "payment_failed",
-                                "paymentStatus" to "failed",
-                                "maxCaptains" to 0
-                            ),
-                            SetOptions.merge()
-                        )
                     Firebase.firestore.collection("merchants").document(uid)
                         .set(
                             mapOf(
@@ -2867,7 +2644,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                                 "maxCaptains" to 0
                             ),
                             SetOptions.merge()
-                        )
+                        ).await()
                 } catch (e: Exception) {
                     Log.w("OrderViewModel", "Note updating failed payment state in Firestore: ${e.message}")
                 }
@@ -3056,10 +2833,19 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         restaurantSubListener?.remove()
         orderTrackingListener?.remove()
         orderTrackingListener = null
+        captainTrackingListener?.remove()
+        captainTrackingListener = null
+        currentTrackedCaptainId = null
         userOrdersDocs.clear()
         restaurantOrdersDocs.clear()
         merchantOrdersDocs.clear()
+        captainInfoCache.clear()
+        captainInfoByPhoneCache.clear()
+        captainLookupTimestampMs.clear()
+        resolvedOrderStoragePhotoCache.clear()
         _firestoreOrders.value = emptyList()
+        _restaurantProfile.value = RestaurantProfile()
+        _trackedCaptainInfo.value = null
         _subscriptionStatus.value = SubscriptionStatusState(isChecking = false, isExpired = false)
     }
 }

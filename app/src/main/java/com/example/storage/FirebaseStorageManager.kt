@@ -77,6 +77,7 @@ object FirebaseStorageManager {
 
     // In-memory audit log of migration records per merchant, enabling inspection and retry of failed items
     private val migrationAuditLog = ConcurrentHashMap<String, ImageMigrationRecord>()
+    private val resolvedStorageUrlCache = ConcurrentHashMap<String, String>()
 
     fun getMigrationRecordsForMerchant(merchantUid: String): List<ImageMigrationRecord> {
         return migrationAuditLog.values
@@ -94,15 +95,40 @@ object FirebaseStorageManager {
     }
 
     /**
-     * Checks whether a given URL is hosted on Firebase Storage or encoded for cloud persistence.
+     * Returns true if the URL is blank or a stock placeholder avatar (e.g., Unsplash default)
+     * rather than a real captain/merchant image stored in Firebase Storage.
+     */
+    fun isPlaceholderAvatarUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return true
+        val lower = url.trim().lowercase()
+        return lower.contains("images.unsplash.com") ||
+            lower.contains("via.placeholder")
+    }
+
+    /**
+     * Checks whether a captain name is a real registered name rather than a generic status/placeholder label.
+     */
+    fun isValidCaptainName(name: String?): Boolean {
+        val trimmed = name?.trim().orEmpty()
+        if (trimmed.isEmpty()) return false
+        return trimmed !in listOf(
+            "في انتظار كابتن",
+            "في انتظار قبول كابتن",
+            "الكابتن",
+            "كابتن التوصيل",
+            "الكابتن أحمد محمود"
+        )
+    }
+
+    /**
+     * Checks whether a URL is hosted on Firebase Storage (`https://firebasestorage...` or `gs://...`).
      */
     fun isFirebaseStorageUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
         val trimmed = url.trim().lowercase()
         return trimmed.contains("firebasestorage.googleapis.com") ||
             trimmed.contains(".firebasestorage.app") ||
-            trimmed.startsWith("gs://") ||
-            trimmed.startsWith("data:image/")
+            trimmed.startsWith("gs://")
     }
 
     /**
@@ -114,6 +140,70 @@ object FirebaseStorageManager {
         return trimmed.startsWith("https://") ||
             trimmed.startsWith("http://") ||
             trimmed.startsWith("data:image/")
+    }
+
+    /**
+     * Checks whether a string is a displayable remote captain image URL (not blank, not placeholder, not local device URI).
+     */
+    fun isValidDisplayableCaptainPhoto(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val trimmed = url.trim()
+        return !isPlaceholderAvatarUrl(trimmed) &&
+            !isLocalDeviceUri(trimmed) &&
+            isRemoteHttpUrl(trimmed)
+    }
+
+    /**
+     * Selects the best captain photo URL, strictly preferring authentic Firebase Storage URLs
+     * over generic remote URLs, and always preferring authoritative captain DB/Storage records
+     * over potentially stale or placeholder values on the order document.
+     */
+    fun selectBestCaptainPhotoUrl(
+        captainDocPhotoUrl: String?,
+        resolvedOrderStorageUrl: String?,
+        orderDocPhotoUrl: String?
+    ): String {
+        val candidates = listOf(captainDocPhotoUrl, resolvedOrderStorageUrl, orderDocPhotoUrl)
+            .map { it?.trim().orEmpty() }
+            .filter { isValidDisplayableCaptainPhoto(it) }
+
+        return candidates.firstOrNull { isFirebaseStorageUrl(it) }
+            ?: candidates.firstOrNull()
+            ?: ""
+    }
+
+    /**
+     * Selects the authoritative captain name and phone, preferring non-placeholder data from
+     * the real `captains/{captainId}` Firestore profile over stale/generic values on the order doc.
+     */
+    fun selectAuthoritativeCaptainName(
+        captainDocName: String?,
+        orderDocName: String?,
+        captainId: String?
+    ): String {
+        val docName = captainDocName?.trim().orEmpty()
+        val orderName = orderDocName?.trim().orEmpty()
+        return when {
+            isValidCaptainName(docName) -> docName
+            isValidCaptainName(orderName) -> orderName
+            docName.isNotEmpty() -> docName
+            orderName.isNotEmpty() -> orderName
+            !captainId.isNullOrBlank() -> "الكابتن"
+            else -> "في انتظار كابتن"
+        }
+    }
+
+    fun selectAuthoritativeCaptainPhone(
+        captainDocPhone: String?,
+        orderDocPhone: String?
+    ): String {
+        val docPhone = captainDocPhone?.trim().orEmpty()
+            .takeIf { it != "01098765432" }
+            .orEmpty()
+        val ordPhone = orderDocPhone?.trim().orEmpty()
+            .takeIf { it != "01098765432" }
+            .orEmpty()
+        return docPhone.ifBlank { ordPhone }
     }
 
     /**
@@ -132,6 +222,137 @@ object FirebaseStorageManager {
             }
         }
         return trimmed
+    }
+
+    /**
+     * Resolves a Firebase Storage path (e.g. `captains/{uid}/profile.jpg`), `gs://...` reference,
+     * or direct HTTPS URL into a displayable download URL.
+     */
+    suspend fun resolveFirebaseStorageDownloadUrl(rawPathOrUrl: String?): String = withContext(Dispatchers.IO) {
+        val trimmed = rawPathOrUrl?.trim().orEmpty()
+        if (trimmed.isEmpty() || isPlaceholderAvatarUrl(trimmed) || isLocalDeviceUri(trimmed)) {
+            return@withContext ""
+        }
+        if (trimmed.startsWith("https://", ignoreCase = true) ||
+            trimmed.startsWith("http://", ignoreCase = true) ||
+            trimmed.startsWith("data:image/", ignoreCase = true)
+        ) {
+            return@withContext trimmed
+        }
+        resolvedStorageUrlCache[trimmed]?.let { cached ->
+            if (cached.isNotBlank()) return@withContext cached
+        }
+        return@withContext try {
+            val storageRef = if (trimmed.startsWith("gs://", ignoreCase = true)) {
+                Firebase.storage.getReferenceFromUrl(trimmed)
+            } else {
+                Firebase.storage.reference.child(trimmed.removePrefix("/"))
+            }
+            val url = kotlinx.coroutines.withTimeout(6000L) {
+                storageRef.downloadUrl.await().toString()
+            }
+            if (url.isNotBlank()) {
+                resolvedStorageUrlCache[trimmed] = url
+            }
+            url
+        } catch (e: Exception) {
+            safeLogW("Could not resolve storage path '$trimmed': ${e.message}")
+            ""
+        }
+    }
+
+    /**
+     * Searches Firebase Storage under `captains/{captainId}/...`, `drivers/{captainId}/...`,
+     * `captain_photos/{captainId}/...`, `profile_images/{captainId}/...`, `avatars/{captainId}/...`,
+     * and `users/{captainId}/...` to find a captain's real uploaded photo URL.
+     */
+    suspend fun findCaptainPhotoInStorage(
+        captainId: String,
+        bypassCache: Boolean = false
+    ): String = withContext(Dispatchers.IO) {
+        val cleanId = captainId.trim()
+        if (cleanId.isEmpty()) return@withContext ""
+        val cacheKey = "captain_lookup:$cleanId"
+        if (!bypassCache) {
+            resolvedStorageUrlCache[cacheKey]?.let { cached ->
+                if (cached.isNotBlank()) return@withContext cached
+            }
+        } else {
+            resolvedStorageUrlCache.remove(cacheKey)
+        }
+
+        val storage = Firebase.storage
+        val folderPrefixes = listOf(
+            "captains/$cleanId",
+            "drivers/$cleanId",
+            "captain_photos/$cleanId",
+            "profile_images/$cleanId",
+            "avatars/$cleanId",
+            "users/$cleanId"
+        )
+        for (prefix in folderPrefixes) {
+            try {
+                val listResult = kotlinx.coroutines.withTimeout(4500L) {
+                    storage.reference.child(prefix).list(10).await()
+                }
+                val preferredItem = listResult.items.firstOrNull { item ->
+                    val n = item.name.lowercase()
+                    n.contains("profile") || n.contains("avatar") || n.contains("photo") ||
+                        n.contains("face") || n.contains("image") || n.contains("logo") || n.contains("selfie")
+                } ?: listResult.items.firstOrNull()
+                if (preferredItem != null) {
+                    val url = kotlinx.coroutines.withTimeout(4500L) {
+                        preferredItem.downloadUrl.await().toString()
+                    }
+                    if (url.isNotBlank()) {
+                        resolvedStorageUrlCache[cacheKey] = url
+                        return@withContext url
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val directCandidates = listOf(
+            "captains/$cleanId/profile.jpg",
+            "captains/$cleanId/profile.png",
+            "captains/$cleanId/avatar.jpg",
+            "captains/$cleanId/avatar.png",
+            "captains/$cleanId/photo.jpg",
+            "captains/$cleanId/photo.png",
+            "captains/$cleanId/logo.jpg",
+            "captains/$cleanId/logo.png",
+            "captains/$cleanId/image.jpg",
+            "captains/$cleanId.jpg",
+            "captains/$cleanId.png",
+            "drivers/$cleanId/profile.jpg",
+            "drivers/$cleanId/avatar.jpg",
+            "drivers/$cleanId/photo.jpg",
+            "drivers/$cleanId.jpg",
+            "users/$cleanId/profile.jpg",
+            "users/$cleanId/photo.jpg",
+            "profile_images/$cleanId/profile.jpg",
+            "profile_images/$cleanId.jpg",
+            "profile_images/$cleanId.png",
+            "captain_photos/$cleanId/profile.jpg",
+            "captain_photos/$cleanId.jpg",
+            "captain_photos/$cleanId.png",
+            "avatars/$cleanId.jpg",
+            "avatars/$cleanId.png"
+        )
+        for (path in directCandidates) {
+            try {
+                val url = kotlinx.coroutines.withTimeout(3500L) {
+                    storage.reference.child(path).downloadUrl.await().toString()
+                }
+                if (url.isNotBlank()) {
+                    resolvedStorageUrlCache[cacheKey] = url
+                    return@withContext url
+                }
+            } catch (_: Exception) {
+            }
+        }
+        ""
     }
 
     /**
@@ -213,7 +434,7 @@ object FirebaseStorageManager {
         return try {
             val originalBitmap = android.graphics.BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
             if (originalBitmap != null) {
-                val maxDim = 360
+                val maxDim = 720
                 val width = originalBitmap.width.coerceAtLeast(1)
                 val height = originalBitmap.height.coerceAtLeast(1)
                 val scale = minOf(maxDim.toFloat() / width, maxDim.toFloat() / height, 1f)
@@ -225,7 +446,7 @@ object FirebaseStorageManager {
                     originalBitmap
                 }
                 val out = java.io.ByteArrayOutputStream()
-                scaledBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 75, out)
+                scaledBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, out)
                 out.toByteArray().takeIf { it.isNotEmpty() } ?: rawBytes
             } else {
                 rawBytes
@@ -236,9 +457,9 @@ object FirebaseStorageManager {
     }
 
     /**
-     * Uploads a newly selected local image to Firebase Storage under `merchants/{uid}/profile.jpg`.
-     * Compresses the image first, sets fast retry bounds so it never hangs, and falls back to
-     * a cloud-compatible encoded JPEG URI if remote bucket security rules block direct client writes.
+     * Uploads a newly selected local image exclusively to Firebase Storage under `merchants/{uid}/profile.jpg`.
+     * Returns failure if the upload or download URL retrieval fails so callers can surface the error
+     * instead of silently losing the logo or saving a non-Storage placeholder.
      */
     suspend fun uploadMerchantProfileImage(
         context: Context,
@@ -264,8 +485,8 @@ object FirebaseStorageManager {
 
         val storage = Firebase.storage
         try {
-            storage.maxUploadRetryTimeMillis = 3500L
-            storage.maxOperationRetryTimeMillis = 3500L
+            storage.maxUploadRetryTimeMillis = 15_000L
+            storage.maxOperationRetryTimeMillis = 10_000L
         } catch (_: Throwable) {}
 
         val storageRef = storage.reference.child(storagePath)
@@ -275,18 +496,19 @@ object FirebaseStorageManager {
             .setCustomMetadata("source", "firebase_storage_official")
             .build()
 
-        try {
-            val taskSnapshot = kotlinx.coroutines.withTimeout(5000L) {
+        return@withContext try {
+            val taskSnapshot = kotlinx.coroutines.withTimeout(25_000L) {
                 storageRef.putBytes(compressedBytes, metadata).await()
             }
-            val downloadUrl = kotlinx.coroutines.withTimeout(4000L) {
+            val downloadUrl = kotlinx.coroutines.withTimeout(10_000L) {
                 storageRef.downloadUrl.await().toString()
             }
-            if (!isRemoteHttpUrl(downloadUrl)) {
+            if (!isFirebaseStorageUrl(downloadUrl)) {
                 throw IllegalStateException("تعذر استخراج رابط تحميل صالح من Firebase Storage")
             }
-            safeLogD("Uploaded merchant image to Firebase Storage ($storagePath): $downloadUrl")
-            return@withContext Result.success(
+            resolvedStorageUrlCache[storagePath] = downloadUrl
+            safeLogD("Uploaded merchant logo to Firebase Storage ($storagePath): $downloadUrl")
+            Result.success(
                 StorageUploadResult(
                     downloadUrl = downloadUrl,
                     storagePath = storagePath,
@@ -294,21 +516,8 @@ object FirebaseStorageManager {
                 )
             )
         } catch (storageEx: Exception) {
-            safeLogW("Direct Firebase Storage bucket write note (${storageEx.message}), using compressed cloud data URI")
-            return@withContext try {
-                val base64Encoded = android.util.Base64.encodeToString(compressedBytes, android.util.Base64.NO_WRAP)
-                val dataUri = "data:image/jpeg;base64,$base64Encoded"
-                Result.success(
-                    StorageUploadResult(
-                        downloadUrl = dataUri,
-                        storagePath = storagePath,
-                        sizeBytes = compressedBytes.size.toLong()
-                    )
-                )
-            } catch (fallbackEx: Exception) {
-                safeLogE("Image upload and encoding failed for $uid: ${fallbackEx.message}", fallbackEx)
-                Result.failure(fallbackEx)
-            }
+            safeLogE("Firebase Storage upload failed for $storagePath: ${storageEx.message}", storageEx)
+            Result.failure(storageEx)
         }
     }
 
@@ -502,21 +711,11 @@ object FirebaseStorageManager {
         legacyBackupUrl: String
     ) {
         val firestore = Firebase.firestore
-        val updates = hashMapOf<String, Any>(
-            "logoUrl" to newDownloadUrl,
-            "photoUrl" to newDownloadUrl,
-            "storagePath" to storagePath,
-            "legacyImageBackupUrl" to legacyBackupUrl,
-            "imageMigratedAt" to FieldValue.serverTimestamp(),
-            "updatedAt" to FieldValue.serverTimestamp()
-        )
-        firestore.collection("restaurants").document(merchantUid)
-            .set(updates, SetOptions.merge())
-            .await()
-
         firestore.collection("merchants").document(merchantUid)
             .set(
                 hashMapOf(
+                    "logo" to newDownloadUrl,
+                    "logoUrl" to newDownloadUrl,
                     "photoUrl" to newDownloadUrl,
                     "storagePath" to storagePath,
                     "legacyImageBackupUrl" to legacyBackupUrl,

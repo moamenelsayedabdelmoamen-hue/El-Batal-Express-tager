@@ -96,6 +96,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Category
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.KeyboardOptions
@@ -150,10 +151,12 @@ import com.example.ui.theme.Primary
 import com.example.R
 import android.app.Activity
 import com.example.auth.MerchantAuthManager
+import com.example.auth.MerchantRegistrationRequest
+import com.example.auth.MerchantRegistrationResult
 import com.example.auth.MerchantSignInResult
 
 @Composable
-fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
+fun LoginScreen(onLoginSuccess: (com.example.auth.MerchantAccount) -> Unit, onRegisterClick: () -> Unit) {
     val context = LocalContext.current
     val sharedPreferences = remember {
         context.getSharedPreferences("login_prefs", Context.MODE_PRIVATE)
@@ -331,7 +334,7 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
                         scope.launch {
                             Log.d("FirebaseAuth", "بدء عملية تسجيل الدخول...")
                             try {
-                                when (val authRes = MerchantAuthManager.signInWithEmailOrProvision(context, trimmedEmail, rawPassword)) {
+                                when (val authRes = MerchantAuthManager.signInWithEmail(context, trimmedEmail, rawPassword)) {
                                     is MerchantSignInResult.Success -> {
                                         sharedPreferences.edit().apply {
                                             putBoolean("remember_me", rememberMe)
@@ -343,7 +346,11 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
                                             apply()
                                         }
                                         Toast.makeText(context, "تم تسجيل الدخول بنجاح! مرحباً ${authRes.merchant.name}", Toast.LENGTH_SHORT).show()
-                                        onLoginSuccess()
+                                        onLoginSuccess(authRes.merchant)
+                                    }
+                                    is MerchantSignInResult.EmailNotVerified -> {
+                                        errorMessageText = authRes.message
+                                        showUnverifiedEmailDialog = true
                                     }
                                     is MerchantSignInResult.NotRegistered -> {
                                         errorMessageText = authRes.message
@@ -603,13 +610,18 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
     }
 
     if (showUnverifiedEmailDialog) {
+        var verificationDialogStatus by remember { mutableStateOf<String?>(null) }
+        var isCheckingVerificationDialog by remember { mutableStateOf(false) }
+
         AlertDialog(
             onDismissRequest = {
-                if (!isResendingVerification) showUnverifiedEmailDialog = false
+                if (!isResendingVerification && !isCheckingVerificationDialog) {
+                    showUnverifiedEmailDialog = false
+                }
             },
             title = {
                 Text(
-                    text = "الحساب غير مفعّل",
+                    text = "تأكيد البريد الإلكتروني مطلوب",
                     fontWeight = FontWeight.Bold,
                     style = MaterialTheme.typography.titleMedium
                 )
@@ -617,84 +629,139 @@ fun LoginScreen(onLoginSuccess: () -> Unit, onRegisterClick: () -> Unit) {
             text = {
                 Column {
                     Text(
-                        text = "البريد الإلكتروني لم يتم تفعيله بعد. يرجى فتح صندوق الوارد (أو مجلد الرسائل غير المرغوب فيها Spam) والضغط على رابط التفعيل.",
+                        text = "لا يمكن تسجيل الدخول قبل تأكيد بريدك الإلكتروني. يرجى فتح صندوق الوارد (أو مجلد الرسائل غير المرغوب فيها Spam) والضغط على رابط التأكيد.",
                         style = MaterialTheme.typography.bodyMedium
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "إذا لم تجد رسالة التفعيل، يمكنك طلب إعادة إرسالها الآن.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    if (verificationDialogStatus != null) {
+                        Text(
+                            text = verificationDialogStatus!!,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            val trimmedEmail = email.trim().lowercase()
+                            val rawPassword = password.trim()
+                            if (trimmedEmail.isEmpty() || rawPassword.isEmpty()) {
+                                verificationDialogStatus = "يرجى إدخال البريد الإلكتروني وكلمة المرور أولاً"
+                                return@OutlinedButton
+                            }
+                            if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
+                                com.example.network.NetworkHelper.notifyNoInternet(context, "إعادة إرسال رابط التأكيد")
+                                return@OutlinedButton
+                            }
+                            isResendingVerification = true
+                            verificationDialogStatus = null
+                            scope.launch {
+                                val resendRes = MerchantAuthManager.resendVerificationEmail(
+                                    context = context,
+                                    email = trimmedEmail,
+                                    password = rawPassword
+                                )
+                                isResendingVerification = false
+                                verificationDialogStatus = if (resendRes.isSuccess) {
+                                    "تم إعادة إرسال رسالة التأكيد بنجاح. يرجى فحص بريدك الإلكتروني."
+                                } else {
+                                    "تعذر إعادة الإرسال: ${resendRes.exceptionOrNull()?.localizedMessage ?: "حاول مرة أخرى"}"
+                                }
+                            }
+                        },
+                        enabled = !isResendingVerification && !isCheckingVerificationDialog,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("login_resend_verification_button")
+                    ) {
+                        if (isResendingVerification) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        Text("إعادة إرسال رسالة التأكيد")
+                    }
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        val trimmedEmail = email.trim()
+                        val trimmedEmail = email.trim().lowercase()
                         val rawPassword = password.trim()
                         if (trimmedEmail.isEmpty() || rawPassword.isEmpty()) {
-                            Toast.makeText(context, "يرجى كتابة البريد وكلمة المرور لإعادة الإرسال", Toast.LENGTH_SHORT).show()
+                            verificationDialogStatus = "يرجى كتابة البريد الإلكتروني وكلمة المرور للتحقق"
                             return@Button
                         }
                         if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
-                            com.example.network.NetworkHelper.notifyNoInternet(context, "إعادة إرسال رابط التفعيل")
+                            com.example.network.NetworkHelper.notifyNoInternet(context, "التحقق من حالة التأكيد")
                             return@Button
                         }
-                        isResendingVerification = true
+                        isCheckingVerificationDialog = true
+                        verificationDialogStatus = null
                         scope.launch {
-                            try {
-                                val res = MerchantAuthManager.signInWithEmailOrProvision(context, trimmedEmail, rawPassword)
-                                if (res is MerchantSignInResult.Success) {
-                                    try {
-                                        Firebase.auth.currentUser?.sendEmailVerification()?.await()
-                                    } catch (_: Exception) {}
-                                    isResendingVerification = false
+                            when (val checkRes = MerchantAuthManager.checkEmailVerificationAndSignIn(
+                                context = context,
+                                email = trimmedEmail,
+                                password = rawPassword
+                            )) {
+                                is MerchantSignInResult.Success -> {
+                                    isCheckingVerificationDialog = false
                                     showUnverifiedEmailDialog = false
+                                    errorMessageText = null
+                                    sharedPreferences.edit().apply {
+                                        putBoolean("remember_me", rememberMe)
+                                        if (rememberMe) putString("saved_email", trimmedEmail) else remove("saved_email")
+                                        apply()
+                                    }
                                     Toast.makeText(
                                         context,
-                                        "تم تفعيل الجلسة بنجاح! جاري الدخول...",
+                                        "تم تأكيد البريد الإلكتروني وتسجيل الدخول بنجاح!",
                                         Toast.LENGTH_SHORT
                                     ).show()
-                                    onLoginSuccess()
-                                } else {
-                                    isResendingVerification = false
-                                    Toast.makeText(
-                                        context,
-                                        "تعذر إعادة الإرسال: تأكد من صحة البريد وكلمة المرور",
-                                        Toast.LENGTH_LONG
-                                    ).show()
+                                    onLoginSuccess(checkRes.merchant)
                                 }
-                            } catch (e: Exception) {
-                                isResendingVerification = false
-                                Toast.makeText(
-                                    context,
-                                    "تعذر إعادة الإرسال: ${e.localizedMessage ?: e.message}",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                                is MerchantSignInResult.EmailNotVerified -> {
+                                    MerchantAuthManager.signOutMerchant(context)
+                                    isCheckingVerificationDialog = false
+                                    verificationDialogStatus = checkRes.message
+                                }
+                                is MerchantSignInResult.NotRegistered -> {
+                                    isCheckingVerificationDialog = false
+                                    showUnverifiedEmailDialog = false
+                                    errorMessageText = checkRes.message
+                                }
+                                is MerchantSignInResult.Error -> {
+                                    isCheckingVerificationDialog = false
+                                    verificationDialogStatus = checkRes.message
+                                }
+                                is MerchantSignInResult.Cancelled -> {
+                                    isCheckingVerificationDialog = false
+                                }
                             }
                         }
                     },
-                    enabled = !isResendingVerification,
-                    colors = ButtonDefaults.buttonColors(containerColor = Primary)
+                    enabled = !isResendingVerification && !isCheckingVerificationDialog,
+                    colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                    modifier = Modifier.testTag("login_check_verification_button")
                 ) {
-                    if (isResendingVerification) {
+                    if (isCheckingVerificationDialog) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(18.dp),
                             color = Color.White,
                             strokeWidth = 2.dp
                         )
                     } else {
-                        Text("إعادة إرسال الرابط", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text("التحقق من حالة التأكيد", color = Color.White, fontWeight = FontWeight.Bold)
                     }
                 }
             },
             dismissButton = {
                 TextButton(
                     onClick = { showUnverifiedEmailDialog = false },
-                    enabled = !isResendingVerification
+                    enabled = !isResendingVerification && !isCheckingVerificationDialog
                 ) {
-                    Text("حسناً")
+                    Text("إغلاق")
                 }
             }
         )
@@ -758,9 +825,14 @@ fun getFirebaseErrorMessage(error: Throwable): String {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RegisterScreen(onRegisterSuccess: () -> Unit) {
+fun RegisterScreen(
+    onRegisterSuccess: () -> Unit,
+    onEmailVerified: (com.example.auth.MerchantAccount) -> Unit = {}
+) {
     val context = LocalContext.current
     var name by remember { mutableStateOf("") }
+    var selectedCategory by remember { mutableStateOf("") }
+    var categoryExpanded by remember { mutableStateOf(false) }
     var email by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
@@ -896,60 +968,151 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // زر إعادة إرسال رابط التأكيد
+                    // أزرار التحقق وإعادة الإرسال بعد التسجيل
                     var isResending by remember { mutableStateOf(false) }
-                    var resendMessage by remember { mutableStateOf<String?>(null) }
+                    var isCheckingVerification by remember { mutableStateOf(false) }
+                    var verificationStatusMessage by remember { mutableStateOf<String?>(null) }
+                    var verificationStatusIsError by remember { mutableStateOf(false) }
 
-                    OutlinedButton(
+                    // زر التحقق من حالة التأكيد باستخدام Firebase Auth reload()
+                    Button(
                         onClick = {
-                            val currentUser = Firebase.auth.currentUser
-                            if (currentUser != null) {
-                                scope.launch {
-                                    isResending = true
-                                    try {
-                                        currentUser.sendEmailVerification().await()
-                                        resendMessage = "تمت إعادة إرسال رابط التحقق بنجاح!"
-                                        Toast.makeText(context, "تمت إعادة إرسال رابط التأكيد", Toast.LENGTH_SHORT).show()
-                                    } catch (e: Exception) {
-                                        resendMessage = "تعذر الإرسال: ${e.message}"
-                                    } finally {
-                                        isResending = false
+                            if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
+                                com.example.network.NetworkHelper.notifyNoInternet(context, "التحقق من حالة البريد الإلكتروني")
+                                return@Button
+                            }
+                            scope.launch {
+                                isCheckingVerification = true
+                                verificationStatusMessage = null
+                                verificationStatusIsError = false
+                                when (val res = MerchantAuthManager.checkEmailVerificationAndSignIn(
+                                    context = context,
+                                    email = registeredEmail,
+                                    password = password.trim()
+                                )) {
+                                    is MerchantSignInResult.Success -> {
+                                        isCheckingVerification = false
+                                        Toast.makeText(
+                                            context,
+                                            "تم تأكيد البريد الإلكتروني بنجاح! مرحباً ${res.merchant.name}",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        onEmailVerified(res.merchant)
+                                    }
+                                    is MerchantSignInResult.EmailNotVerified -> {
+                                        isCheckingVerification = false
+                                        verificationStatusIsError = true
+                                        verificationStatusMessage = res.message
+                                    }
+                                    is MerchantSignInResult.NotRegistered -> {
+                                        isCheckingVerification = false
+                                        verificationStatusIsError = true
+                                        verificationStatusMessage = res.message
+                                    }
+                                    is MerchantSignInResult.Error -> {
+                                        isCheckingVerification = false
+                                        verificationStatusIsError = true
+                                        verificationStatusMessage = res.message
+                                    }
+                                    is MerchantSignInResult.Cancelled -> {
+                                        isCheckingVerification = false
                                     }
                                 }
                             }
                         },
-                        enabled = !isResending,
+                        enabled = !isResending && !isCheckingVerification,
                         shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("register_check_verification_button")
+                    ) {
+                        if (isCheckingVerification) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        Text(
+                            text = if (isCheckingVerification) "جاري التحقق من التأكيد..." else "التحقق من حالة التأكيد",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
+                                com.example.network.NetworkHelper.notifyNoInternet(context, "إعادة إرسال رسالة التأكيد")
+                                return@OutlinedButton
+                            }
+                            scope.launch {
+                                isResending = true
+                                verificationStatusMessage = null
+                                verificationStatusIsError = false
+                                val resendRes = MerchantAuthManager.resendVerificationEmail(
+                                    context = context,
+                                    email = registeredEmail,
+                                    password = password.trim()
+                                )
+                                isResending = false
+                                if (resendRes.isSuccess) {
+                                    verificationStatusIsError = false
+                                    verificationStatusMessage = "تمت إعادة إرسال رسالة التأكيد إلى بريدك بنجاح!"
+                                    Toast.makeText(context, "تمت إعادة إرسال رسالة التأكيد", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    verificationStatusIsError = true
+                                    verificationStatusMessage = "تعذر إعادة الإرسال: ${resendRes.exceptionOrNull()?.localizedMessage ?: "حاول لاحقاً"}"
+                                }
+                            }
+                        },
+                        enabled = !isResending && !isCheckingVerification,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("register_resend_verification_button")
                     ) {
                         if (isResending) {
                             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                             Spacer(modifier = Modifier.width(8.dp))
                         }
                         Text(
-                            text = if (isResending) "جاري إعادة الإرسال..." else "لم يصلك الرابط؟ إعادة الإرسال",
+                            text = if (isResending) "جاري إعادة الإرسال..." else "إعادة إرسال رسالة التأكيد",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium
                         )
                     }
 
-                    if (resendMessage != null) {
-                        Spacer(modifier = Modifier.height(8.dp))
+                    if (verificationStatusMessage != null) {
+                        Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = resendMessage!!,
+                            text = verificationStatusMessage!!,
                             style = MaterialTheme.typography.bodySmall,
-                            color = Primary,
+                            color = if (verificationStatusIsError) MaterialTheme.colorScheme.error else Color(0xFF2E7D32),
+                            fontWeight = FontWeight.SemiBold,
                             textAlign = TextAlign.Center
                         )
                     }
                 }
 
-                // Return to Login Button at bottom
+                // Return to Login Button at bottom (signs out unverified session first)
                 Button(
-                    onClick = onRegisterSuccess,
+                    onClick = {
+                        scope.launch {
+                            MerchantAuthManager.signOutMerchant(context)
+                            onRegisterSuccess()
+                        }
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(54.dp),
+                        .height(54.dp)
+                        .testTag("back_to_login_button"),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Primary
                     ),
@@ -1055,14 +1218,70 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
         OutlinedTextField(
             value = name,
             onValueChange = { name = it },
-            label = { Text("الاسم الكامل / اسم المطعم") },
+            label = { Text("الاسم الكامل") },
             enabled = !isLoading,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("register_name_input"),
             singleLine = true,
             leadingIcon = {
                 Icon(Icons.Default.Person, contentDescription = null, tint = Primary)
             }
         )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Category Dropdown Field (التصنيف)
+        ExposedDropdownMenuBox(
+            expanded = categoryExpanded,
+            onExpandedChange = {
+                if (!isLoading) {
+                    categoryExpanded = !categoryExpanded
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            OutlinedTextField(
+                value = selectedCategory,
+                onValueChange = {},
+                readOnly = true,
+                enabled = !isLoading,
+                label = { Text("التصنيف") },
+                placeholder = { Text("اختر التصنيف") },
+                leadingIcon = {
+                    Icon(Icons.Default.Category, contentDescription = null, tint = Primary)
+                },
+                trailingIcon = {
+                    ExposedDropdownMenuDefaults.TrailingIcon(expanded = categoryExpanded)
+                },
+                colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled = !isLoading)
+                    .testTag("register_category_dropdown"),
+                singleLine = true
+            )
+            ExposedDropdownMenu(
+                expanded = categoryExpanded,
+                onDismissRequest = { categoryExpanded = false }
+            ) {
+                MerchantAuthManager.MERCHANT_CATEGORIES.forEach { categoryOption ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = categoryOption,
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                        },
+                        onClick = {
+                            selectedCategory = categoryOption
+                            categoryExpanded = false
+                        },
+                        contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
+                    )
+                }
+            }
+        }
 
         Spacer(modifier = Modifier.height(8.dp))
 
@@ -1102,7 +1321,7 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
         OutlinedTextField(
             value = address,
             onValueChange = { address = it },
-            label = { Text("عنوان المطعم / الموقع") },
+            label = { Text("العنوان / الموقع") },
             enabled = !isLoading,
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
@@ -1146,7 +1365,11 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
                     return@Button
                 }
                 if (name.trim().isEmpty()) {
-                    Toast.makeText(context, "يرجى إدخال اسم المطعم", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "يرجى إدخال الاسم الكامل", Toast.LENGTH_SHORT).show()
+                    return@Button
+                }
+                if (selectedCategory.isBlank()) {
+                    Toast.makeText(context, "يرجى اختيار التصنيف", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
                 if (email.trim().isEmpty() || !email.contains("@")) {
@@ -1187,197 +1410,74 @@ fun RegisterScreen(onRegisterSuccess: () -> Unit) {
 
                     scope.launch {
                         try {
-                            // 1. إنشاء حساب جديد للمستخدم في Firebase Auth
-                            val authResult = Firebase.auth
-                                .createUserWithEmailAndPassword(email.trim(), password.trim())
-                                .await()
-                            val user = authResult.user
-                                ?: throw Exception("تعذر استرجاع بيانات المستخدم بعد إنشاء الحساب")
-
-                            // 2. الحصول على uid والتحقق من جلسة Auth
-                            val uid = user.uid
-                            val currentAuthUid = Firebase.auth.currentUser?.uid ?: ""
                             val currentEmail = email.trim().lowercase()
+                            diagnosticLogs = diagnosticLogs + "Registering exclusively in Auth + merchants/{uid}..."
 
-                            Log.d("FirestoreDiagnostics", "Auth user created: ${user.email}")
-                            Log.d("FirestoreDiagnostics", "User UID: $uid")
-                            Log.d("FirestoreDiagnostics", "Current Auth UID: $currentAuthUid")
-                            Log.d("FirestoreDiagnostics", "Firebase Project ID: $authProject")
-
-                            diagnosticLogs = diagnosticLogs + listOf(
-                                "Auth user created: $currentEmail",
-                                "User UID: $uid",
-                                "Current Auth UID: $currentAuthUid",
-                                "Firebase Project ID: $authProject"
+                            val regResult = MerchantAuthManager.registerMerchant(
+                                request = MerchantRegistrationRequest(
+                                    name = name.trim(),
+                                    email = currentEmail,
+                                    phone = phone.trim(),
+                                    address = address.trim(),
+                                    password = password.trim(),
+                                    category = selectedCategory
+                                ),
+                                logoUploader = { uid ->
+                                    diagnosticLogs = diagnosticLogs + "Auth user created: $currentEmail (uid=$uid)"
+                                    var uploadedLogoUrl = ""
+                                    var uploadedStoragePath = ""
+                                    if (selectedImageUri != null) {
+                                        val uploadResult = FirebaseStorageManager.uploadMerchantProfileImage(
+                                            context = context,
+                                            uid = uid,
+                                            localUriString = selectedImageUri!!.toString()
+                                        )
+                                        val uploaded = uploadResult.getOrElse { storageEx ->
+                                            val errMsg = "فشل رفع صورة اللوجو إلى Firebase Storage: ${storageEx.localizedMessage ?: storageEx.message ?: "خطأ غير معروف"}"
+                                            diagnosticLogs = diagnosticLogs + errMsg
+                                            throw IllegalStateException(errMsg, storageEx)
+                                        }
+                                        uploadedLogoUrl = uploaded.downloadUrl
+                                        uploadedStoragePath = uploaded.storagePath
+                                        diagnosticLogs = diagnosticLogs + "Logo uploaded to Storage: $uploadedStoragePath"
+                                    }
+                                    uploadedLogoUrl to uploadedStoragePath
+                                }
                             )
 
-                            if (currentAuthUid.isEmpty() || currentAuthUid != uid) {
-                                val syncMsg = "تنبيه: الجلسة الحالية غير متطابقة (user=$uid, current=$currentAuthUid)"
-                                Log.e("FirestoreDiagnostics", syncMsg)
-                                diagnosticLogs = diagnosticLogs + syncMsg
-                                throw Exception("فشل التحقق من جلسة المستخدم: $syncMsg")
-                            }
-
-                            // 3. تحديد المسار المباشر restaurants/{uid}
-                            val restaurantPath = "restaurants/$uid"
-                            val restaurantDocRef = Firebase.firestore.collection("restaurants").document(uid)
-
-                            Log.d("FirestoreDiagnostics", "Firestore document path: $restaurantPath")
-                            Log.d("FirestoreDiagnostics", "Firestore write started: $restaurantPath")
-
-                            diagnosticLogs = diagnosticLogs + listOf(
-                                "Firestore document path: $restaurantPath",
-                                "Firestore write started: $restaurantPath"
-                            )
-
-                            var logoUrl = ""
-                            var storagePath = ""
-                            if (selectedImageUri != null) {
-                                val uploadResult = FirebaseStorageManager.uploadMerchantProfileImage(
-                                    context = context,
-                                    uid = uid,
-                                    localUriString = selectedImageUri!!.toString()
-                                )
-                                uploadResult.onSuccess { uploaded ->
-                                    logoUrl = uploaded.downloadUrl
-                                    storagePath = uploaded.storagePath
-                                    Log.d("FirestoreDiagnostics", "Firebase Storage upload success: $logoUrl ($storagePath)")
-                                }.onFailure { storageEx ->
-                                    Log.w("FirestoreDiagnostics", "Storage upload failed: ${storageEx.message}")
-                                    logoUrl = ""
-                                    storagePath = ""
+                            when (regResult) {
+                                is MerchantRegistrationResult.Success -> {
+                                    diagnosticLogs = diagnosticLogs + listOf(
+                                        "Firestore document created exclusively at: merchants/${regResult.uid}",
+                                        "Verification email sent: ${regResult.verificationEmailSent}"
+                                    )
+                                    diagnosticStatus = "MERCHANT_REGISTERED_PENDING_EMAIL_VERIFICATION"
+                                    registeredEmail = regResult.email
+                                    isLoading = false
+                                    isRegistrationSuccessful = true
+                                }
+                                is MerchantRegistrationResult.Failure -> {
+                                    val cause = regResult.cause
+                                    val errorCode = when (cause) {
+                                        is FirebaseFirestoreException -> cause.code.name
+                                        is FirebaseAuthException -> cause.errorCode
+                                        else -> cause?.javaClass?.simpleName ?: "REGISTRATION_FAILED"
+                                    }
+                                    val isFirestoreIssue = cause is FirebaseFirestoreException
+                                    val errorSummary = "[$errorCode] ${regResult.message}"
+                                    diagnosticError = errorSummary
+                                    diagnosticStatus = if (isFirestoreIssue) "FIRESTORE_WRITE_FAILED" else "AUTH_FAILED"
+                                    diagnosticLogs = diagnosticLogs + ">>> $errorSummary <<<"
+                                    if (isFirestoreIssue) {
+                                        showDiagnosticDialog = true
+                                    }
+                                    Toast.makeText(context, regResult.message, Toast.LENGTH_LONG).show()
                                 }
                             }
-
-                            // 4. إنشاء بيانات التاجر والمطعم والكتابة إلى Firestore
-                            val finalAddress = if (address.trim().isNotBlank()) address.trim() else "العنوان غير محدد"
-
-                            // أ) حفظ مستند التاجر في merchants/{uid}
-                            val merchantDocRef = Firebase.firestore.collection("merchants").document(uid)
-                            val merchantData = hashMapOf<String, Any>(
-                                "uid" to uid,
-                                "name" to name.trim(),
-                                "email" to currentEmail,
-                                "phone" to phone.trim(),
-                                "address" to finalAddress,
-                                "photoUrl" to logoUrl,
-                                "storagePath" to storagePath,
-                                "role" to "merchant",
-                                "status" to "approved",
-                                "isApproved" to true,
-                                "isSubscribed" to false,
-                                "subscriptionStatus" to "unsubscribed",
-                                "maxCaptains" to 0,
-                                "planId" to 0,
-                                "authProvider" to "password",
-                                "createdAt" to FieldValue.serverTimestamp(),
-                                "updatedAt" to FieldValue.serverTimestamp()
-                            )
-                            merchantDocRef.set(merchantData, SetOptions.merge()).addOnCompleteListener { task ->
-                                if (task.isSuccessful) {
-                                    Log.d("FirestoreDiagnostics", "merchants/$uid written successfully")
-                                } else {
-                                    Log.w("FirestoreDiagnostics", "merchants/$uid write warning: ${task.exception?.message}")
-                                }
-                            }
-
-                            // ب) حفظ بيانات المطعم في restaurants/{uid}
-                            val restaurantData = hashMapOf<String, Any>(
-                                "uid" to uid,
-                                "ownerId" to uid,
-                                "email" to currentEmail,
-                                "name" to name.trim(),
-                                "phone" to phone.trim(),
-                                "address" to finalAddress,
-                                "category" to "مطعم",
-                                "logoUrl" to logoUrl,
-                                "photoUrl" to logoUrl,
-                                "storagePath" to storagePath,
-                                "status" to "active",
-                                "isApproved" to true,
-                                "rating" to 5.0,
-                                "ratingCount" to 0L,
-                                "isSubscribed" to false,
-                                "subscriptionStatus" to "unsubscribed",
-                                "maxCaptains" to 0,
-                                "planId" to 0,
-                                "subscriptionId" to "",
-                                "createdAt" to FieldValue.serverTimestamp(),
-                                "updatedAt" to FieldValue.serverTimestamp()
-                            )
-
-                            restaurantDocRef.set(restaurantData).addOnCompleteListener { task ->
-                                if (task.isSuccessful) {
-                                    Log.d("FirestoreDiagnostics", "Firestore write acknowledged by server: $restaurantPath")
-                                } else {
-                                    Log.w("FirestoreDiagnostics", "Firestore write server sync note: ${task.exception?.message}")
-                                }
-                            }
-                            Log.d("FirestoreDiagnostics", "Firestore write initiated & queued: $restaurantPath")
-                            diagnosticLogs = diagnosticLogs + "Firestore write initiated: $restaurantPath"
-
-                            // ج) مزامنة مستند المستخدم في users/$uid
-                            try {
-                                val userDocRef = Firebase.firestore.collection("users").document(uid)
-                                val userData = hashMapOf<String, Any>(
-                                    "uid" to uid,
-                                    "email" to currentEmail,
-                                    "name" to name.trim(),
-                                    "displayName" to name.trim(),
-                                    "phone" to phone.trim(),
-                                    "address" to finalAddress,
-                                    "role" to "merchant",
-                                    "logoUrl" to logoUrl,
-                                    "photoUrl" to logoUrl,
-                                    "createdAt" to FieldValue.serverTimestamp(),
-                                    "updatedAt" to FieldValue.serverTimestamp()
-                                )
-                                userDocRef.set(userData, SetOptions.merge())
-                                Log.d("FirestoreDiagnostics", "User doc write initiated: users/$uid")
-                                diagnosticLogs = diagnosticLogs + "User doc write initiated: users/$uid"
-                            } catch (uEx: Exception) {
-                                Log.w("FirestoreDiagnostics", "users/$uid sync warning: ${uEx.message}")
-                                diagnosticLogs = diagnosticLogs + "users/$uid sync: ${uEx.message}"
-                            }
-
-                            // إرسال رابط تأكيد البريد الإلكتروني
-                            try {
-                                user.sendEmailVerification().await()
-                                Log.d("FirestoreDiagnostics", "Verification email sent to: $currentEmail")
-                            } catch (e: Exception) {
-                                Log.w("FirestoreDiagnostics", "Verification email error: ${e.message}")
-                            }
-
-                            // عرض شاشة النجاح فقط بعد إتمام الكتابة في Firestore
-                            registeredEmail = currentEmail
-                            isLoading = false
-                            isRegistrationSuccessful = true
                         } catch (e: Exception) {
-                            isLoading = false
-                            val errorCode = when (e) {
-                                is FirebaseFirestoreException -> e.code.name
-                                is FirebaseAuthException -> e.errorCode
-                                else -> e.javaClass.simpleName
-                            }
-                            Log.w("FirestoreDiagnostics", "REGISTRATION FAILED: code=$errorCode, message=${e.message}")
-
-                            val isFirestoreIssue = e is FirebaseFirestoreException
-                            val errorSummary = if (isFirestoreIssue) {
-                                "FIRESTORE_WRITE_FAILED: [$errorCode] ${e.localizedMessage ?: e.message}"
-                            } else {
-                                "REGISTRATION_ERROR: [$errorCode] ${e.localizedMessage ?: e.message}"
-                            }
-                            diagnosticError = errorSummary
-                            diagnosticStatus = if (isFirestoreIssue) "FIRESTORE_WRITE_FAILED" else "AUTH_FAILED"
-                            diagnosticLogs = diagnosticLogs + listOf(
-                                ">>> $errorSummary <<<",
-                                "Exception type: ${e.javaClass.name}"
-                            )
-                            if (isFirestoreIssue) {
-                                showDiagnosticDialog = true
-                            }
-
                             val errorMessage = getFirebaseErrorMessage(e)
+                            diagnosticError = errorMessage
+                            diagnosticLogs = diagnosticLogs + ">>> EXCEPTION: $errorMessage <<<"
                             Toast.makeText(context, errorMessage, Toast.LENGTH_LONG).show()
                         } finally {
                             isLoading = false
@@ -2616,7 +2716,7 @@ fun SideMenuContent(
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 Text(
                                     text = "🏪",
@@ -2627,6 +2727,14 @@ fun SideMenuContent(
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            if (profile.category.isNotBlank()) {
+                                Text(
+                                    text = "التصنيف: ${profile.category}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Primary,
+                                    fontWeight = FontWeight.SemiBold
                                 )
                             }
                             if (profile.phone.isNotBlank()) {
@@ -3032,12 +3140,31 @@ fun RestaurantProfileCard(
             Spacer(modifier = Modifier.width(16.dp))
 
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "مرحبا",
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = Primary
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "مرحبا",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = Primary
+                    )
+                    if (profile.category.isNotBlank()) {
+                        Surface(
+                            color = Primary.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = profile.category,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Primary,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(2.dp))
 
@@ -3061,6 +3188,7 @@ fun RestaurantProfileCard(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RestaurantDetailsScreen(
     onBack: () -> Unit,
@@ -3075,6 +3203,8 @@ fun RestaurantDetailsScreen(
     val context = androidx.compose.ui.platform.LocalContext.current
 
     var restaurantName by remember(currentProfile) { mutableStateOf(currentProfile.name) }
+    var selectedCategory by remember(currentProfile) { mutableStateOf(currentProfile.category) }
+    var categoryExpanded by remember { mutableStateOf(false) }
     var phoneNumber by remember(currentProfile) { mutableStateOf(currentProfile.phone) }
     var address by remember(currentProfile) { mutableStateOf(currentProfile.address) }
     var imageUri by remember(currentProfile) { mutableStateOf(currentProfile.imageUri) }
@@ -3384,11 +3514,11 @@ fun RestaurantDetailsScreen(
                         .padding(20.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    // Restaurant Name (الاسم الكامل / اسم المطعم)
+                    // Full Name (الاسم الكامل)
                     OutlinedTextField(
                         value = restaurantName,
                         onValueChange = { restaurantName = it },
-                        label = { Text("الاسم الكامل / اسم المطعم") },
+                        label = { Text("الاسم الكامل") },
                         leadingIcon = {
                             Icon(
                                 imageVector = Icons.Default.Home,
@@ -3400,6 +3530,58 @@ fun RestaurantDetailsScreen(
                         shape = RoundedCornerShape(12.dp),
                         singleLine = true
                     )
+
+                    // Business Category (التصنيف)
+                    ExposedDropdownMenuBox(
+                        expanded = categoryExpanded,
+                        onExpandedChange = {
+                            if (!isSaving) {
+                                categoryExpanded = !categoryExpanded
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        OutlinedTextField(
+                            value = selectedCategory,
+                            onValueChange = {},
+                            readOnly = true,
+                            enabled = !isSaving,
+                            label = { Text("التصنيف") },
+                            placeholder = { Text("اختر التصنيف") },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Category,
+                                    contentDescription = null,
+                                    tint = Primary
+                                )
+                            },
+                            trailingIcon = {
+                                ExposedDropdownMenuDefaults.TrailingIcon(expanded = categoryExpanded)
+                            },
+                            colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor(MenuAnchorType.PrimaryNotEditable, enabled = !isSaving)
+                                .testTag("details_category_dropdown"),
+                            shape = RoundedCornerShape(12.dp),
+                            singleLine = true
+                        )
+                        ExposedDropdownMenu(
+                            expanded = categoryExpanded,
+                            onDismissRequest = { categoryExpanded = false }
+                        ) {
+                            MerchantAuthManager.MERCHANT_CATEGORIES.forEach { categoryOption ->
+                                DropdownMenuItem(
+                                    text = { Text(categoryOption) },
+                                    onClick = {
+                                        selectedCategory = categoryOption
+                                        categoryExpanded = false
+                                    },
+                                    contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
+                                )
+                            }
+                        }
+                    }
 
                     // Phone Number (رقم الهاتف)
                     OutlinedTextField(
@@ -3497,7 +3679,8 @@ fun RestaurantDetailsScreen(
                         phone = phoneNumber,
                         address = address,
                         imageUri = imageUri,
-                        locationUrl = locationUrl
+                        locationUrl = locationUrl,
+                        category = selectedCategory
                     )
                 },
                 enabled = !isSaving,
@@ -3608,12 +3791,105 @@ fun CaptainInfoSection(
     captainLat: Double? = null,
     captainLng: Double? = null,
     showLiveMap: Boolean = false,
-    orderKey: String = ""
+    orderKey: String = "",
+    captainId: String = ""
 ) {
     val context = LocalContext.current
-    val isAssigned = captainName.isNotBlank() &&
+    val cleanCaptainId = captainId.trim()
+    val isAssigned = (captainName.isNotBlank() &&
             captainName != "في انتظار كابتن" &&
-            captainName != "في انتظار قبول كابتن"
+            captainName != "في انتظار قبول كابتن") || cleanCaptainId.isNotEmpty()
+    val displayCaptainName = when {
+        FirebaseStorageManager.isValidCaptainName(captainName) -> captainName.trim()
+        cleanCaptainId.isNotEmpty() -> "جاري تحميل بيانات الكابتن..."
+        else -> captainName.ifBlank { "كابتن التوصيل" }
+    }
+    val realCaptainPhone = captainPhone.trim().takeIf { it.isNotEmpty() && it != "01098765432" }.orEmpty()
+    val hasRealCaptainPhone = realCaptainPhone.isNotEmpty()
+
+    var resolvedCaptainPhotoUrl by remember(captainPhotoUrl, cleanCaptainId) {
+        mutableStateOf(
+            captainPhotoUrl?.trim()
+                ?.takeIf { FirebaseStorageManager.isValidDisplayableCaptainPhoto(it) }
+                .orEmpty()
+        )
+    }
+    var captainImageFailed by remember(resolvedCaptainPhotoUrl) { mutableStateOf(false) }
+    var retriedStorageLookup by remember(cleanCaptainId, captainPhotoUrl) { mutableStateOf(false) }
+    var showFullCaptainPhoto by remember { mutableStateOf(false) }
+
+    LaunchedEffect(captainPhotoUrl, cleanCaptainId) {
+        val raw = captainPhotoUrl?.trim().orEmpty()
+        val resolvedFromRaw = when {
+            raw.isNotBlank() && !FirebaseStorageManager.isPlaceholderAvatarUrl(raw) && !FirebaseStorageManager.isLocalDeviceUri(raw) -> {
+                if (FirebaseStorageManager.isRemoteHttpUrl(raw)) raw
+                else FirebaseStorageManager.resolveFirebaseStorageDownloadUrl(raw)
+            }
+            else -> ""
+        }
+
+        val finalPhotoUrl = when {
+            FirebaseStorageManager.isFirebaseStorageUrl(resolvedFromRaw) &&
+                FirebaseStorageManager.isValidDisplayableCaptainPhoto(resolvedFromRaw) -> resolvedFromRaw
+            cleanCaptainId.isNotEmpty() -> {
+                val fromStorage = FirebaseStorageManager.findCaptainPhotoInStorage(cleanCaptainId)
+                fromStorage.ifBlank {
+                    resolvedFromRaw.takeIf { FirebaseStorageManager.isValidDisplayableCaptainPhoto(it) }.orEmpty()
+                }
+            }
+            else -> resolvedFromRaw.takeIf { FirebaseStorageManager.isValidDisplayableCaptainPhoto(it) }.orEmpty()
+        }
+
+        resolvedCaptainPhotoUrl = finalPhotoUrl
+        captainImageFailed = false
+    }
+
+    LaunchedEffect(captainImageFailed, cleanCaptainId) {
+        if (captainImageFailed && cleanCaptainId.isNotEmpty() && !retriedStorageLookup) {
+            retriedStorageLookup = true
+            val refreshedUrl = FirebaseStorageManager.findCaptainPhotoInStorage(cleanCaptainId, bypassCache = true)
+            if (refreshedUrl.isNotBlank() && refreshedUrl != resolvedCaptainPhotoUrl) {
+                resolvedCaptainPhotoUrl = refreshedUrl
+                captainImageFailed = false
+            }
+        }
+    }
+
+    if (showFullCaptainPhoto && resolvedCaptainPhotoUrl.isNotBlank() && !captainImageFailed) {
+        AlertDialog(
+            onDismissRequest = { showFullCaptainPhoto = false },
+            confirmButton = {
+                Button(onClick = { showFullCaptainPhoto = false }) {
+                    Text("إغلاق")
+                }
+            },
+            title = {
+                Text(
+                    text = "صورة الكابتن: $captainName",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(340.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    AsyncImage(
+                        model = FirebaseStorageManager.resolveDisplayableImageModel(resolvedCaptainPhotoUrl),
+                        contentDescription = "صورة الكابتن بالحجم الكامل",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(14.dp)),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            },
+            shape = RoundedCornerShape(16.dp)
+        )
+    }
 
     if (isCancelled) {
         // حالة الطلب ملغي: إيقاف البحث عن كابتن تماماً
@@ -3663,9 +3939,8 @@ fun CaptainInfoSection(
             }
         }
     } else if (isCompleted) {
-        // حالة الطلب مكتمل (الطلبات السابقة): إظهار اسم الكابتن وصورته ورقم هاتفه بوضوح
-        val displayCaptainName = if (isAssigned) captainName else "كابتن التوصيل"
-        val displayCaptainPhone = captainPhone.ifBlank { "غير مسجل" }
+        // حالة الطلب مكتمل (الطلبات السابقة): إظهار اسم الكابتن وصورته ورقم هاتفه الحقيقي بوضوح
+        val displayCompletedPhone = if (hasRealCaptainPhone) realCaptainPhone else "غير مسجل"
         Surface(
             color = Color(0xFF2E7D32).copy(alpha = 0.08f),
             shape = RoundedCornerShape(14.dp),
@@ -3709,29 +3984,34 @@ fun CaptainInfoSection(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // صورة الكابتن
+                    val hasDisplayableCompletedPhoto = resolvedCaptainPhotoUrl.isNotBlank() && !captainImageFailed
                     Box(
                         modifier = Modifier
                             .size(56.dp)
                             .clip(CircleShape)
                             .background(Primary.copy(alpha = 0.15f))
-                            .border(2.dp, Color(0xFF2E7D32), CircleShape),
+                            .border(2.dp, Color(0xFF2E7D32), CircleShape)
+                            .let { mod ->
+                                if (hasDisplayableCompletedPhoto) mod.clickable { showFullCaptainPhoto = true } else mod
+                            },
                         contentAlignment = Alignment.Center
                     ) {
-                        if (!captainPhotoUrl.isNullOrBlank()) {
+                        Icon(
+                            imageVector = Icons.Default.Person,
+                            contentDescription = "صورة الكابتن",
+                            tint = Color(0xFF2E7D32),
+                            modifier = Modifier.size(30.dp)
+                        )
+                        if (hasDisplayableCompletedPhoto) {
                             AsyncImage(
-                                model = FirebaseStorageManager.resolveDisplayableImageModel(captainPhotoUrl),
+                                model = FirebaseStorageManager.resolveDisplayableImageModel(resolvedCaptainPhotoUrl),
                                 contentDescription = "صورة الكابتن",
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .clip(CircleShape),
-                                contentScale = ContentScale.Crop
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.Default.Person,
-                                contentDescription = "صورة الكابتن",
-                                tint = Color(0xFF2E7D32),
-                                modifier = Modifier.size(30.dp)
+                                contentScale = ContentScale.Crop,
+                                onError = { captainImageFailed = true },
+                                onSuccess = { captainImageFailed = false }
                             )
                         }
                     }
@@ -3749,10 +4029,10 @@ fun CaptainInfoSection(
                         Spacer(modifier = Modifier.height(4.dp))
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            modifier = if (captainPhone.isNotBlank()) {
+                            modifier = if (hasRealCaptainPhone) {
                                 Modifier.clickable {
                                     try {
-                                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$captainPhone"))
+                                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$realCaptainPhone"))
                                         context.startActivity(intent)
                                     } catch (e: Exception) {
                                         e.printStackTrace()
@@ -3768,7 +4048,7 @@ fun CaptainInfoSection(
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = "هاتف الكابتن: $displayCaptainPhone",
+                                text = "هاتف الكابتن: $displayCompletedPhone",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontWeight = FontWeight.SemiBold
@@ -3776,11 +4056,11 @@ fun CaptainInfoSection(
                         }
                     }
 
-                    if (captainPhone.isNotBlank()) {
+                    if (hasRealCaptainPhone) {
                         IconButton(
                             onClick = {
                                 try {
-                                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$captainPhone"))
+                                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$realCaptainPhone"))
                                     context.startActivity(intent)
                                 } catch (e: Exception) {
                                     e.printStackTrace()
@@ -3988,30 +4268,35 @@ fun CaptainInfoSection(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Captain Avatar (صورة المندوب)
+                    // Captain Avatar (صورة المندوب الحقيقية من Firebase Storage)
+                    val hasDisplayableActivePhoto = resolvedCaptainPhotoUrl.isNotBlank() && !captainImageFailed
                     Box(
                         modifier = Modifier
-                            .size(54.dp)
+                            .size(56.dp)
                             .clip(CircleShape)
                             .background(Primary.copy(alpha = 0.2f))
-                            .border(2.dp, if (isDelayed) lateColor else Primary, CircleShape),
+                            .border(2.dp, if (isDelayed) lateColor else Primary, CircleShape)
+                            .let { mod ->
+                                if (hasDisplayableActivePhoto) mod.clickable { showFullCaptainPhoto = true } else mod
+                            },
                         contentAlignment = Alignment.Center
                     ) {
-                        if (!captainPhotoUrl.isNullOrBlank()) {
+                        Icon(
+                            imageVector = Icons.Default.Person,
+                            contentDescription = null,
+                            tint = if (isDelayed) lateColor else Primary,
+                            modifier = Modifier.size(30.dp)
+                        )
+                        if (hasDisplayableActivePhoto) {
                             AsyncImage(
-                                model = FirebaseStorageManager.resolveDisplayableImageModel(captainPhotoUrl),
-                                contentDescription = "صورة المندوب",
+                                model = FirebaseStorageManager.resolveDisplayableImageModel(resolvedCaptainPhotoUrl),
+                                contentDescription = "صورة الكابتن",
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .clip(CircleShape),
-                                contentScale = ContentScale.Crop
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.Default.Person,
-                                contentDescription = null,
-                                tint = if (isDelayed) lateColor else Primary,
-                                modifier = Modifier.size(30.dp)
+                                contentScale = ContentScale.Crop,
+                                onError = { captainImageFailed = true },
+                                onSuccess = { captainImageFailed = false }
                             )
                         }
 
@@ -4032,7 +4317,7 @@ fun CaptainInfoSection(
                     Column(modifier = Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                text = captainName,
+                                text = displayCaptainName,
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
@@ -4041,17 +4326,19 @@ fun CaptainInfoSection(
 
                         Spacer(modifier = Modifier.height(4.dp))
 
-                        val phoneToDisplay = captainPhone.ifBlank { "01098765432" }
+                        val phoneToDisplay = if (hasRealCaptainPhone) realCaptainPhone else "غير مسجل"
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.clickable {
-                                try {
-                                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$phoneToDisplay"))
-                                    context.startActivity(intent)
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
+                            modifier = if (hasRealCaptainPhone) {
+                                Modifier.clickable {
+                                    try {
+                                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$realCaptainPhone"))
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
                                 }
-                            }
+                            } else Modifier
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Phone,
@@ -4069,13 +4356,12 @@ fun CaptainInfoSection(
                         }
                     }
 
-                    if (showCallButton) {
+                    if (showCallButton && hasRealCaptainPhone) {
                         Spacer(modifier = Modifier.width(8.dp))
                         Button(
                             onClick = {
                                 try {
-                                    val phoneToCall = captainPhone.ifBlank { "01098765432" }
-                                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$phoneToCall"))
+                                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$realCaptainPhone"))
                                     context.startActivity(intent)
                                 } catch (e: Exception) {
                                     e.printStackTrace()
@@ -4253,9 +4539,9 @@ fun RestaurantOrderHistoryCard(
                 )
             }
 
-            val isCaptainAssigned = order.captainName.isNotBlank() &&
+            val isCaptainAssigned = (order.captainName.isNotBlank() &&
                 order.captainName != "في انتظار كابتن" &&
-                order.captainName != "في انتظار قبول كابتن"
+                order.captainName != "في انتظار قبول كابتن") || !order.captainId.isNullOrBlank()
             val isCaptainAccepted = isCaptainAssigned || order.status.trim() in listOf(
                 "الكابتن في الطريق لك", "في الطريق لك", "accepted", "في الطريق إلى المطعم",
                 "جاري التوصيل", "delivering", "out_for_delivery"
@@ -4296,25 +4582,30 @@ fun RestaurantOrderHistoryCard(
             val restLat = restaurantProfile.latitude ?: 30.0444
             val restLng = restaurantProfile.longitude ?: 31.2357
 
-            LaunchedEffect(order.id, isCaptainAssigned) {
+            LaunchedEffect(order.firestoreOrderId, order.id, isCaptainAssigned) {
                 if (isCaptainAssigned && isInProgress) {
-                    orderViewModel.startTrackingOrderCaptain(order.id.toString())
+                    orderViewModel.startTrackingOrderCaptain(order.firestoreOrderId.ifBlank { order.id.toString() })
                 }
+            }
+
+            val matchingTracked = trackedCaptain?.takeIf {
+                !order.captainId.isNullOrBlank() && it.captainId == order.captainId
             }
 
             // Part 2: Captain Info
             CaptainInfoSection(
-                captainName = order.captainName,
-                captainPhone = order.captainPhone,
-                captainPhotoUrl = order.captainPhotoUrl,
+                captainName = FirebaseStorageManager.selectAuthoritativeCaptainName(matchingTracked?.name, order.captainName, order.captainId),
+                captainPhone = FirebaseStorageManager.selectAuthoritativeCaptainPhone(matchingTracked?.phone, order.captainPhone),
+                captainPhotoUrl = FirebaseStorageManager.selectBestCaptainPhotoUrl(matchingTracked?.photoUrl, null, order.captainPhotoUrl),
                 estimatedArrival = order.estimatedArrival,
                 isCancelled = isCancelled,
                 isCompleted = isCompleted,
                 restaurantLat = restLat,
                 restaurantLng = restLng,
-                captainLat = trackedCaptain?.latitude,
-                captainLng = trackedCaptain?.longitude,
-                orderKey = order.firestoreOrderId.ifBlank { order.id.toString() }
+                captainLat = matchingTracked?.latitude,
+                captainLng = matchingTracked?.longitude,
+                orderKey = order.firestoreOrderId.ifBlank { order.id.toString() },
+                captainId = order.captainId.orEmpty()
             )
 
             // Star Rating Feature when Delivered
@@ -6040,35 +6331,40 @@ fun OrganizedOrderCard(
                 }
             }
 
-            val isCaptainAssigned = order.captainName.isNotBlank() &&
+            val isCaptainAssigned = (order.captainName.isNotBlank() &&
                 order.captainName != "في انتظار كابتن" &&
-                order.captainName != "في انتظار قبول كابتن"
+                order.captainName != "في انتظار قبول كابتن") || !order.captainId.isNullOrBlank()
 
             val trackedCaptain by orderViewModel.trackedCaptainInfo.collectAsStateWithLifecycle()
             val restaurantProfile by orderViewModel.restaurantProfile.collectAsStateWithLifecycle()
             val restLat = restaurantProfile.latitude ?: 30.0444
             val restLng = restaurantProfile.longitude ?: 31.2357
 
-            LaunchedEffect(order.id, isCaptainAssigned) {
+            LaunchedEffect(orderActionKey, isCaptainAssigned) {
                 if (isCaptainAssigned && isInProgress) {
-                    orderViewModel.startTrackingOrderCaptain(order.id.toString())
+                    orderViewModel.startTrackingOrderCaptain(orderActionKey)
                 }
+            }
+
+            val matchingTracked = trackedCaptain?.takeIf {
+                !order.captainId.isNullOrBlank() && it.captainId == order.captainId
             }
 
             // Captain Info Section: Shows searching status or Captain profile with ETA (or cancelled state)
             CaptainInfoSection(
-                captainName = order.captainName,
-                captainPhone = order.captainPhone,
-                captainPhotoUrl = order.captainPhotoUrl,
+                captainName = FirebaseStorageManager.selectAuthoritativeCaptainName(matchingTracked?.name, order.captainName, order.captainId),
+                captainPhone = FirebaseStorageManager.selectAuthoritativeCaptainPhone(matchingTracked?.phone, order.captainPhone),
+                captainPhotoUrl = FirebaseStorageManager.selectBestCaptainPhotoUrl(matchingTracked?.photoUrl, null, order.captainPhotoUrl),
                 estimatedArrival = order.estimatedArrival,
                 showCallButton = false,
                 isCancelled = isCancelled,
                 isCompleted = isCompleted,
                 restaurantLat = restLat,
                 restaurantLng = restLng,
-                captainLat = trackedCaptain?.latitude,
-                captainLng = trackedCaptain?.longitude,
-                orderKey = orderActionKey
+                captainLat = matchingTracked?.latitude,
+                captainLng = matchingTracked?.longitude,
+                orderKey = orderActionKey,
+                captainId = order.captainId.orEmpty()
             )
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -6137,24 +6433,40 @@ fun OrganizedOrderCard(
                             )
                         }
                     } else if (isCaptainAssigned) {
-                        val captainPhoneToCall = order.captainPhone.ifBlank { "01098765432" }
+                        val captainPhoneToCall = FirebaseStorageManager.selectAuthoritativeCaptainPhone(
+                            matchingTracked?.phone,
+                            order.captainPhone
+                        )
                         OutlinedButton(
                             onClick = {
-                                try {
-                                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$captainPhoneToCall"))
-                                    context.startActivity(intent)
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
+                                if (captainPhoneToCall.isNotBlank()) {
+                                    try {
+                                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$captainPhoneToCall"))
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
                                 }
                             },
+                            enabled = captainPhoneToCall.isNotBlank(),
                             shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, Primary),
+                            border = BorderStroke(1.dp, if (captainPhoneToCall.isNotBlank()) Primary else MaterialTheme.colorScheme.outlineVariant),
                             modifier = Modifier.fillMaxWidth().height(38.dp),
                             contentPadding = PaddingValues(horizontal = 8.dp)
                         ) {
-                            Icon(Icons.Default.Phone, contentDescription = null, tint = Primary, modifier = Modifier.size(14.dp))
+                            Icon(
+                                Icons.Default.Phone,
+                                contentDescription = null,
+                                tint = if (captainPhoneToCall.isNotBlank()) Primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(14.dp)
+                            )
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text(stringResource(R.string.call_captain_btn), style = MaterialTheme.typography.labelMedium, color = Primary, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = if (captainPhoneToCall.isNotBlank()) stringResource(R.string.call_captain_btn) else "رقم الهاتف غير مسجل",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (captainPhoneToCall.isNotBlank()) Primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     } else if (isInProgress && !isCaptainAccepted && onEditOrder != null) {
                         Button(
@@ -6637,9 +6949,9 @@ fun OrderHistoryCard(
                 )
             }
 
-            val isCaptainAssigned = order.captainName.isNotBlank() &&
+            val isCaptainAssigned = (order.captainName.isNotBlank() &&
                 order.captainName != "في انتظار كابتن" &&
-                order.captainName != "في انتظار قبول كابتن"
+                order.captainName != "في انتظار قبول كابتن") || !order.captainId.isNullOrBlank()
             val isCaptainAccepted = isCaptainAssigned || order.status.trim() in listOf(
                 "الكابتن في الطريق لك", "في الطريق لك", "accepted", "في الطريق إلى المطعم",
                 "جاري التوصيل", "delivering", "out_for_delivery"
@@ -6680,26 +6992,31 @@ fun OrderHistoryCard(
             val restLat = restaurantProfile.latitude ?: 30.0444
             val restLng = restaurantProfile.longitude ?: 31.2357
 
-            LaunchedEffect(order.id, isCaptainAssigned) {
+            LaunchedEffect(order.firestoreOrderId, order.id, isCaptainAssigned) {
                 if (isCaptainAssigned && isInProgress) {
-                    orderViewModel.startTrackingOrderCaptain(order.id.toString())
+                    orderViewModel.startTrackingOrderCaptain(order.firestoreOrderId.ifBlank { order.id.toString() })
                 }
+            }
+
+            val matchingTracked = trackedCaptain?.takeIf {
+                !order.captainId.isNullOrBlank() && it.captainId == order.captainId
             }
 
             // Captain Information (بيانات المندوب)
             val isCancelled = order.status in listOf("ملغي", "Cancelled")
             CaptainInfoSection(
-                captainName = order.captainName,
-                captainPhone = order.captainPhone,
-                captainPhotoUrl = order.captainPhotoUrl,
+                captainName = FirebaseStorageManager.selectAuthoritativeCaptainName(matchingTracked?.name, order.captainName, order.captainId),
+                captainPhone = FirebaseStorageManager.selectAuthoritativeCaptainPhone(matchingTracked?.phone, order.captainPhone),
+                captainPhotoUrl = FirebaseStorageManager.selectBestCaptainPhotoUrl(matchingTracked?.photoUrl, null, order.captainPhotoUrl),
                 estimatedArrival = order.estimatedArrival,
                 isCancelled = isCancelled,
                 isCompleted = isDelivered,
                 restaurantLat = restLat,
                 restaurantLng = restLng,
-                captainLat = trackedCaptain?.latitude,
-                captainLng = trackedCaptain?.longitude,
-                orderKey = order.firestoreOrderId.ifBlank { order.id.toString() }
+                captainLat = matchingTracked?.latitude,
+                captainLng = matchingTracked?.longitude,
+                orderKey = order.firestoreOrderId.ifBlank { order.id.toString() },
+                captainId = order.captainId.orEmpty()
             )
 
             // Star Rating Feature when Delivered

@@ -18,9 +18,13 @@
           "format": "email",
           "description": "Verified Google email of the merchant"
         },
+        "logo": {
+          "type": "string",
+          "description": "Merchant logo image URL in Firebase Storage"
+        },
         "photoUrl": {
           "type": "string",
-          "description": "Avatar or Google profile image URL"
+          "description": "Avatar or profile image URL"
         },
         "phone": {
           "type": "string",
@@ -29,6 +33,25 @@
         "address": {
           "type": "string",
           "description": "Merchant physical address"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["مطعم", "صيدلية", "سوبر ماركت", "خضار", "كافيه", "جزارة", "أكل حيوانات"],
+          "description": "Merchant store category selected during registration"
+        },
+        "accountType": {
+          "type": "string",
+          "enum": ["merchant"],
+          "description": "Strict account type discriminator identifying merchants"
+        },
+        "emailVerified": {
+          "type": "boolean",
+          "description": "Mirrors Firebase Auth email verification state after reload()"
+        },
+        "subscriptionStatus": {
+          "type": "string",
+          "enum": ["unsubscribed", "active", "expired", "payment_failed"],
+          "description": "Current subscription plan status"
         },
         "status": {
           "type": "string",
@@ -41,12 +64,12 @@
         },
         "role": {
           "type": "string",
-          "enum": ["merchant", "restaurant"],
+          "enum": ["merchant"],
           "description": "Role identifier"
         },
         "authProvider": {
           "type": "string",
-          "description": "Authentication provider e.g. google.com"
+          "description": "Authentication provider e.g. password or google.com"
         },
         "lastLoginAt": {
           "type": "string",
@@ -64,7 +87,7 @@
           "description": "Server timestamp of last update"
         }
       },
-      "required": ["uid", "email"]
+      "required": ["uid", "email", "accountType"]
     },
     "Restaurant": {
       "title": "Restaurant",

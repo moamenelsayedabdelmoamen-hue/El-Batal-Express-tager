@@ -111,7 +111,7 @@ class MainActivity : ComponentActivity() {
         val isOnline by NetworkHelper.isOnline.collectAsStateWithLifecycle()
         val currentUser = Firebase.auth.currentUser
         val initialRoute = androidx.compose.runtime.remember {
-          if (currentUser != null) {
+          if (currentUser != null && currentUser.isEmailVerified) {
             RestaurantDashboardRoute
           } else {
             LoginRoute
@@ -162,7 +162,8 @@ class MainActivity : ComponentActivity() {
             ) {
               composable<LoginRoute> {
                 LoginScreen(
-                  onLoginSuccess = {
+                  onLoginSuccess = { merchant ->
+                    orderViewModel.applyAuthenticatedMerchant(merchant)
                     orderViewModel.listenToFirestore()
                     navController.navigate(RestaurantDashboardRoute) {
                       popUpTo(LoginRoute) { inclusive = true }
@@ -174,15 +175,15 @@ class MainActivity : ComponentActivity() {
               composable<RegisterRoute> {
                 RegisterScreen(
                   onRegisterSuccess = {
-                    if (Firebase.auth.currentUser != null) {
-                      orderViewModel.listenToFirestore()
-                      navController.navigate(RestaurantDashboardRoute) {
-                        popUpTo(0) { inclusive = true }
-                      }
-                    } else {
-                      navController.navigate(LoginRoute) {
-                        popUpTo(LoginRoute) { inclusive = true }
-                      }
+                    navController.navigate(LoginRoute) {
+                      popUpTo(0) { inclusive = true }
+                    }
+                  },
+                  onEmailVerified = { merchant ->
+                    orderViewModel.applyAuthenticatedMerchant(merchant)
+                    orderViewModel.listenToFirestore()
+                    navController.navigate(RestaurantDashboardRoute) {
+                      popUpTo(0) { inclusive = true }
                     }
                   }
                 )
@@ -195,7 +196,8 @@ class MainActivity : ComponentActivity() {
               }
               composable<RestaurantDashboardRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  if (Firebase.auth.currentUser == null) {
+                  val authUser = Firebase.auth.currentUser
+                  if (authUser == null) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
@@ -204,17 +206,20 @@ class MainActivity : ComponentActivity() {
                     if (sessionMerchant == null) {
                       android.widget.Toast.makeText(
                         context,
-                        "لا يمكن الدخول إلا لحساب مسجل ومؤكد في قاعدة البيانات.",
+                        "لا يمكن الدخول إلا بحساب تاجر مسجل ومؤكد البريد الإلكتروني.",
                         android.widget.Toast.LENGTH_LONG
                       ).show()
                       orderViewModel.clearListeners()
                       navController.navigate(LoginRoute) {
                         popUpTo(0) { inclusive = true }
                       }
+                    } else {
+                      orderViewModel.applyAuthenticatedMerchant(sessionMerchant)
+                      orderViewModel.listenToFirestore()
                     }
                   }
                 }
-                if (Firebase.auth.currentUser != null) {
+                if (Firebase.auth.currentUser != null && Firebase.auth.currentUser?.isEmailVerified == true) {
                   RestaurantDashboardScreen(
                     onRequestCaptain = { navController.navigate(OrderCourierRoute) },
                     onViewAllOrders = { navController.navigate(OrderHistoryRoute) },
@@ -246,13 +251,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<RestaurantDetailsRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  if (Firebase.auth.currentUser == null) {
+                  val authUser = Firebase.auth.currentUser
+                  if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser != null) {
+                if (Firebase.auth.currentUser?.isEmailVerified == true) {
                   RestaurantDetailsScreen(
                     onBack = { navController.popBackStack() },
                     orderViewModel = orderViewModel
@@ -270,13 +276,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<OrderCourierRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  if (Firebase.auth.currentUser == null) {
+                  val authUser = Firebase.auth.currentUser
+                  if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser != null) {
+                if (Firebase.auth.currentUser?.isEmailVerified == true) {
                   OrderCourierScreen(
                     onBack = { navController.popBackStack() },
                     onOrderSubmitted = { navController.navigate(OrderHistoryRoute) },
@@ -287,13 +294,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<OrderHistoryRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  if (Firebase.auth.currentUser == null) {
+                  val authUser = Firebase.auth.currentUser
+                  if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser != null) {
+                if (Firebase.auth.currentUser?.isEmailVerified == true) {
                   OrderHistoryScreen(
                     onBack = { navController.popBackStack() },
                     onRequestNewOrder = { navController.navigate(OrderCourierRoute) },
@@ -304,13 +312,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<EditOrderRoute> { backStackEntry ->
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  if (Firebase.auth.currentUser == null) {
+                  val authUser = Firebase.auth.currentUser
+                  if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser != null) {
+                if (Firebase.auth.currentUser?.isEmailVerified == true) {
                   val route: EditOrderRoute = backStackEntry.toRoute()
                   EditOrderScreen(
                     orderId = route.orderId,
@@ -327,7 +336,7 @@ class MainActivity : ComponentActivity() {
             onDismiss = { orderViewModel.dismissPushNotification() }
           )
 
-          if (currentUser != null && subscriptionStatus.isExpired) {
+          if (currentUser != null && currentUser.isEmailVerified && subscriptionStatus.isExpired) {
             SubscriptionExpiredScreen(
               message = subscriptionStatus.message ?: "انتهت فترة اشتراكك (30 يوماً)، يرجى التواصل مع الإدارة للتجديد",
               onRecheck = { orderViewModel.recheckSubscription() },
