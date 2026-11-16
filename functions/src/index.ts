@@ -58,7 +58,7 @@ function isCaptainCurrentlyInShift(schedule: FirebaseFirestore.DocumentData | un
   const todayIndex = days.indexOf(today);
   if (todayIndex < 0) return false;
   const parseTime = (value: unknown): number => {
-    if (typeof value !== "string" || !/^\\d{2}:\\d{2}$/.test(value)) return -1;
+    if (typeof value !== "string" || !/^\d{2}:\d{2}$/.test(value)) return -1;
     const [h, m] = value.split(":").map(Number);
     return h >= 0 && h <= 23 && m >= 0 && m <= 59 ? h * 60 + m : -1;
   };
