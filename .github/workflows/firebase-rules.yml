@@ -20,5 +20,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - run: node -e "JSON.parse(require('fs').readFileSync('firestore.indexes.json', 'utf8')); console.log('Firestore indexes JSON valid')"
       - run: npm install --global firebase-tools
       - run: firebase emulators:exec --only firestore,storage --project demo-elbatal "echo Firebase rules compiled"
