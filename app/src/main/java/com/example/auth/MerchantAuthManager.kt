@@ -39,8 +39,8 @@ data class MerchantAccount(
     val accountType: String = "merchant",
     val emailVerified: Boolean = false,
     val subscriptionStatus: String = "unsubscribed",
-    val status: String = "approved",
-    val isApproved: Boolean = true,
+    val status: String = "pending",
+    val isApproved: Boolean = false,
     val role: String = "merchant"
 )
 
@@ -328,8 +328,7 @@ object MerchantAuthManager {
                     "accountType" to ACCOUNT_TYPE_MERCHANT,
                     "role" to ACCOUNT_TYPE_MERCHANT,
                     "emailVerified" to false,
-                    "status" to "approved",
-                    "isApproved" to true,
+                    "status" to "pending",
                     "isSubscribed" to false,
                     "subscriptionStatus" to "unsubscribed",
                     "maxCaptains" to 0,
@@ -586,14 +585,14 @@ object MerchantAuthManager {
             // Step 4: Ensure the account is not suspended/blocked
             val status = merchantDoc.status.trim().lowercase()
             val isExplicitlyBlocked = status in listOf(
-                "rejected", "suspended", "blocked", "banned", "inactive", "مرفوض", "موقوف", "محظور"
+                "rejected", "suspended", "blocked", "banned", "inactive", "pending", "مرفوض", "موقوف", "محظور", "قيد المراجعة"
             ) || merchantDoc.isApproved == false
 
             if (isExplicitlyBlocked) {
                 Log.w(TAG, "Login rejected: Merchant account uid=$uid is blocked/suspended (status=$status)")
                 backend.signOut(context)
                 return MerchantSignInResult.NotRegistered(
-                    "تم إيقاف أو رفض حساب التاجر. يرجى التواصل مع الإدارة."
+                    "حساب التاجر قيد مراجعة الإدارة أو موقوف. يرجى انتظار الموافقة قبل تسجيل الدخول."
                 )
             }
 
