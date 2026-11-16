@@ -153,6 +153,23 @@ service cloud.firestore {
         ])
       );
       allow delete: if isAdmin();
+
+      match /transactions/{transactionId} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
+      }
+      match /daily_wallets/{dayKey} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
+      }
+      match /subscriptions/{subscriptionId} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
+      }
+      match /shifts/{shiftId} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
+      }
     }
 
     // Captain schedules are managed by admins; captains can read only their own schedules.
