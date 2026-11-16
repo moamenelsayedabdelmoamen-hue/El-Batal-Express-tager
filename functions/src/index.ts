@@ -64,42 +64,33 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
     return false;
   }
 
-  // 2. Verify Restaurant Subscription
-  const restaurantId = orderData.restaurantId || orderData.userId;
-  if (!restaurantId) {
-    console.warn(`[AutoDispatch] Order ${orderId} has no restaurantId or userId. Cannot verify subscription.`);
-    return false;
-  }
-
-  const restaurantDoc = await db.collection("restaurants").doc(restaurantId).get();
-  if (!restaurantDoc.exists) {
-    console.error(`[AutoDispatch] Restaurant doc ${restaurantId} not found.`);
+  // 2. Verify the canonical merchant account and subscription.
+  const merchantId = orderData.merchantId || orderData.userId;
+  if (!merchantId) return false;
+  const merchantDoc = await db.collection("merchants").doc(merchantId).get();
+  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
     await db.collection("orders").doc(orderId).update({
       dispatchStatus: "failed",
-      dispatchError: "المطعم غير موجود بالنظام",
+      dispatchError: "التاجر غير موجود في merchants",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     return false;
   }
-
-  const restData = restaurantDoc.data() || {};
-  const subStatus = (restData.subscriptionStatus || "").toLowerCase();
-
-  // Check if subscription is expired or inactive
-  let isSubActive = subStatus === "active";
-  if (restData.subscriptionEndDate) {
-    const endDate = restData.subscriptionEndDate.toDate ? restData.subscriptionEndDate.toDate() : new Date(restData.subscriptionEndDate);
-    if (endDate.getTime() < Date.now()) {
-      isSubActive = false;
-    }
+  const restData = merchantDoc.data() || {};
+  if (restData.status !== "approved" && restData.status !== "active") {
+    await db.collection("orders").doc(orderId).update({
+      dispatchStatus: "failed",
+      dispatchError: "حساب التاجر في انتظار موافقة الإدارة",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    return false;
   }
-
-  if (!isSubActive) {
-    console.warn(`[AutoDispatch] Restaurant ${restaurantId} has inactive or expired subscription: ${subStatus}`);
+  const subCheck = await verifyMerchantSubscription(merchantId);
+  if (!subCheck.isValid) {
     await db.collection("orders").doc(orderId).update({
       status: "cancelled",
       dispatchStatus: "failed",
-      cancelReason: "اشتراك المطعم غير فعال أو منتهي",
+      cancelReason: subCheck.errorMessage || "اشتراك التاجر غير فعال",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     return false;
@@ -112,7 +103,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   if (orderData.pickupLocation && typeof orderData.pickupLocation.latitude === "number") {
     pickupLat = orderData.pickupLocation.latitude;
     pickupLng = orderData.pickupLocation.longitude;
-  } else if (typeof orderData.restaurantLatitude === "number" && typeof orderData.restaurantLongitude === "number") {
+  } else if (typeof orderData.merchantLatitude === "number" && typeof orderData.merchantLongitude === "number") {
     pickupLat = orderData.restaurantLatitude;
     pickupLng = orderData.restaurantLongitude;
   } else if (restData.location && typeof restData.location.latitude === "number") {
@@ -278,7 +269,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           status: "accepted",
           dispatchStatus: "assigned",
           assignedAt: admin.firestore.FieldValue.serverTimestamp(),
-          distanceToRestaurantKm: Math.round(candidate.distanceKm * 100) / 100,
+          distanceToMerchantKm: Math.round(candidate.distanceKm * 100) / 100,
           estimatedArrival: `${estimatedMins} دقيقة`,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
@@ -305,11 +296,11 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           token: assignedCaptain.fcmToken,
           notification: {
             title: "طلب توصيل جديد 🛵",
-            body: `طلب جديد من مطعم ${orderData.restaurantName || "البطل"} على بعد ${assignedCaptain.distanceKm.toFixed(1)} كم!`
+            body: `طلب جديد من مطعم ${orderData.merchantName || "البطل"} على بعد ${assignedCaptain.distanceKm.toFixed(1)} كم!`
           },
           data: {
             orderId: orderId,
-            restaurantName: String(orderData.restaurantName || ""),
+            merchantName: String(orderData.merchantName || ""),
             distance: `${assignedCaptain.distanceKm.toFixed(1)} km`,
             fee: String(orderData.serviceFee || orderData.price || "30 جنيه"),
             type: "NEW_ORDER_ASSIGNED"
@@ -477,169 +468,63 @@ export interface VerifySubscriptionResult {
  * - Current server time has not exceeded endDate
  * - Concurrent active captains limit is not exceeded
  */
-export async function verifyMerchantSubscription(
-  merchantId: string
-): Promise<VerifySubscriptionResult> {
+export async function verifyMerchantSubscription(merchantId: string): Promise<VerifySubscriptionResult> {
   const now = Date.now();
-
-  // 1. Try querying 'subscriptions' collection by document ID or merchantId / restaurantId
-  let subDoc: FirebaseFirestore.DocumentSnapshot | null = null;
-
-  const directDoc = await db.collection("subscriptions").doc(merchantId).get();
-  if (directDoc.exists) {
-    subDoc = directDoc;
-  } else {
-    // Query by merchantId
-    const q1 = await db.collection("subscriptions").where("merchantId", "==", merchantId).limit(1).get();
-    if (!q1.empty) {
-      subDoc = q1.docs[0];
-    } else {
-      // Query by restaurantId or userId
-      const q2 = await db.collection("subscriptions").where("restaurantId", "==", merchantId).limit(1).get();
-      if (!q2.empty) {
-        subDoc = q2.docs[0];
-      } else {
-        const q3 = await db.collection("subscriptions").where("userId", "==", merchantId).limit(1).get();
-        if (!q3.empty) {
-          subDoc = q3.docs[0];
-        }
-      }
-    }
+  const [subById, merchantDoc] = await Promise.all([
+    db.collection("subscriptions").doc(merchantId).get(),
+    db.collection("merchants").doc(merchantId).get()
+  ]);
+  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
+    return { isValid: false, status: "not_found", errorMessage: "حساب التاجر غير موجود في merchants." };
   }
-
-  // If not found in 'subscriptions', check 'restaurants' document as legitimate legacy bridge
-  let subData: FirebaseFirestore.DocumentData | undefined;
-  if (subDoc && subDoc.exists) {
-    subData = subDoc.data() || {};
-  } else {
-    const restDoc = await db.collection("restaurants").doc(merchantId).get();
-    if (restDoc.exists && (restDoc.data()?.subscriptionStatus || restDoc.data()?.subscriptionEndDate)) {
-      subData = restDoc.data();
-    }
+  const merchantData = merchantDoc.data() || {};
+  if (merchantData.status !== "approved" && merchantData.status !== "active") {
+    return { isValid: false, status: "merchant_pending", errorMessage: "حساب التاجر في انتظار موافقة الإدارة." };
   }
-
-  if (!subData) {
-    return {
-      isValid: false,
-      status: "not_found",
-      errorMessage: "لا يوجد اشتراك مسجل لهذا الحساب، يرجى التواصل مع الإدارة للاشتراك في إحدى الباقات."
-    };
-  }
-
-  const rawStatus = (subData.status || subData.subscriptionStatus || "").toString().toLowerCase().trim();
+  const subData = subById.exists ? (subById.data() || {}) : merchantData;
+  const rawStatus = String(subData.status || subData.subscriptionStatus || "").toLowerCase().trim();
   const planId = Number(subData.planId || 1);
   const planName = subData.planName || (planId === 2 ? "الباقة المتوسطة" : planId === 3 ? "الباقة المميزة" : planId === 4 ? "الباقة المتقدمة" : "الباقة الأساسية");
   const maxCaptains = Number(subData.maxCaptains || (planId === 2 ? 4 : planId === 3 ? 6 : planId === 4 ? 8 : 2));
-
-  // Determine end date
-  let endDateMs: number | null = null;
   const rawEndDate = subData.endDate || subData.subscriptionEndDate || subData.expiryDate;
+  let endDateMs: number | null = null;
   if (rawEndDate) {
-    if (typeof rawEndDate.toMillis === "function") {
-      endDateMs = rawEndDate.toMillis();
-    } else if (rawEndDate instanceof Date) {
-      endDateMs = rawEndDate.getTime();
-    } else if (typeof rawEndDate === "number") {
-      endDateMs = rawEndDate;
-    } else if (typeof rawEndDate === "string") {
+    if (typeof rawEndDate.toMillis === "function") endDateMs = rawEndDate.toMillis();
+    else if (rawEndDate instanceof Date) endDateMs = rawEndDate.getTime();
+    else if (typeof rawEndDate === "number") endDateMs = rawEndDate;
+    else if (typeof rawEndDate === "string") {
       const parsed = Date.parse(rawEndDate);
       if (!isNaN(parsed)) endDateMs = parsed;
     }
   }
-
-  // Handle various states
   if (rawStatus === "expired" || (endDateMs !== null && now >= endDateMs)) {
-    return {
-      isValid: false,
-      status: "expired",
-      planId,
-      planName,
-      maxCaptains,
-      endDate: endDateMs,
-      errorMessage: "اشتراكك منتهي، يرجى تجديد الاشتراك لمتابعة إنشاء وتوصيل الطلبات."
-    };
+    return { isValid: false, status: "expired", planId, planName, maxCaptains, endDate: endDateMs, errorMessage: "اشتراكك منتهي، يرجى تجديد الاشتراك." };
   }
-
-  if (rawStatus === "suspended" || rawStatus === "موقوف") {
-    return {
-      isValid: false,
-      status: "suspended",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "اشتراكك موقوف مؤقتاً من قبل الإدارة، يرجى التواصل مع الدعم الفني."
-    };
+  if (["suspended", "موقوف", "cancelled", "canceled", "ملغي", "pending_payment", "في انتظار الدفع"].includes(rawStatus)) {
+    return { isValid: false, status: rawStatus, planId, planName, maxCaptains, errorMessage: "الاشتراك غير نشط أو في انتظار الدفع." };
   }
-
-  if (rawStatus === "cancelled" || rawStatus === "canceled" || rawStatus === "ملغي") {
-    return {
-      isValid: false,
-      status: "cancelled",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "تم إلغاء الاشتراك، يرجى التواصل مع الإدارة لإعادة التفعيل."
-    };
-  }
-
-  if (rawStatus === "pending_payment" || rawStatus === "في انتظار الدفع") {
-    return {
-      isValid: false,
-      status: "pending_payment",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "اشتراكك في انتظار تأكيد سداد الفاتورة، يرجى إتمام عملية الدفع."
-    };
-  }
-
   if (rawStatus !== "active" && rawStatus !== "نشط") {
-    return {
-      isValid: false,
-      status: rawStatus || "inactive",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "حالة الاشتراك الحالية غير مفعلة، يرجى مراجعة إدارة البطل إكسبريس."
-    };
+    return { isValid: false, status: rawStatus || "inactive", planId, planName, maxCaptains, errorMessage: "لا يوجد اشتراك نشط لهذا التاجر." };
   }
 
-  // Count active concurrent captains for this restaurant
-  const activeOrdersSnap = await db.collection("orders")
-    .where("restaurantId", "==", merchantId)
-    .where("status", "in", ["accepted", "in_progress", "out_for_delivery", "captain_reached_store", "order_picked_up", "waiting_merchant_confirmation", "customer_confirmed", "customer_rejected", "في الطريق لك", "جاري التوصيل", "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات"])
-    .get();
-
+  const activeStatuses = ["accepted", "in_progress", "out_for_delivery", "captain_reached_store", "order_picked_up", "waiting_merchant_confirmation", "customer_confirmed", "customer_rejected", "في الطريق لك", "جاري التوصيل", "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات"];
+  const [activeByMerchant, activeLegacy] = await Promise.all([
+    db.collection("orders").where("merchantId", "==", merchantId).where("status", "in", activeStatuses).get(),
+    db.collection("orders").where("restaurantId", "==", merchantId).where("status", "in", activeStatuses).get()
+  ]);
+  const activeOrders = new Map<string, FirebaseFirestore.QueryDocumentSnapshot>();
+  activeByMerchant.docs.forEach((doc) => activeOrders.set(doc.id, doc));
+  activeLegacy.docs.forEach((doc) => activeOrders.set(doc.id, doc));
   const activeCaptainIds = new Set<string>();
-  activeOrdersSnap.forEach((doc) => {
-    const cid = doc.data().captainId;
-    if (cid && typeof cid === "string" && cid.trim() !== "") {
-      activeCaptainIds.add(cid.trim());
-    }
+  activeOrders.forEach((doc) => {
+    const captainId = doc.data().captainId;
+    if (typeof captainId === "string" && captainId.trim()) activeCaptainIds.add(captainId.trim());
   });
-
   const activeCaptainsCount = activeCaptainIds.size;
   if (activeCaptainsCount >= maxCaptains && maxCaptains > 0) {
-    return {
-      isValid: false,
-      status: "active",
-      planId,
-      planName,
-      maxCaptains,
-      activeCaptainsCount,
-      errorMessage: `لقد وصلت للحد الأقصى لعدد الكباتن المتزامنين المسموح بهم في باقتك (${maxCaptains} كباتن). يرجى انتظار تسليم أحد الطلبات الجارية أو ترقية الباقة.`
-    };
+    return { isValid: false, status: "active", planId, planName, maxCaptains, activeCaptainsCount, errorMessage: `وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك (${maxCaptains}).` };
   }
-
-  return {
-    isValid: true,
-    status: "active",
-    planId,
-    planName,
-    maxCaptains,
-    endDate: endDateMs,
-    activeCaptainsCount
-  };
+  return { isValid: true, status: "active", planId, planName, maxCaptains, endDate: endDateMs, activeCaptainsCount };
 }
 
 /**
@@ -697,11 +582,23 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
     throw new functions.https.HttpsError("failed-precondition", subCheck.errorMessage || "الاشتراك غير متاح لإنشاء الطلب.");
   }
 
-  // Get restaurant profile data
-  const restDoc = await db.collection("restaurants").doc(uid).get();
-  const restData = restDoc.exists ? restDoc.data() || {} : {};
-  const restaurantName = restData.name || restData.restaurantName || "مطعم";
-  const restaurantLoc = restData.location || (restData.latitude && restData.longitude ? new admin.firestore.GeoPoint(restData.latitude, restData.longitude) : new admin.firestore.GeoPoint(30.0444, 31.2357));
+  // Read the merchant profile exclusively from merchants/{uid}.
+  const merchantDoc = await db.collection("merchants").doc(uid).get();
+  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
+    throw new functions.https.HttpsError("permission-denied", "حساب التاجر غير موجود في merchants.");
+  }
+  const merchantData = merchantDoc.data() || {};
+  if (merchantData.status !== "approved" && merchantData.status !== "active") {
+    throw new functions.https.HttpsError("failed-precondition", "حساب التاجر في انتظار موافقة الإدارة.");
+  }
+  const merchantName = merchantData.name || "تاجر";
+  const merchantLoc = merchantData.location ||
+    (typeof merchantData.latitude === "number" && typeof merchantData.longitude === "number"
+      ? new admin.firestore.GeoPoint(merchantData.latitude, merchantData.longitude)
+      : null);
+  if (!merchantLoc) {
+    throw new functions.https.HttpsError("failed-precondition", "يرجى تحديد موقع المتجر قبل إنشاء الطلب.");
+  }
 
   // 4. Atomic Transaction: Find unique 6-digit code and create order
   const MAX_ATTEMPTS = 15;
@@ -758,15 +655,15 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
           notes: deliveryNotes,
           status: "pending",
           dispatchStatus: "searching",
-          restaurantId: uid,
+          merchantId: uid,
           merchantId: uid,
           userId: uid,
-          restaurantName: restaurantName,
-          "restaurant name": restaurantName,
-          restaurantLocation: restaurantLoc,
-          pickupLocation: restaurantLoc,
-          restaurantLatitude: (restaurantLoc as any).latitude,
-          restaurantLongitude: (restaurantLoc as any).longitude,
+          merchantName: merchantName,
+          
+          merchantLocation: merchantLoc,
+          pickupLocation: merchantLoc,
+          merchantLatitude: (merchantLoc as any).latitude,
+          merchantLongitude: (merchantLoc as any).longitude,
           captainId: null,
           driver_name: null,
           captainName: null,
