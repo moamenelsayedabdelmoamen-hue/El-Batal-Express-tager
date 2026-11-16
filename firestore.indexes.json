@@ -32,8 +32,6 @@
         { "fieldPath": "dispatchStatus", "order": "ASCENDING" }
       ]
     }
-  ]
-    }
   ],
   "fieldOverrides": []
 }
