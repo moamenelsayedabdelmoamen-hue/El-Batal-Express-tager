@@ -2,51 +2,192 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
 
-    // دالة مساعدة للتحقق من تسجيل دخول المستخدم
-    function isSignedIn() {
+    function isAuthenticated() {
       return request.auth != null;
     }
 
-    // دالة للتحقق من أن الملف المرفوع صورة وحجمه أقل من 10 ميجابايت
-    function isValidImage() {
+    // Trusted DB-backed admin check (never trusts spoofable client fields)
+    function isAdmin() {
+      return isAuthenticated() &&
+        firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid));
+    }
+
+    // Trusted DB-backed merchant account check
+    function isMerchantAccount() {
+      return isAuthenticated() &&
+        firestore.exists(/databases/(default)/documents/merchants/$(request.auth.uid));
+    }
+
+    function isValidImageUpload() {
       return request.resource != null
-          && request.resource.size < 10 * 1024 * 1024
-          && request.resource.contentType.matches('image/.*');
+        && request.resource.size > 0
+        && request.resource.size <= 10 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|jpg|png|webp)');
     }
 
-    // 1. صور وشعارات المتاجر والمطاعم: merchants/{uid}/...
-    match /merchants/{uid}/{allPaths=**} {
-      allow read: if true;
-      allow write: if isSignedIn() && request.auth.uid == uid && isValidImage();
+    function isAssignedCaptainOfOrder(orderData) {
+      return isAuthenticated() && (
+        ('captainId' in orderData && orderData.captainId == request.auth.uid) ||
+        ('driverId' in orderData && orderData.driverId == request.auth.uid) ||
+        ('captainUid' in orderData && orderData.captainUid == request.auth.uid) ||
+        ('assignedCaptainId' in orderData && orderData.assignedCaptainId == request.auth.uid)
+      );
     }
 
-    // 2. مسار المطاعم الإضافي: restaurants/{uid}/...
-    match /restaurants/{uid}/{allPaths=**} {
-      allow read: if true;
-      allow write: if isSignedIn() && request.auth.uid == uid && isValidImage();
+    // Merchant is permitted ONLY when authenticated as a merchant AND explicitly linked to THIS order
+    function isMerchantOfOrder(orderData) {
+      return isMerchantAccount() && (
+        ('merchantId' in orderData && orderData.merchantId == request.auth.uid) ||
+        ('restaurantId' in orderData && orderData.restaurantId == request.auth.uid) ||
+        ('storeId' in orderData && orderData.storeId == request.auth.uid) ||
+        ('vendorId' in orderData && orderData.vendorId == request.auth.uid) ||
+        ('ownerId' in orderData && orderData.ownerId == request.auth.uid)
+      );
     }
 
-    // 3. صور الكباتن والمناديب: captains/{captainId}/...
-    match /captains/{captainId}/{allPaths=**} {
-      allow read: if true;
-      allow write: if isSignedIn() && (request.auth.uid == captainId || isValidImage());
+    // EXPLICIT ALLOWLIST of order statuses permitted for receipt upload.
+    // Any missing, unknown, initial ('pending', 'accepted', 'at_store'), en_route,
+    // or closed ('delivered', 'completed', 'cancelled', 'expired', 'closed') status is REJECTED.
+    function isExplicitAllowedReceiptUploadStatus(orderData) {
+      return ('status' in orderData)
+        && (orderData.status is string)
+        && (orderData.status in [
+          'picked_up',
+          'merchant_rejected',
+          'awaiting_merchant_confirmation'
+        ]);
     }
 
-    // 4. إيصالات الطلبات وصور الاستلام: orders/... و receipts/...
-    match /orders/{allPaths=**} {
-      allow read: if isSignedIn();
-      allow write: if isSignedIn() && isValidImage();
+    function canReadOrderReceiptDoc(orderDoc) {
+      return orderDoc != null
+        && orderDoc.data != null
+        && (
+          isAssignedCaptainOfOrder(orderDoc.data) ||
+          isMerchantOfOrder(orderDoc.data)
+        );
     }
 
-    match /receipts/{allPaths=**} {
-      allow read: if isSignedIn();
-      allow write: if isSignedIn() && isValidImage();
+    function canCaptainWriteOrderReceiptDoc(orderDoc) {
+      return orderDoc != null
+        && orderDoc.data != null
+        && isAssignedCaptainOfOrder(orderDoc.data)
+        && isExplicitAllowedReceiptUploadStatus(orderDoc.data);
     }
 
-    // 5. السماح لأي مستخدم مسجل الدخول برفع وقراءة الصور في المسارات الأخرى داخل التطبيق
+    function hasValidReceiptMetadata(orderId) {
+      return request.resource.metadata != null
+        && ('orderId' in request.resource.metadata)
+        && ('captainId' in request.resource.metadata)
+        && request.resource.metadata.orderId == orderId
+        && request.resource.metadata.captainId == request.auth.uid;
+    }
+
+    // Restricts merchant read of a captain's profile photo ONLY to the merchant
+    // currently linked to an active order with this specific captain (never all merchants).
+    function isCaptainLinkedToActiveMerchant(captainDoc) {
+      return captainDoc != null
+        && captainDoc.data != null
+        && (
+          ('activeMerchantId' in captainDoc.data && captainDoc.data.activeMerchantId == request.auth.uid) ||
+          ('currentMerchantId' in captainDoc.data && captainDoc.data.currentMerchantId == request.auth.uid)
+        );
+    }
+
+    // Merchant profile images: merchants/{merchantId}/profile.jpg
+    // The merchant can manage only their own image; admins can moderate any merchant image.
+    match /merchants/{merchantId}/{fileName} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == merchantId || isAdmin()
+      );
+      allow create, update: if isAuthenticated()
+        && (request.auth.uid == merchantId || isAdmin())
+        && fileName in ['profile.jpg', 'logo.jpg', 'logo.png', 'logo.webp']
+        && isValidImageUpload();
+      allow delete: if isAdmin() || (isAuthenticated() && request.auth.uid == merchantId);
+    }
+
+    // 1. Captain Profile Photo: captains/{captainId}/profile/profile.jpg
+    // - Read: ONLY the owning captain, an admin, or the specific merchant linked to an active order with this captain.
+    //   Blanket read access across all captains by arbitrary merchants is DENIED.
+    // - Write: ONLY the owning captain (non-merchant) with validated image MIME & size.
+    match /captains/{captainId}/profile/profile.jpg {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == captainId ||
+        isAdmin() ||
+        (
+          isMerchantAccount() &&
+          isCaptainLinkedToActiveMerchant(
+            firestore.get(/databases/(default)/documents/captains/$(captainId))
+          )
+        )
+      );
+
+      allow create, update: if isAuthenticated()
+        && request.auth.uid == captainId
+        && !isMerchantAccount()
+        && isValidImageUpload();
+
+      allow delete: if isAdmin();
+    }
+
+    // 2. Captain Private Documents (National ID Front & Back, License): captains/{captainId}/documents/{docFile}
+    // - Strictly private: NO public open access, NO other captains, and ZERO merchants allowed.
+    // - Read: ONLY the owning captain or system admin.
+    // - Write: ONLY the owning captain.
+    match /captains/{captainId}/documents/{docFile} {
+      allow read: if isAuthenticated() && (
+        (request.auth.uid == captainId && !isMerchantAccount()) ||
+        isAdmin()
+      );
+
+      allow create, update: if isAuthenticated()
+        && request.auth.uid == captainId
+        && !isMerchantAccount()
+        && (docFile == 'id_front.jpg' || docFile == 'id_back.jpg' || docFile == 'license.jpg')
+        && isValidImageUpload();
+
+      allow delete: if isAdmin();
+    }
+
+    // 3. Order Receipts: orders/{orderId}/receipts/{uniqueFileName}
+    // - Read: ONLY the assigned captain of this order, the merchant owning THIS specific order, or an admin.
+    // - Create/Update: ONLY the assigned captain when the order status is in the EXPLICIT allowlist
+    //   ['picked_up', 'merchant_rejected', 'awaiting_merchant_confirmation'] (any unknown or closed state is rejected).
+    // - Delete: Admin/server authority only.
+    match /orders/{orderId}/receipts/{uniqueFileName} {
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        canReadOrderReceiptDoc(
+          firestore.get(/databases/(default)/documents/orders/$(orderId))
+        )
+      );
+
+      allow create: if isAuthenticated()
+        && !isMerchantAccount()
+        && isValidImageUpload()
+        && hasValidReceiptMetadata(orderId)
+        && canCaptainWriteOrderReceiptDoc(
+          firestore.get(/databases/(default)/documents/orders/$(orderId))
+        );
+
+      allow update: if isAuthenticated() && (
+        (
+          !isMerchantAccount()
+          && isValidImageUpload()
+          && hasValidReceiptMetadata(orderId)
+          && canCaptainWriteOrderReceiptDoc(
+            firestore.get(/databases/(default)/documents/orders/$(orderId))
+          )
+        ) ||
+        isAdmin()
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // 4. Default zero-trust deny for all other paths
     match /{allPaths=**} {
-      allow read: if true;
-      allow write: if isSignedIn();
+      allow read, write: if false;
     }
   }
 }

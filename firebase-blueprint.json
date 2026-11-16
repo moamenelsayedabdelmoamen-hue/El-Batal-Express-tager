@@ -89,26 +89,12 @@
       },
       "required": ["uid", "email", "accountType"]
     },
-    "Restaurant": {
-      "title": "Restaurant",
-      "description": "Restaurant profile information",
-      "type": "object",
-      "properties": {
-        "uid": { "type": "string" },
-        "name": { "type": "string" },
-        "phone": { "type": "string" },
-        "address": { "type": "string" },
-        "latitude": { "type": "number" },
-        "longitude": { "type": "number" },
-        "ownerId": { "type": "string" }
-      }
-    },
     "Order": {
       "title": "Order",
       "description": "Courier dispatch orders",
       "type": "object",
       "properties": {
-        "restaurantId": { "type": "string" },
+        "merchantId": { "type": "string" },
         "captainId": { "type": "string" },
         "status": { "type": "string" },
         "dispatchStatus": { "type": "string" }
@@ -130,10 +116,6 @@
     "/merchants/{merchantId}": {
       "schema": "Merchant",
       "description": "Merchant accounts pre-registered and approved by El Batal Express"
-    },
-    "/restaurants/{restaurantId}": {
-      "schema": "Restaurant",
-      "description": "Restaurant store details and location"
     },
     "/orders/{orderId}": {
       "schema": "Order",

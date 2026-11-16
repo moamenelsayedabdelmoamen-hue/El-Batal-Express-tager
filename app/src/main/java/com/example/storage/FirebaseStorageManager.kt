@@ -530,7 +530,7 @@ object FirebaseStorageManager {
      * 2. Upload image bytes to Firebase Storage (`merchants/{uid}/profile.jpg`).
      * 3. Verify upload succeeded (`totalByteCount > 0`).
      * 4. Verify new image download URL is readable.
-     * 5. Update image URL and `storagePath` in Firestore (`restaurants/{uid}` and `merchants/{uid}`).
+     * 5. Update image URL and `storagePath` only in `merchants/{uid}`.
      * 6. Retain `legacyImageBackupUrl` until all steps succeed; log result and support retry on failure.
      */
     suspend fun migrateLegacyImageSafely(

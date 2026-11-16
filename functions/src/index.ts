@@ -46,9 +46,67 @@ interface CandidateCaptain {
   distanceKm: number;
 }
 
+// Shared eligibility gate used before ranking and again inside the Firestore assignment transaction.
+function isCaptainReadyForDispatch(data: FirebaseFirestore.DocumentData | undefined): boolean {
+  if (!data || data.isOnline !== true) return false;
+  const status = String(data.status || "").toLowerCase();
+  const presence = String(data.presenceStatus || "available").toLowerCase();
+  const availability = String(data.availabilityStatus || "available").toLowerCase();
+  const unavailableStates = ["offline", "busy", "unavailable", "paused"];
+  return ["online", "active", "approved"].includes(status)
+    && data.canReceiveOrders !== false
+    && data.isReceivingOrders !== false
+    && data.receiveOrders !== false
+    && data.isBlocked !== true
+    && data.isSuspended !== true
+    && !unavailableStates.includes(presence)
+    && !unavailableStates.includes(availability)
+    && !(data.currentOrderId && String(data.currentOrderId).trim());
+}
+
+function isCaptainCurrentlyInShift(schedule: FirebaseFirestore.DocumentData | undefined, now = new Date()): boolean {
+  if (!schedule || schedule.isPaused === true || !schedule.weeklySchedule) return false;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Africa/Cairo", weekday: "long", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(now);
+  const part = (type: string) => parts.find((p) => p.type === type)?.value || "";
+  const today = part("weekday").toLowerCase();
+  const currentMinutes = Number(part("hour")) * 60 + Number(part("minute"));
+  const days = ["saturday", "sunday", "monday", "tuesday", "wednesday", "thursday", "friday"];
+  const todayIndex = days.indexOf(today);
+  if (todayIndex < 0) return false;
+  const parseTime = (value: unknown): number => {
+    if (typeof value !== "string" || !/^\d{2}:\d{2}$/.test(value)) return -1;
+    const [h, m] = value.split(":").map(Number);
+    return h >= 0 && h <= 23 && m >= 0 && m <= 59 ? h * 60 + m : -1;
+  };
+  const weekly = schedule.weeklySchedule as Record<string, any>;
+  const todaySchedule = weekly[today];
+  if (todaySchedule && todaySchedule.isDayOff !== true) {
+    for (const shift of (todaySchedule.shifts || [])) {
+      const start = parseTime(shift.startTime);
+      const end = parseTime(shift.endTime);
+      if (start < 0 || end < 0) continue;
+      if (shift.isOvernight === true || end <= start) {
+        if (currentMinutes >= start) return true;
+      } else if (currentMinutes >= start && currentMinutes < end) return true;
+    }
+  }
+  const previousDay = days[(todayIndex + days.length - 1) % days.length];
+  const previousSchedule = weekly[previousDay];
+  if (previousSchedule && previousSchedule.isDayOff !== true) {
+    for (const shift of (previousSchedule.shifts || [])) {
+      const start = parseTime(shift.startTime);
+      const end = parseTime(shift.endTime);
+      if (start >= 0 && end >= 0 && (shift.isOvernight === true || end <= start) && currentMinutes < end) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Main auto-dispatch engine function.
- * Given an order ID and data, verifies restaurant subscription, searches for eligible captains,
+ * Given an order ID and data, verifies merchant subscription, searches for eligible captains,
  * sorts by proximity, and attempts an atomic transaction assignment.
  */
 export async function runAutoDispatch(orderId: string, orderData: FirebaseFirestore.DocumentData): Promise<boolean> {
@@ -64,42 +122,33 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
     return false;
   }
 
-  // 2. Verify Restaurant Subscription
-  const restaurantId = orderData.restaurantId || orderData.userId;
-  if (!restaurantId) {
-    console.warn(`[AutoDispatch] Order ${orderId} has no restaurantId or userId. Cannot verify subscription.`);
-    return false;
-  }
-
-  const restaurantDoc = await db.collection("restaurants").doc(restaurantId).get();
-  if (!restaurantDoc.exists) {
-    console.error(`[AutoDispatch] Restaurant doc ${restaurantId} not found.`);
+  // 2. Verify the canonical merchant account and subscription.
+  const merchantId = orderData.merchantId || orderData.userId;
+  if (!merchantId) return false;
+  const merchantDoc = await db.collection("merchants").doc(merchantId).get();
+  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
     await db.collection("orders").doc(orderId).update({
       dispatchStatus: "failed",
-      dispatchError: "المطعم غير موجود بالنظام",
+      dispatchError: "التاجر غير موجود في merchants",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     return false;
   }
-
-  const restData = restaurantDoc.data() || {};
-  const subStatus = (restData.subscriptionStatus || "").toLowerCase();
-
-  // Check if subscription is expired or inactive
-  let isSubActive = subStatus === "active";
-  if (restData.subscriptionEndDate) {
-    const endDate = restData.subscriptionEndDate.toDate ? restData.subscriptionEndDate.toDate() : new Date(restData.subscriptionEndDate);
-    if (endDate.getTime() < Date.now()) {
-      isSubActive = false;
-    }
+  const restData = merchantDoc.data() || {};
+  if (restData.status !== "approved" && restData.status !== "active") {
+    await db.collection("orders").doc(orderId).update({
+      dispatchStatus: "failed",
+      dispatchError: "حساب التاجر في انتظار موافقة الإدارة",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    return false;
   }
-
-  if (!isSubActive) {
-    console.warn(`[AutoDispatch] Restaurant ${restaurantId} has inactive or expired subscription: ${subStatus}`);
+  const subCheck = await verifyMerchantSubscription(merchantId);
+  if (!subCheck.isValid) {
     await db.collection("orders").doc(orderId).update({
       status: "cancelled",
       dispatchStatus: "failed",
-      cancelReason: "اشتراك المطعم غير فعال أو منتهي",
+      cancelReason: subCheck.errorMessage || "اشتراك التاجر غير فعال",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     return false;
@@ -112,9 +161,9 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   if (orderData.pickupLocation && typeof orderData.pickupLocation.latitude === "number") {
     pickupLat = orderData.pickupLocation.latitude;
     pickupLng = orderData.pickupLocation.longitude;
-  } else if (typeof orderData.restaurantLatitude === "number" && typeof orderData.restaurantLongitude === "number") {
-    pickupLat = orderData.restaurantLatitude;
-    pickupLng = orderData.restaurantLongitude;
+  } else if (typeof orderData.merchantLatitude === "number" && typeof orderData.merchantLongitude === "number") {
+    pickupLat = orderData.merchantLatitude;
+    pickupLng = orderData.merchantLongitude;
   } else if (restData.location && typeof restData.location.latitude === "number") {
     pickupLat = restData.location.latitude;
     pickupLng = restData.location.longitude;
@@ -124,25 +173,21 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   }
 
   if (pickupLat === null || pickupLng === null) {
-    console.warn(`[AutoDispatch] No valid location found for restaurant ${restaurantId}. Order ${orderId} remains in searching.`);
+    console.warn(`[AutoDispatch] No valid location found for merchant ${merchantId}. Order ${orderId} remains in searching.`);
     await db.collection("orders").doc(orderId).update({
       dispatchStatus: "searching",
-      dispatchNote: "في انتظار تحديد إحداثيات المطعم",
+      dispatchNote: "في انتظار تحديد إحداثيات التاجر",
       lastSearchAt: admin.firestore.FieldValue.serverTimestamp()
     });
     return false;
   }
 
   // 4. Query eligible captains from 'captains' collection
-  // Criteria:
-  // - isOnline == true
-  // - availabilityStatus == 'available'
-  // - status == 'approved'
-  // - currentOrderId == null
+  // isOnline is the stable shared field across the captain app and admin dashboard.
+  // A shared readiness predicate handles status, presence, reception toggles, and current order.
+  // Older/current clients may use presenceStatus/canReceiveOrders instead of availabilityStatus.
   const captainsSnapshot = await db.collection("captains")
     .where("isOnline", "==", true)
-    .where("availabilityStatus", "==", "available")
-    .where("status", "==", "approved")
     .get();
 
   if (captainsSnapshot.empty) {
@@ -158,14 +203,15 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   const nowMs = Date.now();
   const maxLocationStaleMs = 3 * 60 * 1000; // 3 minutes maximum for fresh location
   const candidates: CandidateCaptain[] = [];
+  const scheduleSnapshots = await Promise.all(captainsSnapshot.docs.map((captainDoc) =>
+    db.collection("captain_schedules").doc(captainDoc.id).get()
+  ));
 
-  for (const doc of captainsSnapshot.docs) {
+  for (let captainIndex = 0; captainIndex < captainsSnapshot.docs.length; captainIndex++) {
+    const doc = captainsSnapshot.docs[captainIndex];
+    if (!isCaptainCurrentlyInShift(scheduleSnapshots[captainIndex].data())) continue;
     const data = doc.data();
-
-    // Ensure no active order
-    if (data.currentOrderId && data.currentOrderId !== null && data.currentOrderId !== "") {
-      continue;
-    }
+    if (!isCaptainReadyForDispatch(data)) continue;
 
     // Validate location existence
     const loc = data.location;
@@ -178,7 +224,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
     if (lastLocUpdate) {
       const updateDate = lastLocUpdate.toDate ? lastLocUpdate.toDate() : new Date(lastLocUpdate);
       const diffMs = nowMs - updateDate.getTime();
-      if (diffMs > maxLocationStaleMs) {
+      if (!Number.isFinite(updateDate.getTime()) || diffMs < -30000 || diffMs > maxLocationStaleMs) {
         console.log(`[AutoDispatch] Captain ${doc.id} skipped due to stale location (${Math.round(diffMs / 1000)}s old).`);
         continue;
       }
@@ -230,9 +276,13 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
       await db.runTransaction(async (transaction) => {
         const orderRef = db.collection("orders").doc(orderId);
         const captainRef = db.collection("captains").doc(candidate.id);
+        const scheduleRef = db.collection("captain_schedules").doc(candidate.id);
 
-        const currentOrderDoc = await transaction.get(orderRef);
-        const currentCaptainDoc = await transaction.get(captainRef);
+        const [currentOrderDoc, currentCaptainDoc, scheduleDoc] = await Promise.all([
+          transaction.get(orderRef),
+          transaction.get(captainRef),
+          transaction.get(scheduleRef)
+        ]);
 
         if (!currentOrderDoc.exists) {
           throw new Error("ORDER_NOT_FOUND");
@@ -249,11 +299,10 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         }
 
         const freshCaptain = currentCaptainDoc.data() || {};
-        // Re-verify captain is strictly available and not busy
+        // Re-verify readiness and shift membership inside the assignment transaction.
         if (
-          !freshCaptain.isOnline ||
-          freshCaptain.availabilityStatus !== "available" ||
-          (freshCaptain.currentOrderId && freshCaptain.currentOrderId !== null && freshCaptain.currentOrderId !== "")
+          !isCaptainReadyForDispatch(freshCaptain) ||
+          !isCaptainCurrentlyInShift(scheduleDoc.data())
         ) {
           throw new Error("CAPTAIN_BUSY_OR_OFFLINE");
         }
@@ -264,6 +313,8 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         transaction.update(captainRef, {
           availabilityStatus: "busy",
           currentOrderId: orderId,
+          activeMerchantId: merchantId,
+          currentMerchantId: merchantId,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
@@ -278,7 +329,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           status: "accepted",
           dispatchStatus: "assigned",
           assignedAt: admin.firestore.FieldValue.serverTimestamp(),
-          distanceToRestaurantKm: Math.round(candidate.distanceKm * 100) / 100,
+          distanceToMerchantKm: Math.round(candidate.distanceKm * 100) / 100,
           estimatedArrival: `${estimatedMins} دقيقة`,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
@@ -305,11 +356,11 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           token: assignedCaptain.fcmToken,
           notification: {
             title: "طلب توصيل جديد 🛵",
-            body: `طلب جديد من مطعم ${orderData.restaurantName || "البطل"} على بعد ${assignedCaptain.distanceKm.toFixed(1)} كم!`
+            body: `طلب جديد من مطعم ${orderData.merchantName || "البطل"} على بعد ${assignedCaptain.distanceKm.toFixed(1)} كم!`
           },
           data: {
             orderId: orderId,
-            restaurantName: String(orderData.restaurantName || ""),
+            merchantName: String(orderData.merchantName || ""),
             distance: `${assignedCaptain.distanceKm.toFixed(1)} km`,
             fee: String(orderData.serviceFee || orderData.price || "30 جنيه"),
             type: "NEW_ORDER_ASSIGNED"
@@ -367,10 +418,8 @@ export const onCaptainUpdated = functions.firestore
     const afterData = change.after.data();
 
     const becameAvailable =
-      afterData.isOnline === true &&
-      afterData.availabilityStatus === "available" &&
-      (!afterData.currentOrderId || afterData.currentOrderId === null) &&
-      (beforeData.isOnline !== true || beforeData.availabilityStatus !== "available" || beforeData.currentOrderId !== null);
+      isCaptainReadyForDispatch(afterData) &&
+      !isCaptainReadyForDispatch(beforeData);
 
     if (becameAvailable) {
       console.log(`[AutoDispatch] Captain ${context.params.captainId} is now online & available. Looking for queued orders...`);
@@ -417,6 +466,8 @@ export const onOrderStatusChanged = functions.firestore
         await db.collection("captains").doc(captainId).update({
           availabilityStatus: "available",
           currentOrderId: null,
+          activeMerchantId: admin.firestore.FieldValue.delete(),
+          currentMerchantId: admin.firestore.FieldValue.delete(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
         console.log(`[AutoDispatch] Captain ${captainId} freed and set to available.`);
@@ -470,176 +521,70 @@ export interface VerifySubscriptionResult {
 }
 
 /**
- * Server-side subscription validation against 'subscriptions' collection (with fallback to 'restaurants').
+ * Server-side subscription validation against subscriptions/{merchantId} and merchants/{merchantId} only.
  * Checks:
  * - Subscription document exists in 'subscriptions'
  * - Status is 'active'
  * - Current server time has not exceeded endDate
  * - Concurrent active captains limit is not exceeded
  */
-export async function verifyMerchantSubscription(
-  merchantId: string
-): Promise<VerifySubscriptionResult> {
+export async function verifyMerchantSubscription(merchantId: string): Promise<VerifySubscriptionResult> {
   const now = Date.now();
-
-  // 1. Try querying 'subscriptions' collection by document ID or merchantId / restaurantId
-  let subDoc: FirebaseFirestore.DocumentSnapshot | null = null;
-
-  const directDoc = await db.collection("subscriptions").doc(merchantId).get();
-  if (directDoc.exists) {
-    subDoc = directDoc;
-  } else {
-    // Query by merchantId
-    const q1 = await db.collection("subscriptions").where("merchantId", "==", merchantId).limit(1).get();
-    if (!q1.empty) {
-      subDoc = q1.docs[0];
-    } else {
-      // Query by restaurantId or userId
-      const q2 = await db.collection("subscriptions").where("restaurantId", "==", merchantId).limit(1).get();
-      if (!q2.empty) {
-        subDoc = q2.docs[0];
-      } else {
-        const q3 = await db.collection("subscriptions").where("userId", "==", merchantId).limit(1).get();
-        if (!q3.empty) {
-          subDoc = q3.docs[0];
-        }
-      }
-    }
+  const [subById, merchantDoc] = await Promise.all([
+    db.collection("subscriptions").doc(merchantId).get(),
+    db.collection("merchants").doc(merchantId).get()
+  ]);
+  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
+    return { isValid: false, status: "not_found", errorMessage: "حساب التاجر غير موجود في merchants." };
   }
-
-  // If not found in 'subscriptions', check 'restaurants' document as legitimate legacy bridge
-  let subData: FirebaseFirestore.DocumentData | undefined;
-  if (subDoc && subDoc.exists) {
-    subData = subDoc.data() || {};
-  } else {
-    const restDoc = await db.collection("restaurants").doc(merchantId).get();
-    if (restDoc.exists && (restDoc.data()?.subscriptionStatus || restDoc.data()?.subscriptionEndDate)) {
-      subData = restDoc.data();
-    }
+  const merchantData = merchantDoc.data() || {};
+  if (merchantData.status !== "approved" && merchantData.status !== "active") {
+    return { isValid: false, status: "merchant_pending", errorMessage: "حساب التاجر في انتظار موافقة الإدارة." };
   }
-
-  if (!subData) {
-    return {
-      isValid: false,
-      status: "not_found",
-      errorMessage: "لا يوجد اشتراك مسجل لهذا الحساب، يرجى التواصل مع الإدارة للاشتراك في إحدى الباقات."
-    };
-  }
-
-  const rawStatus = (subData.status || subData.subscriptionStatus || "").toString().toLowerCase().trim();
+  const subData = subById.exists ? (subById.data() || {}) : merchantData;
+  const rawStatus = String(subData.status || subData.subscriptionStatus || "").toLowerCase().trim();
   const planId = Number(subData.planId || 1);
   const planName = subData.planName || (planId === 2 ? "الباقة المتوسطة" : planId === 3 ? "الباقة المميزة" : planId === 4 ? "الباقة المتقدمة" : "الباقة الأساسية");
   const maxCaptains = Number(subData.maxCaptains || (planId === 2 ? 4 : planId === 3 ? 6 : planId === 4 ? 8 : 2));
-
-  // Determine end date
-  let endDateMs: number | null = null;
   const rawEndDate = subData.endDate || subData.subscriptionEndDate || subData.expiryDate;
+  let endDateMs: number | null = null;
   if (rawEndDate) {
-    if (typeof rawEndDate.toMillis === "function") {
-      endDateMs = rawEndDate.toMillis();
-    } else if (rawEndDate instanceof Date) {
-      endDateMs = rawEndDate.getTime();
-    } else if (typeof rawEndDate === "number") {
-      endDateMs = rawEndDate;
-    } else if (typeof rawEndDate === "string") {
+    if (typeof rawEndDate.toMillis === "function") endDateMs = rawEndDate.toMillis();
+    else if (rawEndDate instanceof Date) endDateMs = rawEndDate.getTime();
+    else if (typeof rawEndDate === "number") endDateMs = rawEndDate;
+    else if (typeof rawEndDate === "string") {
       const parsed = Date.parse(rawEndDate);
       if (!isNaN(parsed)) endDateMs = parsed;
     }
   }
-
-  // Handle various states
   if (rawStatus === "expired" || (endDateMs !== null && now >= endDateMs)) {
-    return {
-      isValid: false,
-      status: "expired",
-      planId,
-      planName,
-      maxCaptains,
-      endDate: endDateMs,
-      errorMessage: "اشتراكك منتهي، يرجى تجديد الاشتراك لمتابعة إنشاء وتوصيل الطلبات."
-    };
+    return { isValid: false, status: "expired", planId, planName, maxCaptains, endDate: endDateMs, errorMessage: "اشتراكك منتهي، يرجى تجديد الاشتراك." };
   }
-
-  if (rawStatus === "suspended" || rawStatus === "موقوف") {
-    return {
-      isValid: false,
-      status: "suspended",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "اشتراكك موقوف مؤقتاً من قبل الإدارة، يرجى التواصل مع الدعم الفني."
-    };
+  if (["suspended", "موقوف", "cancelled", "canceled", "ملغي", "pending_payment", "في انتظار الدفع"].includes(rawStatus)) {
+    return { isValid: false, status: rawStatus, planId, planName, maxCaptains, errorMessage: "الاشتراك غير نشط أو في انتظار الدفع." };
   }
-
-  if (rawStatus === "cancelled" || rawStatus === "canceled" || rawStatus === "ملغي") {
-    return {
-      isValid: false,
-      status: "cancelled",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "تم إلغاء الاشتراك، يرجى التواصل مع الإدارة لإعادة التفعيل."
-    };
-  }
-
-  if (rawStatus === "pending_payment" || rawStatus === "في انتظار الدفع") {
-    return {
-      isValid: false,
-      status: "pending_payment",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "اشتراكك في انتظار تأكيد سداد الفاتورة، يرجى إتمام عملية الدفع."
-    };
-  }
-
   if (rawStatus !== "active" && rawStatus !== "نشط") {
-    return {
-      isValid: false,
-      status: rawStatus || "inactive",
-      planId,
-      planName,
-      maxCaptains,
-      errorMessage: "حالة الاشتراك الحالية غير مفعلة، يرجى مراجعة إدارة البطل إكسبريس."
-    };
+    return { isValid: false, status: rawStatus || "inactive", planId, planName, maxCaptains, errorMessage: "لا يوجد اشتراك نشط لهذا التاجر." };
   }
 
-  // Count active concurrent captains for this restaurant
-  const activeOrdersSnap = await db.collection("orders")
-    .where("restaurantId", "==", merchantId)
-    .where("status", "in", ["accepted", "in_progress", "out_for_delivery", "captain_reached_store", "order_picked_up", "waiting_merchant_confirmation", "customer_confirmed", "customer_rejected", "في الطريق لك", "جاري التوصيل", "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات"])
-    .get();
-
+  const activeStatuses = ["accepted", "in_progress", "out_for_delivery", "captain_reached_store", "order_picked_up", "waiting_merchant_confirmation", "customer_confirmed", "customer_rejected", "في الطريق لك", "جاري التوصيل", "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات"];
+  const [activeByMerchant, activeLegacy] = await Promise.all([
+    db.collection("orders").where("merchantId", "==", merchantId).where("status", "in", activeStatuses).get(),
+    db.collection("orders").where("restaurantId", "==", merchantId).where("status", "in", activeStatuses).get()
+  ]);
+  const activeOrders = new Map<string, FirebaseFirestore.QueryDocumentSnapshot>();
+  activeByMerchant.docs.forEach((doc) => activeOrders.set(doc.id, doc));
+  activeLegacy.docs.forEach((doc) => activeOrders.set(doc.id, doc));
   const activeCaptainIds = new Set<string>();
-  activeOrdersSnap.forEach((doc) => {
-    const cid = doc.data().captainId;
-    if (cid && typeof cid === "string" && cid.trim() !== "") {
-      activeCaptainIds.add(cid.trim());
-    }
+  activeOrders.forEach((doc) => {
+    const captainId = doc.data().captainId;
+    if (typeof captainId === "string" && captainId.trim()) activeCaptainIds.add(captainId.trim());
   });
-
   const activeCaptainsCount = activeCaptainIds.size;
   if (activeCaptainsCount >= maxCaptains && maxCaptains > 0) {
-    return {
-      isValid: false,
-      status: "active",
-      planId,
-      planName,
-      maxCaptains,
-      activeCaptainsCount,
-      errorMessage: `لقد وصلت للحد الأقصى لعدد الكباتن المتزامنين المسموح بهم في باقتك (${maxCaptains} كباتن). يرجى انتظار تسليم أحد الطلبات الجارية أو ترقية الباقة.`
-    };
+    return { isValid: false, status: "active", planId, planName, maxCaptains, activeCaptainsCount, errorMessage: `وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك (${maxCaptains}).` };
   }
-
-  return {
-    isValid: true,
-    status: "active",
-    planId,
-    planName,
-    maxCaptains,
-    endDate: endDateMs,
-    activeCaptainsCount
-  };
+  return { isValid: true, status: "active", planId, planName, maxCaptains, endDate: endDateMs, activeCaptainsCount };
 }
 
 /**
@@ -660,6 +605,9 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
     throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً لإنشاء طلب جديد.");
   }
   const uid = context.auth.uid;
+  if (context.auth.token.email_verified !== true) {
+    throw new functions.https.HttpsError("permission-denied", "يجب تأكيد البريد الإلكتروني أولاً.");
+  }
 
   const idempotencyKey = (data.idempotencyKey || "").toString().trim();
   const destinationAddress = (data.destinationAddress || data.address || "").toString().trim();
@@ -697,11 +645,23 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
     throw new functions.https.HttpsError("failed-precondition", subCheck.errorMessage || "الاشتراك غير متاح لإنشاء الطلب.");
   }
 
-  // Get restaurant profile data
-  const restDoc = await db.collection("restaurants").doc(uid).get();
-  const restData = restDoc.exists ? restDoc.data() || {} : {};
-  const restaurantName = restData.name || restData.restaurantName || "مطعم";
-  const restaurantLoc = restData.location || (restData.latitude && restData.longitude ? new admin.firestore.GeoPoint(restData.latitude, restData.longitude) : new admin.firestore.GeoPoint(30.0444, 31.2357));
+  // Read the merchant profile exclusively from merchants/{uid}.
+  const merchantDoc = await db.collection("merchants").doc(uid).get();
+  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
+    throw new functions.https.HttpsError("permission-denied", "حساب التاجر غير موجود في merchants.");
+  }
+  const merchantData = merchantDoc.data() || {};
+  if (merchantData.status !== "approved" && merchantData.status !== "active") {
+    throw new functions.https.HttpsError("failed-precondition", "حساب التاجر في انتظار موافقة الإدارة.");
+  }
+  const merchantName = merchantData.name || "تاجر";
+  const merchantLoc = merchantData.location ||
+    (typeof merchantData.latitude === "number" && typeof merchantData.longitude === "number"
+      ? new admin.firestore.GeoPoint(merchantData.latitude, merchantData.longitude)
+      : null);
+  if (!merchantLoc) {
+    throw new functions.https.HttpsError("failed-precondition", "يرجى تحديد موقع المتجر قبل إنشاء الطلب.");
+  }
 
   // 4. Atomic Transaction: Find unique 6-digit code and create order
   const MAX_ATTEMPTS = 15;
@@ -758,15 +718,14 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
           notes: deliveryNotes,
           status: "pending",
           dispatchStatus: "searching",
-          restaurantId: uid,
           merchantId: uid,
           userId: uid,
-          restaurantName: restaurantName,
-          "restaurant name": restaurantName,
-          restaurantLocation: restaurantLoc,
-          pickupLocation: restaurantLoc,
-          restaurantLatitude: (restaurantLoc as any).latitude,
-          restaurantLongitude: (restaurantLoc as any).longitude,
+          merchantName: merchantName,
+          
+          merchantLocation: merchantLoc,
+          pickupLocation: merchantLoc,
+          merchantLatitude: (merchantLoc as any).latitude,
+          merchantLongitude: (merchantLoc as any).longitude,
           captainId: null,
           driver_name: null,
           captainName: null,

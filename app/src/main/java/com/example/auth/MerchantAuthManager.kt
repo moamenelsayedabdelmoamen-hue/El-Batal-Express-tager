@@ -39,8 +39,8 @@ data class MerchantAccount(
     val accountType: String = "merchant",
     val emailVerified: Boolean = false,
     val subscriptionStatus: String = "unsubscribed",
-    val status: String = "approved",
-    val isApproved: Boolean = true,
+    val status: String = "pending",
+    val isApproved: Boolean = false,
     val role: String = "merchant"
 )
 
@@ -328,8 +328,7 @@ object MerchantAuthManager {
                     "accountType" to ACCOUNT_TYPE_MERCHANT,
                     "role" to ACCOUNT_TYPE_MERCHANT,
                     "emailVerified" to false,
-                    "status" to "approved",
-                    "isApproved" to true,
+                    "status" to "pending",
                     "isSubscribed" to false,
                     "subscriptionStatus" to "unsubscribed",
                     "maxCaptains" to 0,
@@ -442,12 +441,17 @@ object MerchantAuthManager {
         context: Context,
         activity: Activity
     ): MerchantSignInResult {
-        val clientId = try {
-            context.getString(R.string.default_web_client_id)
-        } catch (e: Exception) {
-            Log.e(TAG, "default_web_client_id missing from resources", e)
-            return MerchantSignInResult.Error("إعدادات Google Sign-In غير متوفرة (default_web_client_id)")
+        val clientIdResourceId = context.resources.getIdentifier(
+            "default_web_client_id",
+            "string",
+            context.packageName
+        )
+        if (clientIdResourceId == 0) {
+            Log.e(TAG, "default_web_client_id missing; check app/google-services.json")
+            return MerchantSignInResult.Error("إعدادات Google Sign-In غير مكتملة. يرجى تحديث إعدادات Firebase.")
         }
+        val clientId = context.getString(clientIdResourceId).takeIf { it.isNotBlank() }
+            ?: return MerchantSignInResult.Error("إعدادات Google Sign-In غير مكتملة. يرجى تحديث إعدادات Firebase.")
 
         val credentialManager = CredentialManager.create(context)
         val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = clientId).build()
@@ -585,15 +589,22 @@ object MerchantAuthManager {
 
             // Step 4: Ensure the account is not suspended/blocked
             val status = merchantDoc.status.trim().lowercase()
+            if (status in listOf("pending", "awaiting_approval", "under_review", "قيد المراجعة", "في انتظار الموافقة")) {
+                Log.i(TAG, "Login deferred: merchant account is awaiting admin approval (uid=$uid)")
+                backend.signOut(context)
+                return MerchantSignInResult.NotRegistered(
+                    "تم استلام طلب تسجيلك بنجاح. حسابك في انتظار موافقة الإدارة، وسيتمكن من الدخول بعد اعتماد الحساب."
+                )
+            }
             val isExplicitlyBlocked = status in listOf(
-                "rejected", "suspended", "blocked", "banned", "inactive", "مرفوض", "موقوف", "محظور"
+                "rejected", "suspended", "blocked", "banned", "inactive", "pending", "مرفوض", "موقوف", "محظور", "قيد المراجعة"
             ) || merchantDoc.isApproved == false
 
             if (isExplicitlyBlocked) {
                 Log.w(TAG, "Login rejected: Merchant account uid=$uid is blocked/suspended (status=$status)")
                 backend.signOut(context)
                 return MerchantSignInResult.NotRegistered(
-                    "تم إيقاف أو رفض حساب التاجر. يرجى التواصل مع الإدارة."
+                    "حساب التاجر قيد مراجعة الإدارة أو موقوف. يرجى انتظار الموافقة قبل تسجيل الدخول."
                 )
             }
 

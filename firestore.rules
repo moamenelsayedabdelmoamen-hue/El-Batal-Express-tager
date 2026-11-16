@@ -26,19 +26,6 @@ service cloud.firestore {
       return exists(/databases/$(database)/documents/merchants/$(uid));
     }
 
-    function hasRestaurantAccount(uid) {
-      return exists(/databases/$(database)/documents/restaurants/$(uid));
-    }
-
-    // Check if user is the restaurant owner (strictly isolated from merchants and captains)
-    function isRestaurantOwner(restaurantId) {
-      return isSignedIn() && (
-        (request.auth.token.role == 'restaurant' && request.auth.token.restaurantId == restaurantId) ||
-        request.auth.uid == restaurantId
-      );
-    }
-
-    // Check if user is the merchant owner (strictly isolated: NEVER includes isRestaurantOwner)
     function isMerchant(merchantId) {
       return isSignedIn() && (
         request.auth.uid == merchantId ||
@@ -61,175 +48,220 @@ service cloud.firestore {
 
     // Admins collection: only admins can read or manage
     match /admins/{adminId} {
-      allow read: if isSignedIn();
+      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == adminId);
+      allow list: if isAdmin();
       allow write: if isAdmin();
     }
 
     // Merchants collection:
     // Strictly isolated to merchant accounts (`accountType == 'merchant'`).
-    // Blocked if UID already belongs to captains or restaurants.
+    // Blocked if UID already belongs to a captain account.
     match /merchants/{merchantId} {
-      // Direct document read allowed for Admin or the merchant themselves (never a captain account)
-      allow get: if isAdmin() || (
-        isMerchant(merchantId) &&
-        !hasCaptainAccount(request.auth.uid)
-      );
-
-      // Listing/scraping all merchants is restricted to admins only
+      allow get: if isAdmin() || (isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid));
       allow list: if isAdmin();
-
-      // Creation allowed ONLY for admin or the authenticated user creating their own merchants/{uid}
-      // with accountType == 'merchant', and NOT present in captains or restaurants
       allow create: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.uid == merchantId &&
-        request.resource.data.uid == request.auth.uid &&
-        request.resource.data.accountType == 'merchant' &&
-        !hasCaptainAccount(request.auth.uid) &&
-        !hasRestaurantAccount(request.auth.uid)
+        isSignedIn() && request.auth.uid == merchantId && !hasCaptainAccount(request.auth.uid)
+        && request.resource.data.uid == merchantId
+        && request.resource.data.accountType == 'merchant'
+        && request.resource.data.role == 'merchant'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 150
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 160
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 32
+        && request.resource.data.address is string
+        && request.resource.data.address.size() <= 300
+        && request.resource.data.emailVerified == false
+        && request.resource.data.status == 'pending'
+        && request.resource.data.subscriptionStatus == 'unsubscribed'
+        && request.resource.data.isSubscribed == false
+        && request.resource.data.maxCaptains == 0
+        && request.resource.data.planId == 0
+        && !('isApproved' in request.resource.data)
+        && !('isAdmin' in request.resource.data)
+        && !('walletBalance' in request.resource.data)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'name', 'email', 'phone', 'address', 'category', 'logo', 'photoUrl',
+          'logoUrl', 'storagePath', 'accountType', 'role', 'emailVerified', 'status',
+          'isSubscribed', 'subscriptionStatus', 'maxCaptains', 'planId', 'authProvider',
+          'createdAt', 'updatedAt'
+        ])
       );
-
-      // Updating: Admin has full access. Merchant can update their profile info,
-      // but cannot elevate or alter protected administrative/identity fields.
       allow update: if isAdmin() || (
-        isMerchant(merchantId) &&
-        !hasCaptainAccount(request.auth.uid) &&
-        (!('status' in request.resource.data) || request.resource.data.status == resource.data.status) &&
-        (!('isApproved' in request.resource.data) || request.resource.data.isApproved == resource.data.isApproved) &&
-        (!('role' in request.resource.data) || request.resource.data.role == resource.data.role) &&
-        (!('accountType' in request.resource.data) || request.resource.data.accountType == 'merchant') &&
-        (!('emailVerified' in request.resource.data) ||
-          request.resource.data.emailVerified == resource.data.emailVerified ||
-          (request.resource.data.emailVerified == true && request.auth.token.email_verified == true)) &&
-        (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid || request.resource.data.uid == request.auth.uid)
+        isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.accountType == 'merchant'
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.status == resource.data.status
+        && (!('isApproved' in resource.data) || request.resource.data.isApproved == resource.data.isApproved)
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 150
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 32
+        && request.resource.data.address is string
+        && request.resource.data.address.size() <= 300
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'phone', 'address', 'category', 'description', 'logo', 'logoUrl',
+          'photoUrl', 'imageUrl', 'storagePath', 'location', 'latitude', 'longitude',
+          'locationUrl', 'locationLink', 'mapUrl', 'mapLink', 'mapsUrl', 'mapsLink',
+          'googleMapsUrl', 'googleMapUrl', 'isOpen', 'workingHours', 'fcmToken',
+          'emailVerified', 'lastLoginAt', 'updatedAt'
+        ])
+        && (!('emailVerified' in request.resource.data.diff(resource.data).affectedKeys())
+          || request.resource.data.emailVerified == false
+          || request.auth.token.email_verified == true)
       );
-
-      // Only admins can delete a merchant document
       allow delete: if isAdmin();
-
-      // Subcollections under merchant (e.g., products, branches)
       match /{subcollection=**} {
         allow read, write: if isAdmin() || (isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid));
       }
     }
 
-    // Restaurants collection:
-    // Strictly separated from merchants and captains
-    match /restaurants/{restaurantId} {
-      // Direct document read allowed for Admin or the restaurant owner (only if not a merchant/captain)
-      allow get: if isAdmin() || (
-        isRestaurantOwner(restaurantId) &&
-        !hasMerchantAccount(request.auth.uid) &&
-        !hasCaptainAccount(request.auth.uid)
-      );
-      
-      // Listing/scraping all restaurants is restricted to admins only
+    // Captains: private by default. Merchants can get only the captain currently assigned to them.
+    match /captains/{captainId} {
+      allow get: if isAdmin()
+        || isCaptain(captainId)
+        || (
+          isSignedIn()
+          && hasMerchantAccount(request.auth.uid)
+          && (
+            ('activeMerchantId' in resource.data && resource.data.activeMerchantId == request.auth.uid)
+            || ('currentMerchantId' in resource.data && resource.data.currentMerchantId == request.auth.uid)
+          )
+        );
       allow list: if isAdmin();
 
-      // Creation blocked if user already exists in merchants or captains
       allow create: if isAdmin() || (
-        isRestaurantOwner(restaurantId) &&
-        !hasMerchantAccount(request.auth.uid) &&
-        !hasCaptainAccount(request.auth.uid) &&
-        (!('ownerId' in request.resource.data) || request.resource.data.ownerId == request.auth.uid) &&
-        (!('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid)
+        isSignedIn()
+        && request.auth.uid == captainId
+        && !hasMerchantAccount(request.auth.uid)
+        && request.resource.data.uid == captainId
+        && request.resource.data.role == 'captain'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.walletBalance == 0
+        && !('isAdmin' in request.resource.data)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'email',
+          'role', 'status', 'profileImagePath', 'idFrontImagePath', 'idBackImagePath',
+          'licenseImagePath', 'idDocumentsComplete', 'rating', 'walletBalance',
+          'vehicleType', 'licensePlate', 'createdAt', 'updatedAt', 'avatarUri', 'profileImageUrl', 'photoUrl',
+          'idCardImageUrl', 'licenseImageUrl', 'nationalIdUrl', 'licenseUrl',
+          'avatarPresetIndex', 'isOnline', 'isLoggedIn', 'emailVerified', 'isEmailVerified'
+        ])
       );
 
-      // Updating: Admin has full access. Restaurant owner can update own doc only if not merchant/captain.
       allow update: if isAdmin() || (
-        isRestaurantOwner(restaurantId) &&
-        !hasMerchantAccount(request.auth.uid) &&
-        !hasCaptainAccount(request.auth.uid) &&
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'rating',
-          'ratingCount'
-        ]) &&
-        (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid || (!('uid' in resource.data) && request.resource.data.uid == request.auth.uid)) &&
-        (!('ownerId' in request.resource.data) || request.resource.data.ownerId == resource.data.ownerId || (!('ownerId' in resource.data) && request.resource.data.ownerId == request.auth.uid)) &&
-        (!('createdAt' in request.resource.data) || request.resource.data.createdAt == resource.data.createdAt || !('createdAt' in resource.data))
+        isCaptain(captainId)
+        && !hasMerchantAccount(request.auth.uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'emailVerified',
+          'isEmailVerified', 'isLoggedIn', 'isOnline', 'presenceStatus', 'location',
+          'latitude', 'longitude', 'accuracy', 'bearing', 'speed', 'lastLocationUpdate',
+          'lastLocationTimestamp', 'updatedAt', 'profileImagePath', 'profileImageUpdatedAt', 'profileImageUrl', 'photoUrl', 'avatarUri',
+          'idFrontImagePath', 'idBackImagePath', 'licenseImagePath', 'idDocumentsComplete',
+          'idCardImageUrl', 'licenseImageUrl', 'nationalIdUrl', 'licenseUrl',
+          'vehicleType', 'licensePlate', 'avatarUri', 'avatarPresetIndex', 'fcmToken'
+        ])
       );
-
-      // Only admins can delete a restaurant document
       allow delete: if isAdmin();
-      
-      // Subcollections under restaurant (e.g., menu, branches)
-      match /{subcollection=**} {
-        allow read, write: if isAdmin() || (
-          isRestaurantOwner(restaurantId) &&
-          !hasMerchantAccount(request.auth.uid) &&
-          !hasCaptainAccount(request.auth.uid)
-        );
+
+      match /transactions/{transactionId} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
+      }
+      match /daily_wallets/{dayKey} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
+      }
+      match /subscriptions/{subscriptionId} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
+      }
+      match /shifts/{shiftId} {
+        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
+        allow create, update, delete: if isAdmin();
       }
     }
 
-    // Captains collection
-    // Merchants and restaurants are strictly forbidden from creating or editing captain profiles.
-    match /captains/{captainId} {
-      allow read: if isSignedIn();
-      allow create: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.uid == captainId &&
-        !hasMerchantAccount(request.auth.uid) &&
-        !hasRestaurantAccount(request.auth.uid)
-      );
-      // Captains can update their own profile/status (blocked for merchants/restaurants).
-      // Active order dispatch can update availabilityStatus and currentOrderId only.
-      allow update: if isAdmin() || (
-        isCaptain(captainId) &&
-        !hasMerchantAccount(request.auth.uid) &&
-        !hasRestaurantAccount(request.auth.uid) &&
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'status',
-          'rating',
-          'ratingCount',
-          'role'
-        ])
-      ) || (
-        isSignedIn() &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'availabilityStatus',
-          'currentOrderId',
-          'updatedAt'
-        ])
-      );
-      allow delete: if isAdmin();
+    // Captain schedules are managed by admins; captains can read only their own schedules.
+    match /captain_schedules/{scheduleId} {
+      allow get: if isAdmin() || (isSignedIn() && (
+        request.auth.uid == scheduleId ||
+        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
+        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
+        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
+      ));
+      allow list: if isAdmin() || (isSignedIn() && (
+        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
+        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
+        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
+      ));
+      allow create, update, delete: if isAdmin();
+
+      match /shifts/{shiftId} {
+        allow read: if isAdmin() || isSignedIn() && request.auth.uid == scheduleId;
+        allow write: if isAdmin();
+      }
+    }
+
+    // Legacy shifts are read-only for the assigned captain; all schedule writes go through the admin panel.
+    match /shifts/{shiftId} {
+      allow get, list: if isAdmin() || (isSignedIn() && (
+        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
+        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
+        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
+      ));
+      allow create, update, delete: if isAdmin();
     }
 
     // Orders collection:
-    // 1. Restaurant/Merchant can NEVER choose or modify captainId.
+    // 1. Merchant can NEVER choose or modify captainId.
     // 2. Initial order creation must have captainId == null, dispatchStatus == 'searching', status == 'pending'.
     // 3. Selection and assignment are handled atomically by Cloud Functions / backend transactions.
     match /orders/{orderId} {
-      allow read: if isAdmin() || 
-        (isSignedIn() && (
-          resource.data.restaurantId == request.auth.token.restaurantId ||
-          resource.data.restaurantId == request.auth.uid ||
+      allow read: if isAdmin() ||
+        (isMerchantAccount() && (
           resource.data.merchantId == request.auth.uid ||
           resource.data.userId == request.auth.uid
         )) ||
-        (isSignedIn() && (
-          resource.data.captainId == request.auth.token.captainId ||
-          resource.data.captainId == request.auth.uid
+        (hasCaptainAccount(request.auth.uid) && (
+          ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
+          ('offeredCaptainId' in resource.data && resource.data.offeredCaptainId == request.auth.uid)
         ));
       
-      // Restaurant/Merchant creates order with pending status and null captainId
+      // Merchant creates order with pending status and null captainId
       allow create: if isAdmin() || (
         isSignedIn() &&
-        (request.resource.data.restaurantId == request.auth.uid || request.resource.data.merchantId == request.auth.uid || request.resource.data.userId == request.auth.uid) &&
+        request.resource.data.merchantId == request.auth.uid &&
+        exists(/databases/$(database)/documents/merchants/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant' &&
+        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.status in ['approved', 'active'] &&
+        request.auth.token.email_verified == true &&
         request.resource.data.captainId == null &&
         request.resource.data.dispatchStatus == 'searching' &&
         request.resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن']
       );
 
-      // Restaurant/Merchant can update order details or cancel prior to assignment, but CANNOT set captainId or dispatchStatus
+      // Merchant can update order details or cancel prior to assignment, but CANNOT set captainId or dispatchStatus
       // Captain can update delivery progress once assigned
       allow update: if isAdmin() || 
-        (isSignedIn() && (resource.data.restaurantId == request.auth.uid || resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid) &&
+        (isMerchantAccount() && resource.data.merchantId == request.auth.uid &&
+          request.resource.data.merchantId == resource.data.merchantId &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.orderCode == resource.data.orderCode &&
           request.resource.data.captainId == resource.data.captainId &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'dispatchStatus', 'assignedAt'])
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId', 'dispatchStatus', 'assignedAt'])
         ) ||
-        (isSignedIn() && (resource.data.captainId == request.auth.uid) &&
-          request.resource.data.captainId == resource.data.captainId
+        (hasCaptainAccount(request.auth.uid) && resource.data.captainId == request.auth.uid &&
+          request.resource.data.captainId == resource.data.captainId &&
+          request.resource.data.merchantId == resource.data.merchantId &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.orderCode == resource.data.orderCode
         );
 
       allow delete: if isAdmin();
@@ -238,24 +270,17 @@ service cloud.firestore {
     // Subscriptions collection:
     // Merchant can read their own subscription document.
     match /subscriptions/{subscriptionId} {
-      allow read: if isSignedIn();
-      allow create, update: if isAdmin() || (
-        isSignedIn() && (
-          subscriptionId == request.auth.uid ||
-          request.resource.data.merchantId == request.auth.uid ||
-          request.resource.data.restaurantId == request.auth.uid
-        )
-      );
-      allow delete: if isAdmin();
+      allow read: if isAdmin() || (isSignedIn() && subscriptionId == request.auth.uid);
+      // Subscription activation and changes are server-authoritative (Paymob webhook/Admin SDK).
+      allow create, update, delete: if isAdmin();
     }
 
     // Order Codes collection:
     // Tracks unique 6-digit codes. Allows authenticated merchants to atomically reserve codes during order creation.
     match /order_codes/{code} {
       allow read: if isSignedIn();
-      allow create: if isSignedIn() && (
-        request.resource.data.merchantId == request.auth.uid ||
-        isAdmin()
+      allow create: if isAdmin() || (
+        isMerchantAccount() && request.resource.data.merchantId == request.auth.uid
       );
       allow update, delete: if isAdmin();
     }
@@ -269,9 +294,8 @@ service cloud.firestore {
         resource.data.userId == request.auth.uid ||
         isAdmin()
       );
-      allow create: if isSignedIn() && (
-        request.resource.data.merchantId == request.auth.uid ||
-        isAdmin()
+      allow create: if isAdmin() || (
+        isMerchantAccount() && request.resource.data.merchantId == request.auth.uid
       );
       allow update, delete: if isAdmin();
     }
@@ -279,7 +303,7 @@ service cloud.firestore {
     // Payments collection
     match /payments/{paymentId} {
       allow read: if isAdmin() || 
-        (isSignedIn() && (resource.data.restaurantId == request.auth.token.restaurantId || resource.data.restaurantId == request.auth.uid || resource.data.merchantId == request.auth.uid));
+        (isSignedIn() && (resource.data.merchantId == request.auth.uid));
       allow write: if isAdmin();
     }
 
@@ -291,9 +315,10 @@ service cloud.firestore {
 
     // Users collection (used for user profile synchronization)
     match /users/{userId} {
-      allow read: if isSignedIn();
+      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow list: if isAdmin();
       allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
-      allow delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow delete: if isAdmin();
     }
   }
 }
