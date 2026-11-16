@@ -177,14 +177,9 @@ service cloud.firestore {
     // Subscriptions collection:
     // Merchant can read their own subscription document.
     match /subscriptions/{subscriptionId} {
-      allow read: if isSignedIn();
-      allow create, update: if isAdmin() || (
-        isSignedIn() && (
-          subscriptionId == request.auth.uid ||
-          request.resource.data.merchantId == request.auth.uid ||
-        )
-      );
-      allow delete: if isAdmin();
+      allow read: if isAdmin() || (isSignedIn() && subscriptionId == request.auth.uid);
+      // Subscription activation and changes are server-authoritative (Paymob webhook/Admin SDK).
+      allow create, update, delete: if isAdmin();
     }
 
     // Order Codes collection:
