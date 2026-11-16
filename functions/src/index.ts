@@ -170,10 +170,10 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   // - availabilityStatus == 'available'
   // - status == 'approved'
   // - currentOrderId == null
+  // isOnline is the stable shared field across the captain app and admin dashboard.
+  // Older/current clients may use presenceStatus/canReceiveOrders instead of availabilityStatus.
   const captainsSnapshot = await db.collection("captains")
     .where("isOnline", "==", true)
-    .where("availabilityStatus", "==", "available")
-    .where("status", "==", "approved")
     .get();
 
   if (captainsSnapshot.empty) {
@@ -289,12 +289,19 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         }
 
         const freshCaptain = currentCaptainDoc.data() || {};
-        // Re-verify online, approved, available, and currently inside the configured shift.
+        const freshStatus = String(freshCaptain.status || "").toLowerCase();
+        const freshPresence = String(freshCaptain.presenceStatus || freshCaptain.availabilityStatus || "available").toLowerCase();
+        // Re-verify online, approved/active, enabled for orders, idle, and currently inside the configured shift.
         if (
-          !freshCaptain.isOnline ||
-          freshCaptain.status !== "approved" ||
-          freshCaptain.availabilityStatus !== "available" ||
-          (freshCaptain.currentOrderId && freshCaptain.currentOrderId !== null && freshCaptain.currentOrderId !== "") ||
+          freshCaptain.isOnline !== true ||
+          !["online", "active", "approved"].includes(freshStatus) ||
+          freshCaptain.canReceiveOrders === false ||
+          freshCaptain.isReceivingOrders === false ||
+          freshCaptain.receiveOrders === false ||
+          freshCaptain.isBlocked === true ||
+          freshCaptain.isSuspended === true ||
+          ["offline", "busy", "unavailable", "paused"].includes(freshPresence) ||
+          (freshCaptain.currentOrderId && String(freshCaptain.currentOrderId).trim()) ||
           !isCaptainCurrentlyInShift(scheduleDoc.data())
         ) {
           throw new Error("CAPTAIN_BUSY_OR_OFFLINE");
