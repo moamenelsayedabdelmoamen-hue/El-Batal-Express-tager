@@ -231,7 +231,7 @@ service cloud.firestore {
         )) ||
         (hasCaptainAccount(request.auth.uid) && (
           ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
-          resource.data.offeredCaptainId == request.auth.uid
+          ('offeredCaptainId' in resource.data && resource.data.offeredCaptainId == request.auth.uid)
         ));
       
       // Merchant creates order with pending status and null captainId
@@ -257,8 +257,11 @@ service cloud.firestore {
           request.resource.data.captainId == resource.data.captainId &&
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId', 'dispatchStatus', 'assignedAt'])
         ) ||
-        (isSignedIn() && (resource.data.captainId == request.auth.uid) &&
-          request.resource.data.captainId == resource.data.captainId
+        (hasCaptainAccount(request.auth.uid) && resource.data.captainId == request.auth.uid &&
+          request.resource.data.captainId == resource.data.captainId &&
+          request.resource.data.merchantId == resource.data.merchantId &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.orderCode == resource.data.orderCode
         );
 
       allow delete: if isAdmin();
@@ -276,9 +279,8 @@ service cloud.firestore {
     // Tracks unique 6-digit codes. Allows authenticated merchants to atomically reserve codes during order creation.
     match /order_codes/{code} {
       allow read: if isSignedIn();
-      allow create: if isSignedIn() && (
-        request.resource.data.merchantId == request.auth.uid ||
-        isAdmin()
+      allow create: if isAdmin() || (
+        isMerchantAccount() && request.resource.data.merchantId == request.auth.uid
       );
       allow update, delete: if isAdmin();
     }
@@ -292,9 +294,8 @@ service cloud.firestore {
         resource.data.userId == request.auth.uid ||
         isAdmin()
       );
-      allow create: if isSignedIn() && (
-        request.resource.data.merchantId == request.auth.uid ||
-        isAdmin()
+      allow create: if isAdmin() || (
+        isMerchantAccount() && request.resource.data.merchantId == request.auth.uid
       );
       allow update, delete: if isAdmin();
     }
