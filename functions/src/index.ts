@@ -46,6 +46,7 @@ interface CandidateCaptain {
   distanceKm: number;
 }
 
+// Shared eligibility gate used before ranking and again inside the Firestore assignment transaction.
 function isCaptainReadyForDispatch(data: FirebaseFirestore.DocumentData | undefined): boolean {
   if (!data || data.isOnline !== true) return false;
   const status = String(data.status || "").toLowerCase();
