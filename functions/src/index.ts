@@ -266,9 +266,13 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
       await db.runTransaction(async (transaction) => {
         const orderRef = db.collection("orders").doc(orderId);
         const captainRef = db.collection("captains").doc(candidate.id);
+        const scheduleRef = db.collection("captain_schedules").doc(candidate.id);
 
-        const currentOrderDoc = await transaction.get(orderRef);
-        const currentCaptainDoc = await transaction.get(captainRef);
+        const [currentOrderDoc, currentCaptainDoc, scheduleDoc] = await Promise.all([
+          transaction.get(orderRef),
+          transaction.get(captainRef),
+          transaction.get(scheduleRef)
+        ]);
 
         if (!currentOrderDoc.exists) {
           throw new Error("ORDER_NOT_FOUND");
@@ -285,11 +289,13 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         }
 
         const freshCaptain = currentCaptainDoc.data() || {};
-        // Re-verify captain is strictly available and not busy
+        // Re-verify online, approved, available, and currently inside the configured shift.
         if (
           !freshCaptain.isOnline ||
+          freshCaptain.status !== "approved" ||
           freshCaptain.availabilityStatus !== "available" ||
-          (freshCaptain.currentOrderId && freshCaptain.currentOrderId !== null && freshCaptain.currentOrderId !== "")
+          (freshCaptain.currentOrderId && freshCaptain.currentOrderId !== null && freshCaptain.currentOrderId !== "") ||
+          !isCaptainCurrentlyInShift(scheduleDoc.data())
         ) {
           throw new Error("CAPTAIN_BUSY_OR_OFFLINE");
         }
