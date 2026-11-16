@@ -584,6 +584,13 @@ object MerchantAuthManager {
 
             // Step 4: Ensure the account is not suspended/blocked
             val status = merchantDoc.status.trim().lowercase()
+            if (status in listOf("pending", "awaiting_approval", "under_review", "قيد المراجعة", "في انتظار الموافقة")) {
+                Log.i(TAG, "Login deferred: merchant account is awaiting admin approval (uid=$uid)")
+                backend.signOut(context)
+                return MerchantSignInResult.NotRegistered(
+                    "تم استلام طلب تسجيلك بنجاح. حسابك في انتظار موافقة الإدارة، وسيتمكن من الدخول بعد اعتماد الحساب."
+                )
+            }
             val isExplicitlyBlocked = status in listOf(
                 "rejected", "suspended", "blocked", "banned", "inactive", "pending", "مرفوض", "موقوف", "محظور", "قيد المراجعة"
             ) || merchantDoc.isApproved == false
