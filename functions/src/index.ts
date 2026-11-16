@@ -46,6 +46,46 @@ interface CandidateCaptain {
   distanceKm: number;
 }
 
+function isCaptainCurrentlyInShift(schedule: FirebaseFirestore.DocumentData | undefined, now = new Date()): boolean {
+  if (!schedule || schedule.isPaused === true || !schedule.weeklySchedule) return false;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Africa/Cairo", weekday: "long", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(now);
+  const part = (type: string) => parts.find((p) => p.type === type)?.value || "";
+  const today = part("weekday").toLowerCase();
+  const currentMinutes = Number(part("hour")) * 60 + Number(part("minute"));
+  const days = ["saturday", "sunday", "monday", "tuesday", "wednesday", "thursday", "friday"];
+  const todayIndex = days.indexOf(today);
+  if (todayIndex < 0) return false;
+  const parseTime = (value: unknown): number => {
+    if (typeof value !== "string" || !/^\\d{2}:\\d{2}$/.test(value)) return -1;
+    const [h, m] = value.split(":").map(Number);
+    return h >= 0 && h <= 23 && m >= 0 && m <= 59 ? h * 60 + m : -1;
+  };
+  const weekly = schedule.weeklySchedule as Record<string, any>;
+  const todaySchedule = weekly[today];
+  if (todaySchedule && todaySchedule.isDayOff !== true) {
+    for (const shift of (todaySchedule.shifts || [])) {
+      const start = parseTime(shift.startTime);
+      const end = parseTime(shift.endTime);
+      if (start < 0 || end < 0) continue;
+      if (shift.isOvernight === true || end <= start) {
+        if (currentMinutes >= start || currentMinutes < end) return true;
+      } else if (currentMinutes >= start && currentMinutes < end) return true;
+    }
+  }
+  const previousDay = days[(todayIndex + days.length - 1) % days.length];
+  const previousSchedule = weekly[previousDay];
+  if (previousSchedule && previousSchedule.isDayOff !== true) {
+    for (const shift of (previousSchedule.shifts || [])) {
+      const start = parseTime(shift.startTime);
+      const end = parseTime(shift.endTime);
+      if (start >= 0 && end >= 0 && (shift.isOvernight === true || end <= start) && currentMinutes < end) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Main auto-dispatch engine function.
  * Given an order ID and data, verifies merchant subscription, searches for eligible captains,
@@ -149,8 +189,13 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   const nowMs = Date.now();
   const maxLocationStaleMs = 3 * 60 * 1000; // 3 minutes maximum for fresh location
   const candidates: CandidateCaptain[] = [];
+  const scheduleSnapshots = await Promise.all(captainsSnapshot.docs.map((captainDoc) =>
+    db.collection("captain_schedules").doc(captainDoc.id).get()
+  ));
 
-  for (const doc of captainsSnapshot.docs) {
+  for (let captainIndex = 0; captainIndex < captainsSnapshot.docs.length; captainIndex++) {
+    const doc = captainsSnapshot.docs[captainIndex];
+    if (!isCaptainCurrentlyInShift(scheduleSnapshots[captainIndex].data())) continue;
     const data = doc.data();
 
     // Ensure no active order
@@ -461,7 +506,7 @@ export interface VerifySubscriptionResult {
 }
 
 /**
- * Server-side subscription validation against 'subscriptions' collection (with fallback to 'restaurants').
+ * Server-side subscription validation against subscriptions/{merchantId} and merchants/{merchantId} only.
  * Checks:
  * - Subscription document exists in 'subscriptions'
  * - Status is 'active'
@@ -545,6 +590,9 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
     throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً لإنشاء طلب جديد.");
   }
   const uid = context.auth.uid;
+  if (context.auth.token.email_verified !== true) {
+    throw new functions.https.HttpsError("permission-denied", "يجب تأكيد البريد الإلكتروني أولاً.");
+  }
 
   const idempotencyKey = (data.idempotencyKey || "").toString().trim();
   const destinationAddress = (data.destinationAddress || data.address || "").toString().trim();
@@ -655,7 +703,6 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
           notes: deliveryNotes,
           status: "pending",
           dispatchStatus: "searching",
-          merchantId: uid,
           merchantId: uid,
           userId: uid,
           merchantName: merchantName,
