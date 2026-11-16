@@ -49,14 +49,17 @@ interface CandidateCaptain {
 function isCaptainReadyForDispatch(data: FirebaseFirestore.DocumentData | undefined): boolean {
   if (!data || data.isOnline !== true) return false;
   const status = String(data.status || "").toLowerCase();
-  const presence = String(data.presenceStatus || data.availabilityStatus || "available").toLowerCase();
+  const presence = String(data.presenceStatus || "available").toLowerCase();
+  const availability = String(data.availabilityStatus || "available").toLowerCase();
+  const unavailableStates = ["offline", "busy", "unavailable", "paused"];
   return ["online", "active", "approved"].includes(status)
     && data.canReceiveOrders !== false
     && data.isReceivingOrders !== false
     && data.receiveOrders !== false
     && data.isBlocked !== true
     && data.isSuspended !== true
-    && !["offline", "busy", "unavailable", "paused"].includes(presence)
+    && !unavailableStates.includes(presence)
+    && !unavailableStates.includes(availability)
     && !(data.currentOrderId && String(data.currentOrderId).trim());
 }
 
