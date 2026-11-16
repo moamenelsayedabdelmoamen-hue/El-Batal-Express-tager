@@ -46,6 +46,20 @@ interface CandidateCaptain {
   distanceKm: number;
 }
 
+function isCaptainReadyForDispatch(data: FirebaseFirestore.DocumentData | undefined): boolean {
+  if (!data || data.isOnline !== true) return false;
+  const status = String(data.status || "").toLowerCase();
+  const presence = String(data.presenceStatus || data.availabilityStatus || "available").toLowerCase();
+  return ["online", "active", "approved"].includes(status)
+    && data.canReceiveOrders !== false
+    && data.isReceivingOrders !== false
+    && data.receiveOrders !== false
+    && data.isBlocked !== true
+    && data.isSuspended !== true
+    && !["offline", "busy", "unavailable", "paused"].includes(presence)
+    && !(data.currentOrderId && String(data.currentOrderId).trim());
+}
+
 function isCaptainCurrentlyInShift(schedule: FirebaseFirestore.DocumentData | undefined, now = new Date()): boolean {
   if (!schedule || schedule.isPaused === true || !schedule.weeklySchedule) return false;
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -289,19 +303,9 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         }
 
         const freshCaptain = currentCaptainDoc.data() || {};
-        const freshStatus = String(freshCaptain.status || "").toLowerCase();
-        const freshPresence = String(freshCaptain.presenceStatus || freshCaptain.availabilityStatus || "available").toLowerCase();
-        // Re-verify online, approved/active, enabled for orders, idle, and currently inside the configured shift.
+        // Re-verify readiness and shift membership inside the assignment transaction.
         if (
-          freshCaptain.isOnline !== true ||
-          !["online", "active", "approved"].includes(freshStatus) ||
-          freshCaptain.canReceiveOrders === false ||
-          freshCaptain.isReceivingOrders === false ||
-          freshCaptain.receiveOrders === false ||
-          freshCaptain.isBlocked === true ||
-          freshCaptain.isSuspended === true ||
-          ["offline", "busy", "unavailable", "paused"].includes(freshPresence) ||
-          (freshCaptain.currentOrderId && String(freshCaptain.currentOrderId).trim()) ||
+          !isCaptainReadyForDispatch(freshCaptain) ||
           !isCaptainCurrentlyInShift(scheduleDoc.data())
         ) {
           throw new Error("CAPTAIN_BUSY_OR_OFFLINE");
@@ -418,10 +422,8 @@ export const onCaptainUpdated = functions.firestore
     const afterData = change.after.data();
 
     const becameAvailable =
-      afterData.isOnline === true &&
-      afterData.availabilityStatus === "available" &&
-      (!afterData.currentOrderId || afterData.currentOrderId === null) &&
-      (beforeData.isOnline !== true || beforeData.availabilityStatus !== "available" || beforeData.currentOrderId !== null);
+      isCaptainReadyForDispatch(afterData) &&
+      !isCaptainReadyForDispatch(beforeData);
 
     if (becameAvailable) {
       console.log(`[AutoDispatch] Captain ${context.params.captainId} is now online & available. Looking for queued orders...`);
