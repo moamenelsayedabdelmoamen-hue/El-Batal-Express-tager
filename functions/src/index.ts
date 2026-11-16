@@ -70,7 +70,7 @@ function isCaptainCurrentlyInShift(schedule: FirebaseFirestore.DocumentData | un
       const end = parseTime(shift.endTime);
       if (start < 0 || end < 0) continue;
       if (shift.isOvernight === true || end <= start) {
-        if (currentMinutes >= start || currentMinutes < end) return true;
+        if (currentMinutes >= start) return true;
       } else if (currentMinutes >= start && currentMinutes < end) return true;
     }
   }
