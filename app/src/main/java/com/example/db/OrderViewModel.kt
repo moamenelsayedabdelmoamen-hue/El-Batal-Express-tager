@@ -1116,17 +1116,9 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
             for (captId in idsToQuery) {
                 try {
-                    var snap = try { db.collection("captains").document(captId).get().await() } catch (_: Exception) { null }
-                    if (snap == null || !snap.exists()) {
-                        snap = try {
-                            db.collection("captains").whereEqualTo("captainId", captId).limit(1).get().await().documents.firstOrNull()
-                        } catch (_: Exception) { null }
-                    }
-                    if (snap == null || !snap.exists()) {
-                        snap = try {
-                            db.collection("captains").whereEqualTo("uid", captId).limit(1).get().await().documents.firstOrNull()
-                        } catch (_: Exception) { null }
-                    }
+                    // Captain document IDs are Firebase Auth UIDs. Fetch only the assigned captain;
+                    // never list/search the entire captains collection from a merchant account.
+                    val snap = try { db.collection("captains").document(captId).get().await() } catch (_: Exception) { null }
                     if (snap != null && snap.exists()) {
                         val name = snap.getAnyString(
                             "name", "fullName", "full_name", "driver_name", "driverName", "displayName", "captainName", "userName"
