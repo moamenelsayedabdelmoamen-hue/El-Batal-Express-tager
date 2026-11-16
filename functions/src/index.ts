@@ -306,6 +306,8 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         transaction.update(captainRef, {
           availabilityStatus: "busy",
           currentOrderId: orderId,
+          activeMerchantId: merchantId,
+          currentMerchantId: merchantId,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
@@ -459,6 +461,8 @@ export const onOrderStatusChanged = functions.firestore
         await db.collection("captains").doc(captainId).update({
           availabilityStatus: "available",
           currentOrderId: null,
+          activeMerchantId: admin.firestore.FieldValue.delete(),
+          currentMerchantId: admin.firestore.FieldValue.delete(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
         console.log(`[AutoDispatch] Captain ${captainId} freed and set to available.`);
