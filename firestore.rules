@@ -196,16 +196,15 @@ service cloud.firestore {
           resource.data.merchantId == request.auth.uid ||
           resource.data.userId == request.auth.uid
         )) ||
-        (isSignedIn() && (
-          resource.data.captainId == request.auth.token.captainId ||
-          resource.data.captainId == request.auth.uid ||
+        (hasCaptainAccount(request.auth.uid) && (
+          ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
           resource.data.offeredCaptainId == request.auth.uid
         ));
       
       // Merchant creates order with pending status and null captainId
       allow create: if isAdmin() || (
         isSignedIn() &&
-        (request.resource.data.merchantId == request.auth.uid || request.resource.data.userId == request.auth.uid) &&
+        request.resource.data.merchantId == request.auth.uid &&
         exists(/databases/$(database)/documents/merchants/$(request.auth.uid)) &&
         get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant' &&
         get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.status in ['approved', 'active'] &&
@@ -218,9 +217,9 @@ service cloud.firestore {
       // Merchant can update order details or cancel prior to assignment, but CANNOT set captainId or dispatchStatus
       // Captain can update delivery progress once assigned
       allow update: if isAdmin() || 
-        (isMerchantAccount() && (resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid) &&
+        (isMerchantAccount() && resource.data.merchantId == request.auth.uid &&
           request.resource.data.captainId == resource.data.captainId &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'dispatchStatus', 'assignedAt'])
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId', 'dispatchStatus', 'assignedAt'])
         ) ||
         (isSignedIn() && (resource.data.captainId == request.auth.uid) &&
           request.resource.data.captainId == resource.data.captainId
