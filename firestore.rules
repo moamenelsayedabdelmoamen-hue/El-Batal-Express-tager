@@ -132,7 +132,8 @@ service cloud.firestore {
           'uid', 'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'email',
           'role', 'status', 'profileImagePath', 'idFrontImagePath', 'idBackImagePath',
           'licenseImagePath', 'idDocumentsComplete', 'rating', 'walletBalance',
-          'vehicleType', 'licensePlate', 'createdAt', 'updatedAt', 'avatarUri',
+          'vehicleType', 'licensePlate', 'createdAt', 'updatedAt', 'avatarUri', 'profileImageUrl', 'photoUrl',
+          'idCardImageUrl', 'licenseImageUrl', 'nationalIdUrl', 'licenseUrl',
           'avatarPresetIndex', 'isOnline', 'isLoggedIn', 'emailVerified', 'isEmailVerified'
         ])
       );
@@ -144,8 +145,9 @@ service cloud.firestore {
           'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'emailVerified',
           'isEmailVerified', 'isLoggedIn', 'isOnline', 'presenceStatus', 'location',
           'latitude', 'longitude', 'accuracy', 'bearing', 'speed', 'lastLocationUpdate',
-          'lastLocationTimestamp', 'updatedAt', 'profileImagePath', 'profileImageUpdatedAt',
+          'lastLocationTimestamp', 'updatedAt', 'profileImagePath', 'profileImageUpdatedAt', 'profileImageUrl', 'photoUrl', 'avatarUri',
           'idFrontImagePath', 'idBackImagePath', 'licenseImagePath', 'idDocumentsComplete',
+          'idCardImageUrl', 'licenseImageUrl', 'nationalIdUrl', 'licenseUrl',
           'vehicleType', 'licensePlate', 'avatarUri', 'avatarPresetIndex', 'fcmToken'
         ])
       );
