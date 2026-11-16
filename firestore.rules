@@ -155,6 +155,37 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // Captain schedules are managed by admins; captains can read only their own schedules.
+    match /captain_schedules/{scheduleId} {
+      allow get: if isAdmin() || (isSignedIn() && (
+        request.auth.uid == scheduleId ||
+        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
+        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
+        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
+      ));
+      allow list: if isAdmin() || (isSignedIn() && (
+        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
+        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
+        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
+      ));
+      allow create, update, delete: if isAdmin();
+
+      match /shifts/{shiftId} {
+        allow read: if isAdmin() || isSignedIn() && request.auth.uid == scheduleId;
+        allow write: if isAdmin();
+      }
+    }
+
+    // Legacy shifts are read-only for the assigned captain; all schedule writes go through the admin panel.
+    match /shifts/{shiftId} {
+      allow get, list: if isAdmin() || (isSignedIn() && (
+        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
+        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
+        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
+      ));
+      allow create, update, delete: if isAdmin();
+    }
+
     // Orders collection:
     // 1. Merchant can NEVER choose or modify captainId.
     // 2. Initial order creation must have captainId == null, dispatchStatus == 'searching', status == 'pending'.
