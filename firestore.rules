@@ -54,7 +54,7 @@ service cloud.firestore {
 
     // Merchants collection:
     // Strictly isolated to merchant accounts (`accountType == 'merchant'`).
-    // Blocked if UID already belongs to captains or restaurants.
+    // Blocked if UID already belongs to a captain account.
     match /merchants/{merchantId} {
       allow get: if isAdmin() || (isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid));
       allow list: if isAdmin();
@@ -112,7 +112,7 @@ service cloud.firestore {
       allow create: if isAdmin() || (
         isSignedIn() &&
         request.auth.uid == captainId &&
-        !hasMerchantAccount(request.auth.uid) &&
+        !hasMerchantAccount(request.auth.uid)
       );
       // Captains can update their own profile/status (blocked for merchants).
       // Active order dispatch can update availabilityStatus and currentOrderId only.
@@ -154,7 +154,11 @@ service cloud.firestore {
       // Merchant creates order with pending status and null captainId
       allow create: if isAdmin() || (
         isSignedIn() &&
-        (request.request.resource.data.merchantId == request.auth.uid || request.resource.data.userId == request.auth.uid) &&
+        (request.resource.data.merchantId == request.auth.uid || request.resource.data.userId == request.auth.uid) &&
+        exists(/databases/$(database)/documents/merchants/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant' &&
+        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.status in ['approved', 'active'] &&
+        request.auth.token.email_verified == true &&
         request.resource.data.captainId == null &&
         request.resource.data.dispatchStatus == 'searching' &&
         request.resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن']
