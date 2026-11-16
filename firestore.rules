@@ -202,7 +202,6 @@ service cloud.firestore {
     match /orders/{orderId} {
       allow read: if isAdmin() || 
         (isSignedIn() && (
-          resource.data.restaurantId == request.auth.token.restaurantId ||
           resource.data.restaurantId == request.auth.uid ||
           resource.data.merchantId == request.auth.uid ||
           resource.data.userId == request.auth.uid
@@ -215,7 +214,7 @@ service cloud.firestore {
       // Restaurant/Merchant creates order with pending status and null captainId
       allow create: if isAdmin() || (
         isSignedIn() &&
-        (request.resource.data.restaurantId == request.auth.uid || request.resource.data.merchantId == request.auth.uid || request.resource.data.userId == request.auth.uid) &&
+        (request.request.resource.data.merchantId == request.auth.uid || request.resource.data.userId == request.auth.uid) &&
         request.resource.data.captainId == null &&
         request.resource.data.dispatchStatus == 'searching' &&
         request.resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن']
@@ -224,7 +223,7 @@ service cloud.firestore {
       // Restaurant/Merchant can update order details or cancel prior to assignment, but CANNOT set captainId or dispatchStatus
       // Captain can update delivery progress once assigned
       allow update: if isAdmin() || 
-        (isSignedIn() && (resource.data.restaurantId == request.auth.uid || resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid) &&
+        (isSignedIn() && (resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid) &&
           request.resource.data.captainId == resource.data.captainId &&
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'dispatchStatus', 'assignedAt'])
         ) ||
@@ -279,7 +278,7 @@ service cloud.firestore {
     // Payments collection
     match /payments/{paymentId} {
       allow read: if isAdmin() || 
-        (isSignedIn() && (resource.data.restaurantId == request.auth.token.restaurantId || resource.data.restaurantId == request.auth.uid || resource.data.merchantId == request.auth.uid));
+        (isSignedIn() && (resource.data.merchantId == request.auth.uid));
       allow write: if isAdmin();
     }
 
