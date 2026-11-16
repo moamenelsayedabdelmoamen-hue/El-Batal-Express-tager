@@ -105,32 +105,48 @@ service cloud.firestore {
       }
     }
 
-    // Captains collection
-    // Merchants are strictly forbidden from creating or editing captain profiles.
+    // Captains: private by default. Merchants can get only the captain currently assigned to them.
     match /captains/{captainId} {
-      allow read: if isSignedIn();
+      allow get: if isAdmin()
+        || isCaptain(captainId)
+        || (
+          isSignedIn()
+          && hasMerchantAccount(request.auth.uid)
+          && (
+            resource.data.activeMerchantId == request.auth.uid
+            || resource.data.currentMerchantId == request.auth.uid
+          )
+        );
+      allow list: if isAdmin();
+
       allow create: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.uid == captainId &&
-        !hasMerchantAccount(request.auth.uid)
-      );
-      // Captains can update their own profile/status (blocked for merchants).
-      // Active order dispatch can update availabilityStatus and currentOrderId only.
-      allow update: if isAdmin() || (
-        isCaptain(captainId) &&
-        !hasMerchantAccount(request.auth.uid) &&
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'status',
-          'rating',
-          'ratingCount',
-          'role'
+        isSignedIn()
+        && request.auth.uid == captainId
+        && !hasMerchantAccount(request.auth.uid)
+        && request.resource.data.uid == captainId
+        && request.resource.data.role == 'captain'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.walletBalance == 0
+        && !('isAdmin' in request.resource.data)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'email',
+          'role', 'status', 'profileImagePath', 'idFrontImagePath', 'idBackImagePath',
+          'licenseImagePath', 'idDocumentsComplete', 'rating', 'walletBalance',
+          'vehicleType', 'licensePlate', 'createdAt', 'updatedAt', 'avatarUri',
+          'avatarPresetIndex', 'isOnline', 'isLoggedIn', 'emailVerified', 'isEmailVerified'
         ])
-      ) || (
-        isSignedIn() &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'availabilityStatus',
-          'currentOrderId',
-          'updatedAt'
+      );
+
+      allow update: if isAdmin() || (
+        isCaptain(captainId)
+        && !hasMerchantAccount(request.auth.uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'emailVerified',
+          'isEmailVerified', 'isLoggedIn', 'isOnline', 'presenceStatus', 'location',
+          'latitude', 'longitude', 'accuracy', 'bearing', 'speed', 'lastLocationUpdate',
+          'lastLocationTimestamp', 'updatedAt', 'profileImagePath', 'profileImageUpdatedAt',
+          'idFrontImagePath', 'idBackImagePath', 'licenseImagePath', 'idDocumentsComplete',
+          'vehicleType', 'licensePlate', 'avatarUri', 'avatarPresetIndex', 'fcmToken'
         ])
       );
       allow delete: if isAdmin();
