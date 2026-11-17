@@ -50,7 +50,7 @@
         },
         "subscriptionStatus": {
           "type": "string",
-          "enum": ["unsubscribed", "active", "expired", "payment_failed"],
+          "enum": ["unsubscribed", "active", "suspended", "cancelled", "expired", "payment_failed"],
           "description": "Current subscription plan status"
         },
         "status": {
@@ -89,6 +89,29 @@
       },
       "required": ["uid", "email", "accountType"]
     },
+    "Subscription": {
+      "title": "Subscription",
+      "description": "Canonical server-managed merchant subscription document stored at subscriptions/{merchantId}",
+      "type": "object",
+      "properties": {
+        "merchantId": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["unsubscribed", "active", "suspended", "cancelled", "expired", "payment_failed"]
+        },
+        "isSubscribed": { "type": "boolean" },
+        "planId": { "type": "integer" },
+        "planName": { "type": "string" },
+        "maxCaptains": { "type": "integer" },
+        "price": { "type": "integer" },
+        "paymentStatus": { "type": "string" },
+        "suspensionReason": { "type": "string" },
+        "startDate": { "type": "string", "format": "date-time" },
+        "endDate": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["merchantId", "status", "isSubscribed"]
+    },
     "Order": {
       "title": "Order",
       "description": "Courier dispatch orders",
@@ -116,6 +139,10 @@
     "/merchants/{merchantId}": {
       "schema": "Merchant",
       "description": "Merchant accounts pre-registered and approved by El Batal Express"
+    },
+    "/subscriptions/{subscriptionId}": {
+      "schema": "Subscription",
+      "description": "Canonical merchant subscription documents keyed by merchantId"
     },
     "/orders/{orderId}": {
       "schema": "Order",

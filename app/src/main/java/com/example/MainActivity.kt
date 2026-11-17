@@ -28,17 +28,25 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.example.db.OrderViewModel
@@ -46,6 +54,7 @@ import com.example.network.NetworkHelper
 import com.example.ui.theme.ElBatalExpressTheme
 import com.example.ui.theme.ThemeManager
 import com.google.firebase.Firebase
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.FirebaseFirestoreSettings
 import com.google.firebase.firestore.firestore
@@ -110,13 +119,41 @@ class MainActivity : ComponentActivity() {
         val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
         val isOnline by NetworkHelper.isOnline.collectAsStateWithLifecycle()
         val currentUser = Firebase.auth.currentUser
-        val initialRoute = androidx.compose.runtime.remember {
+        var verifiedMerchantUid by remember {
+          mutableStateOf(currentUser?.takeIf { it.isEmailVerified }?.uid)
+        }
+        DisposableEffect(Unit) {
+          val listener = FirebaseAuth.AuthStateListener { auth ->
+            val u = auth.currentUser
+            verifiedMerchantUid = if (u != null && u.isEmailVerified) u.uid else null
+          }
+          Firebase.auth.addAuthStateListener(listener)
+          onDispose {
+            Firebase.auth.removeAuthStateListener(listener)
+          }
+        }
+        val lifecycleOwner = LocalLifecycleOwner.current
+        DisposableEffect(lifecycleOwner, verifiedMerchantUid) {
+          val observer = LifecycleEventObserver { _, event ->
+            val uid = verifiedMerchantUid
+            if (event == Lifecycle.Event.ON_RESUME && uid != null) {
+              orderViewModel.refreshSubscriptionFromServer(uid)
+            }
+          }
+          lifecycleOwner.lifecycle.addObserver(observer)
+          onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+          }
+        }
+        val initialRoute = remember {
           if (currentUser != null && currentUser.isEmailVerified) {
             RestaurantDashboardRoute
           } else {
             LoginRoute
           }
         }
+        val navBackStackEntry by navController.currentBackStackEntryAsState()
+        val isOnSubscriptionRoute = navBackStackEntry?.destination?.route?.contains("SubscriptionRoute") == true
         val context = LocalContext.current
 
         Box(modifier = Modifier.fillMaxSize()) {
@@ -331,14 +368,23 @@ class MainActivity : ComponentActivity() {
             }
           }
 
-          SimulatedPushNotificationOverlay(
-            notification = pushNotification,
-            onDismiss = { orderViewModel.dismissPushNotification() }
-          )
-
-          if (currentUser != null && currentUser.isEmailVerified && subscriptionStatus.isExpired) {
+          if (verifiedMerchantUid != null &&
+            (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired) &&
+            !isOnSubscriptionRoute
+          ) {
+            val fallbackMessage = when {
+              subscriptionStatus.isSuspended ->
+                "تم إيقاف اشتراكك مؤقتاً من قبل الإدارة. يرجى التواصل مع الإدارة أو تجديد الاشتراك."
+              subscriptionStatus.isCancelled ->
+                "تم إلغاء اشتراكك من قبل الإدارة. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة."
+              else ->
+                "انتهت فترة اشتراكك، يرجى التواصل مع الإدارة أو تجديد الاشتراك."
+            }
             SubscriptionExpiredScreen(
-              message = subscriptionStatus.message ?: "انتهت فترة اشتراكك (30 يوماً)، يرجى التواصل مع الإدارة للتجديد",
+              status = subscriptionStatus.status,
+              message = subscriptionStatus.message ?: fallbackMessage,
+              suspensionReason = subscriptionStatus.suspensionReason,
+              onViewPlans = { navController.navigate(SubscriptionRoute) },
               onRecheck = { orderViewModel.recheckSubscription() },
               onContactAdmin = {
                 try {
@@ -349,7 +395,7 @@ class MainActivity : ComponentActivity() {
                 }
               },
               onLogout = {
-                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                CoroutineScope(Dispatchers.Main).launch {
                   com.example.auth.MerchantAuthManager.signOutMerchant(context)
                   orderViewModel.clearListeners()
                   navController.navigate(LoginRoute) {
@@ -359,6 +405,11 @@ class MainActivity : ComponentActivity() {
               }
             )
           }
+
+          SimulatedPushNotificationOverlay(
+            notification = pushNotification,
+            onDismiss = { orderViewModel.dismissPushNotification() }
+          )
         }
       }
     }

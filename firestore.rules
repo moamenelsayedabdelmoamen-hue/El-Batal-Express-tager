@@ -7,12 +7,15 @@ service cloud.firestore {
       return request.auth != null;
     }
     
-    // Check if user has admin privileges via Custom Claims, email whitelist, or admins collection
+    // Check if user has admin privileges via Custom Claims, verified email whitelist, or admins collection
     function isAdmin() {
       return isSignedIn() && (
-        request.auth.token.role == 'admin' ||
-        request.auth.token.admin == true ||
-        request.auth.token.email in ['moamen.elsayed.abdelmoamen@gmail.com', 'admin@elbatalexpress.com'] ||
+        ('role' in request.auth.token && request.auth.token.role == 'admin') ||
+        ('admin' in request.auth.token && request.auth.token.admin == true) ||
+        ('email' in request.auth.token &&
+          request.auth.token.email in ['moamen.elsayed.abdelmoamen@gmail.com', 'admin@elbatalexpress.com'] &&
+          'email_verified' in request.auth.token &&
+          request.auth.token.email_verified == true) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
@@ -26,11 +29,50 @@ service cloud.firestore {
       return exists(/databases/$(database)/documents/merchants/$(uid));
     }
 
+    function isMerchantAccount() {
+      return isSignedIn() &&
+        hasMerchantAccount(request.auth.uid) &&
+        !hasCaptainAccount(request.auth.uid) &&
+        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant';
+    }
+
     function isMerchant(merchantId) {
       return isSignedIn() && (
         request.auth.uid == merchantId ||
         (request.auth.token.role == 'merchant' && request.auth.token.merchantId == merchantId)
       );
+    }
+
+    function isUnexpiredEndDate(val) {
+      return val == null ||
+        (val is timestamp && val > request.time) ||
+        (val is int && val > request.time.toMillis());
+    }
+
+    function isSubscriptionDocActive(subData) {
+      return subData.status == 'active' &&
+        (!('isSubscribed' in subData) || subData.isSubscribed == true) &&
+        (!('paymentStatus' in subData) || subData.paymentStatus == 'paid') &&
+        (!('maxCaptains' in subData) || subData.maxCaptains > 0) &&
+        (!('endDate' in subData) || isUnexpiredEndDate(subData.endDate));
+    }
+
+    // Server-side authoritative subscription check across BOTH subscriptions/{uid} and merchants/{uid}
+    function hasActiveMerchantSubscription(uid) {
+      let merch = get(/databases/$(database)/documents/merchants/$(uid)).data;
+      return merch.accountType == 'merchant' &&
+        merch.status in ['approved', 'active'] &&
+        !('subscriptionStatus' in merch && merch.subscriptionStatus in ['suspended', 'cancelled', 'canceled', 'expired', 'payment_failed']) &&
+        (
+          exists(/databases/$(database)/documents/subscriptions/$(uid))
+            ? isSubscriptionDocActive(get(/databases/$(database)/documents/subscriptions/$(uid)).data)
+            : (
+                merch.subscriptionStatus == 'active' &&
+                merch.isSubscribed == true &&
+                (!('maxCaptains' in merch) || merch.maxCaptains > 0) &&
+                (!('subscriptionEndDate' in merch) || isUnexpiredEndDate(merch.subscriptionEndDate))
+              )
+        );
     }
     
     // Check if user is the captain
@@ -117,8 +159,9 @@ service cloud.firestore {
           || request.auth.token.email_verified == true)
       );
       allow delete: if isAdmin();
-      match /{subcollection=**} {
-        allow read, write: if isAdmin() || (isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid));
+      match /{subcollection}/{subDoc=**} {
+        allow read: if isAdmin() || (isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid));
+        allow write: if isAdmin();
       }
     }
 
@@ -221,8 +264,8 @@ service cloud.firestore {
 
     // Orders collection:
     // 1. Merchant can NEVER choose or modify captainId.
-    // 2. Initial order creation must have captainId == null, dispatchStatus == 'searching', status == 'pending'.
-    // 3. Selection and assignment are handled atomically by Cloud Functions / backend transactions.
+    // 2. Merchant MUST have verified email and an active, non-suspended, non-cancelled, unexpired subscription.
+    // 3. Initial order creation must have captainId == null, dispatchStatus == 'searching', status == 'pending'.
     match /orders/{orderId} {
       allow read: if isAdmin() ||
         (isMerchantAccount() && (
@@ -234,14 +277,13 @@ service cloud.firestore {
           ('offeredCaptainId' in resource.data && resource.data.offeredCaptainId == request.auth.uid)
         ));
       
-      // Merchant creates order with pending status and null captainId
+      // Merchant creates order only when email verified AND subscription active on server
       allow create: if isAdmin() || (
         isSignedIn() &&
-        request.resource.data.merchantId == request.auth.uid &&
-        exists(/databases/$(database)/documents/merchants/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant' &&
-        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.status in ['approved', 'active'] &&
         request.auth.token.email_verified == true &&
+        request.resource.data.merchantId == request.auth.uid &&
+        request.resource.data.userId == request.auth.uid &&
+        hasActiveMerchantSubscription(request.auth.uid) &&
         request.resource.data.captainId == null &&
         request.resource.data.dispatchStatus == 'searching' &&
         request.resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن']
@@ -268,19 +310,28 @@ service cloud.firestore {
     }
 
     // Subscriptions collection:
-    // Merchant can read their own subscription document.
+    // Canonical document path: subscriptions/{merchantId}.
+    // Merchant can ONLY read their own subscription document; never list other merchants or self-modify.
     match /subscriptions/{subscriptionId} {
-      allow read: if isAdmin() || (isSignedIn() && subscriptionId == request.auth.uid);
-      // Subscription activation and changes are server-authoritative (Paymob webhook/Admin SDK).
+      allow get: if isAdmin() || (
+        isSignedIn() &&
+        subscriptionId == request.auth.uid &&
+        !hasCaptainAccount(request.auth.uid)
+      );
+      allow list: if isAdmin();
+      // Subscription activation, suspension, cancellation, and extension are strictly server/Admin-only.
       allow create, update, delete: if isAdmin();
     }
 
     // Order Codes collection:
-    // Tracks unique 6-digit codes. Allows authenticated merchants to atomically reserve codes during order creation.
+    // Tracks unique 6-digit codes. Allows active merchants to atomically reserve codes during order creation.
     match /order_codes/{code} {
       allow read: if isSignedIn();
       allow create: if isAdmin() || (
-        isMerchantAccount() && request.resource.data.merchantId == request.auth.uid
+        isMerchantAccount() &&
+        request.auth.token.email_verified == true &&
+        hasActiveMerchantSubscription(request.auth.uid) &&
+        request.resource.data.merchantId == request.auth.uid
       );
       allow update, delete: if isAdmin();
     }
@@ -295,7 +346,10 @@ service cloud.firestore {
         isAdmin()
       );
       allow create: if isAdmin() || (
-        isMerchantAccount() && request.resource.data.merchantId == request.auth.uid
+        isMerchantAccount() &&
+        request.auth.token.email_verified == true &&
+        hasActiveMerchantSubscription(request.auth.uid) &&
+        request.resource.data.merchantId == request.auth.uid
       );
       allow update, delete: if isAdmin();
     }

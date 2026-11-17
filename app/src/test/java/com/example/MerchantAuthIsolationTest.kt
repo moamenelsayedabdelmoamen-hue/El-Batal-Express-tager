@@ -213,6 +213,16 @@ class MerchantAuthIsolationTest {
         // Simulate user clicking verification link -> Firebase Auth reflects verified on reload()
         fakeBackend.markEmailVerifiedInAuth("baraka@merchant.com")
 
+        // Before admin approval, login is deferred cleanly as NotRegistered/pending approval
+        val pendingLogin = MerchantAuthManager.signInWithEmail(
+            context = context,
+            rawEmail = "baraka@merchant.com",
+            rawPassword = "Password123!"
+        )
+        assertTrue(pendingLogin is MerchantSignInResult.NotRegistered)
+
+        // Admin approves merchant -> login must succeed
+        fakeBackend.approveMerchant(reg.uid)
         val verifiedLogin = MerchantAuthManager.signInWithEmail(
             context = context,
             rawEmail = "baraka@merchant.com",
@@ -257,6 +267,7 @@ class MerchantAuthIsolationTest {
         )
 
         fakeBackend.markEmailVerifiedInAuth("profile@merchant.com")
+        fakeBackend.approveMerchant(reg.uid)
 
         val loginRes = MerchantAuthManager.signInWithEmail(
             context = context,
@@ -362,6 +373,13 @@ class MerchantAuthIsolationTest {
 
         fun markEmailVerifiedInAuth(email: String) {
             authUsersByEmail[email.lowercase()]?.isVerified = true
+        }
+
+        fun approveMerchant(uid: String) {
+            merchantsCollection[uid]?.let {
+                it["status"] = "approved"
+                it["isApproved"] = true
+            }
         }
 
         private fun StoredAuthRecord.toSnapshot() = AuthUserSnapshot(

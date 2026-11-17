@@ -510,23 +510,86 @@ export function generateDistinct6DigitCode(): string {
 
 export interface VerifySubscriptionResult {
   isValid: boolean;
-  status: string; // active, expired, suspended, cancelled, pending_payment, not_found
+  status: string; // active, expired, suspended, cancelled, payment_failed, unsubscribed, merchant_pending, not_found
   errorMessage?: string;
   planId?: number;
   planName?: string;
   maxCaptains?: number;
+  price?: number;
   startDate?: any;
   endDate?: any;
   activeCaptainsCount?: number;
+  reason?: string;
+}
+
+const ADMIN_EMAIL_ALLOWLIST = [
+  "moamen.elsayed.abdelmoamen@gmail.com",
+  "admin@elbatalexpress.com"
+];
+
+function parseMillis(rawDate: any): number | null {
+  if (!rawDate) return null;
+  if (typeof rawDate.toMillis === "function") return rawDate.toMillis();
+  if (rawDate instanceof Date) return rawDate.getTime();
+  if (typeof rawDate === "number" && Number.isFinite(rawDate)) return rawDate;
+  if (typeof rawDate === "string") {
+    const asNum = Number(rawDate);
+    if (!isNaN(asNum) && asNum > 1000000000) return asNum;
+    const parsed = Date.parse(rawDate);
+    if (!isNaN(parsed)) return parsed;
+  }
+  return null;
+}
+
+function normalizeSubscriptionStatus(raw: unknown): string {
+  const s = String(raw || "").toLowerCase().trim();
+  if (["active", "نشط", "نشطة", "سارية"].includes(s)) return "active";
+  if (["suspended", "suspend", "paused", "موقوف", "موقوفة", "متوقف", "متوقفة", "inactive"].includes(s)) return "suspended";
+  if (["cancelled", "canceled", "cancel", "ملغي", "ملغى", "ملغاة"].includes(s)) return "cancelled";
+  if (["expired", "منتهي", "منتهية"].includes(s)) return "expired";
+  if (["payment_failed", "failed", "declined"].includes(s)) return "payment_failed";
+  if (["pending_payment", "pending", "في انتظار الدفع"].includes(s)) return "pending_payment";
+  if (["unsubscribed", "none", ""].includes(s)) return "unsubscribed";
+  return s;
+}
+
+function resolvePlanMetadata(rawPlanId: any, rawPlanName: any, rawMaxCaptains: any, rawPrice: any) {
+  const planId = Number(rawPlanId || 0) || (
+    String(rawPlanName || "").includes("المتقدمة") || String(rawPlanName || "").includes("8") ? 4 :
+    String(rawPlanName || "").includes("المميزة") || String(rawPlanName || "").includes("6") ? 3 :
+    String(rawPlanName || "").includes("المتوسطة") || String(rawPlanName || "").includes("4") ? 2 : 1
+  );
+  const defaults: Record<number, { planName: string; maxCaptains: number; price: number }> = {
+    1: { planName: "الباقة الأساسية", maxCaptains: 2, price: 400 },
+    2: { planName: "الباقة المتوسطة", maxCaptains: 4, price: 800 },
+    3: { planName: "الباقة المميزة", maxCaptains: 6, price: 1200 },
+    4: { planName: "الباقة المتقدمة", maxCaptains: 8, price: 1600 }
+  };
+  const def = defaults[planId] || defaults[1];
+  const planName = String(rawPlanName || "").trim() || def.planName;
+  const maxCaptains = Number(rawMaxCaptains) > 0 ? Number(rawMaxCaptains) : def.maxCaptains;
+  const price = Number(rawPrice) > 0 ? Number(rawPrice) : def.price;
+  return { planId, planName, maxCaptains, price };
+}
+
+async function isAdminCaller(context: functions.https.CallableContext): Promise<boolean> {
+  if (!context.auth || !context.auth.uid) return false;
+  const token = context.auth.token || {};
+  if (token.role === "admin" || token.admin === true) return true;
+  if (
+    typeof token.email === "string" &&
+    token.email_verified === true &&
+    ADMIN_EMAIL_ALLOWLIST.includes(token.email.toLowerCase())
+  ) {
+    return true;
+  }
+  const adminDoc = await db.collection("admins").doc(context.auth.uid).get();
+  return adminDoc.exists;
 }
 
 /**
- * Server-side subscription validation against subscriptions/{merchantId} and merchants/{merchantId} only.
- * Checks:
- * - Subscription document exists in 'subscriptions'
- * - Status is 'active'
- * - Current server time has not exceeded endDate
- * - Concurrent active captains limit is not exceeded
+ * Server-side subscription validation against BOTH subscriptions/{merchantId} and merchants/{merchantId}.
+ * Guarantees suspended / cancelled / expired / failed states are never bypassed by stale mirror docs.
  */
 export async function verifyMerchantSubscription(merchantId: string): Promise<VerifySubscriptionResult> {
   const now = Date.now();
@@ -541,30 +604,106 @@ export async function verifyMerchantSubscription(merchantId: string): Promise<Ve
   if (merchantData.status !== "approved" && merchantData.status !== "active") {
     return { isValid: false, status: "merchant_pending", errorMessage: "حساب التاجر في انتظار موافقة الإدارة." };
   }
-  const subData = subById.exists ? (subById.data() || {}) : merchantData;
-  const rawStatus = String(subData.status || subData.subscriptionStatus || "").toLowerCase().trim();
-  const planId = Number(subData.planId || 1);
-  const planName = subData.planName || (planId === 2 ? "الباقة المتوسطة" : planId === 3 ? "الباقة المميزة" : planId === 4 ? "الباقة المتقدمة" : "الباقة الأساسية");
-  const maxCaptains = Number(subData.maxCaptains || (planId === 2 ? 4 : planId === 3 ? 6 : planId === 4 ? 8 : 2));
-  const rawEndDate = subData.endDate || subData.subscriptionEndDate || subData.expiryDate;
-  let endDateMs: number | null = null;
-  if (rawEndDate) {
-    if (typeof rawEndDate.toMillis === "function") endDateMs = rawEndDate.toMillis();
-    else if (rawEndDate instanceof Date) endDateMs = rawEndDate.getTime();
-    else if (typeof rawEndDate === "number") endDateMs = rawEndDate;
-    else if (typeof rawEndDate === "string") {
-      const parsed = Date.parse(rawEndDate);
-      if (!isNaN(parsed)) endDateMs = parsed;
+
+  const subData = subById.exists ? (subById.data() || {}) : {};
+  const subStatus = subById.exists
+    ? normalizeSubscriptionStatus(subData.status || subData.subscriptionStatus || subData.planStatus)
+    : "unsubscribed";
+  const merchSubStatus = normalizeSubscriptionStatus(merchantData.subscriptionStatus);
+
+  const subUpdatedMs = parseMillis(subData.updatedAt) || 0;
+  const merchUpdatedMs = parseMillis(merchantData.updatedAt) || 0;
+
+  let effectiveDoc: FirebaseFirestore.DocumentData = subById.exists ? subData : merchantData;
+  let effectiveStatus = subById.exists ? subStatus : merchSubStatus;
+
+  if (subById.exists && merchSubStatus !== "unsubscribed" && merchSubStatus !== subStatus) {
+    if (merchUpdatedMs > subUpdatedMs) {
+      effectiveDoc = { ...subData, ...merchantData };
+      effectiveStatus = merchSubStatus;
+    } else if (subUpdatedMs === 0 && ["suspended", "cancelled", "expired"].includes(merchSubStatus)) {
+      effectiveDoc = { ...subData, ...merchantData };
+      effectiveStatus = merchSubStatus;
     }
   }
-  if (rawStatus === "expired" || (endDateMs !== null && now >= endDateMs)) {
-    return { isValid: false, status: "expired", planId, planName, maxCaptains, endDate: endDateMs, errorMessage: "اشتراكك منتهي، يرجى تجديد الاشتراك." };
+
+  const meta = resolvePlanMetadata(
+    effectiveDoc.planId ?? merchantData.planId,
+    effectiveDoc.planName ?? merchantData.planName,
+    effectiveDoc.maxCaptains ?? merchantData.maxCaptains,
+    effectiveDoc.price ?? merchantData.price
+  );
+  const startDateMs = parseMillis(effectiveDoc.startDate || effectiveDoc.subscriptionStartDate || subData.startDate || merchantData.subscriptionStartDate);
+  const endDateMs = parseMillis(effectiveDoc.endDate || effectiveDoc.subscriptionEndDate || effectiveDoc.expiryDate || subData.endDate || merchantData.subscriptionEndDate);
+  const reason = String(effectiveDoc.suspensionReason || effectiveDoc.cancellationReason || merchantData.suspensionReason || "").trim();
+  const paymentStatus = String(effectiveDoc.paymentStatus || merchantData.paymentStatus || "paid").toLowerCase().trim();
+
+  if (effectiveStatus === "suspended") {
+    return {
+      isValid: false,
+      status: "suspended",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: 0,
+      price: meta.price,
+      startDate: startDateMs,
+      endDate: endDateMs,
+      reason,
+      errorMessage: reason
+        ? `تم إيقاف اشتراكك من قبل الإدارة (${reason}). يرجى التواصل مع الإدارة أو تجديد الاشتراك.`
+        : "تم إيقاف اشتراكك من قبل الإدارة. يرجى التواصل مع الإدارة أو تجديد الاشتراك."
+    };
   }
-  if (["suspended", "موقوف", "cancelled", "canceled", "ملغي", "pending_payment", "في انتظار الدفع"].includes(rawStatus)) {
-    return { isValid: false, status: rawStatus, planId, planName, maxCaptains, errorMessage: "الاشتراك غير نشط أو في انتظار الدفع." };
+  if (effectiveStatus === "cancelled") {
+    return {
+      isValid: false,
+      status: "cancelled",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: 0,
+      price: meta.price,
+      startDate: startDateMs,
+      endDate: endDateMs,
+      reason,
+      errorMessage: reason
+        ? `تم إلغاء اشتراكك (${reason}). يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة.`
+        : "تم إلغاء اشتراكك. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة."
+    };
   }
-  if (rawStatus !== "active" && rawStatus !== "نشط") {
-    return { isValid: false, status: rawStatus || "inactive", planId, planName, maxCaptains, errorMessage: "لا يوجد اشتراك نشط لهذا التاجر." };
+  if (effectiveStatus === "payment_failed" || effectiveStatus === "pending_payment" || ["failed", "unpaid", "pending"].includes(paymentStatus)) {
+    return {
+      isValid: false,
+      status: effectiveStatus === "pending_payment" ? "pending_payment" : "payment_failed",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: 0,
+      price: meta.price,
+      errorMessage: "لم يتم تأكيد الدفع لهذا الاشتراك."
+    };
+  }
+  if (effectiveStatus === "expired" || (endDateMs !== null && now >= endDateMs)) {
+    return {
+      isValid: false,
+      status: "expired",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: meta.maxCaptains,
+      price: meta.price,
+      startDate: startDateMs,
+      endDate: endDateMs,
+      errorMessage: "انتهت فترة اشتراكك، يرجى تجديد الاشتراك."
+    };
+  }
+  if (effectiveStatus !== "active" || effectiveDoc.isSubscribed === false || Number(effectiveDoc.maxCaptains) <= 0) {
+    return {
+      isValid: false,
+      status: effectiveStatus || "unsubscribed",
+      planId: 0,
+      planName: "غير مشترك",
+      maxCaptains: 0,
+      price: 0,
+      errorMessage: "لا يوجد اشتراك نشط لهذا التاجر."
+    };
   }
 
   const activeStatuses = ["accepted", "in_progress", "out_for_delivery", "captain_reached_store", "order_picked_up", "waiting_merchant_confirmation", "customer_confirmed", "customer_rejected", "في الطريق لك", "جاري التوصيل", "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات"];
@@ -581,11 +720,341 @@ export async function verifyMerchantSubscription(merchantId: string): Promise<Ve
     if (typeof captainId === "string" && captainId.trim()) activeCaptainIds.add(captainId.trim());
   });
   const activeCaptainsCount = activeCaptainIds.size;
-  if (activeCaptainsCount >= maxCaptains && maxCaptains > 0) {
-    return { isValid: false, status: "active", planId, planName, maxCaptains, activeCaptainsCount, errorMessage: `وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك (${maxCaptains}).` };
+  if (activeCaptainsCount >= meta.maxCaptains && meta.maxCaptains > 0) {
+    return {
+      isValid: false,
+      status: "active",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: meta.maxCaptains,
+      price: meta.price,
+      startDate: startDateMs,
+      endDate: endDateMs,
+      activeCaptainsCount,
+      errorMessage: `وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك (${meta.maxCaptains}).`
+    };
   }
-  return { isValid: true, status: "active", planId, planName, maxCaptains, endDate: endDateMs, activeCaptainsCount };
+  return {
+    isValid: true,
+    status: "active",
+    planId: meta.planId,
+    planName: meta.planName,
+    maxCaptains: meta.maxCaptains,
+    price: meta.price,
+    startDate: startDateMs,
+    endDate: endDateMs,
+    activeCaptainsCount
+  };
 }
+
+/**
+ * Trusted Admin Callable: Atomically activates, reactivates, suspends, or cancels a merchant's subscription.
+ * Writes ONLY to canonical `subscriptions/{merchantId}` + mirrors summary fields onto `merchants/{merchantId}`.
+ */
+export const adminUpdateMerchantSubscription = functions.https.onCall(async (data, context) => {
+  const authorizedAdmin = await isAdminCaller(context);
+  if (!authorizedAdmin || !context.auth) {
+    throw new functions.https.HttpsError("permission-denied", "هذه العملية مسموحة لمسؤولي الإدارة فقط.");
+  }
+
+  const merchantId = String(data?.merchantId || "").trim();
+  const action = String(data?.action || "").toLowerCase().trim();
+  if (!merchantId) {
+    throw new functions.https.HttpsError("invalid-argument", "معرف التاجر merchantId مطلوب.");
+  }
+  if (!["activate", "reactivate", "suspend", "cancel"].includes(action)) {
+    throw new functions.https.HttpsError("invalid-argument", "الإجراء غير مدعوم. الإجراءات المتاحة: activate, reactivate, suspend, cancel.");
+  }
+
+  const adminUid = context.auth.uid;
+  const reason = String(data?.reason || "").trim();
+  const durationDays = Math.max(1, Math.min(365, Number(data?.durationDays || 30)));
+
+  const result = await db.runTransaction(async (transaction) => {
+    const merchantRef = db.collection("merchants").doc(merchantId);
+    const subRef = db.collection("subscriptions").doc(merchantId);
+    const [merchantDoc, subDoc] = await Promise.all([
+      transaction.get(merchantRef),
+      transaction.get(subRef)
+    ]);
+
+    if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
+      throw new functions.https.HttpsError("not-found", "حساب التاجر غير موجود في مجموعة merchants.");
+    }
+
+    const existingSub = subDoc.data() || {};
+    const existingMerch = merchantDoc.data() || {};
+    const meta = resolvePlanMetadata(
+      data?.planId ?? existingSub.planId ?? existingMerch.planId,
+      data?.planName ?? existingSub.planName ?? existingMerch.planName,
+      data?.maxCaptains ?? existingSub.maxCaptains ?? existingMerch.maxCaptains,
+      data?.price ?? existingSub.price ?? existingMerch.price
+    );
+
+    if (action === "activate" || action === "reactivate") {
+      const startMs = typeof data?.startDateMs === "number" ? data.startDateMs : Date.now();
+      const endMs = typeof data?.endDateMs === "number"
+        ? data.endDateMs
+        : startMs + durationDays * 24 * 60 * 60 * 1000;
+      const startTs = admin.firestore.Timestamp.fromMillis(startMs);
+      const endTs = admin.firestore.Timestamp.fromMillis(endMs);
+
+      transaction.set(subRef, {
+        merchantId,
+        status: "active",
+        subscriptionStatus: "active",
+        isSubscribed: true,
+        paymentStatus: "paid",
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: meta.maxCaptains,
+        price: meta.price,
+        startDate: startTs,
+        endDate: endTs,
+        suspensionReason: admin.firestore.FieldValue.delete(),
+        cancellationReason: admin.firestore.FieldValue.delete(),
+        updatedByAdminUid: adminUid,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      transaction.set(merchantRef, {
+        subscriptionStatus: "active",
+        isSubscribed: true,
+        paymentStatus: "paid",
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: meta.maxCaptains,
+        price: meta.price,
+        subscriptionStartDate: startTs,
+        subscriptionEndDate: endTs,
+        suspensionReason: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return { status: "active", startDateMs: startMs, endDateMs: endMs, ...meta };
+    }
+
+    if (action === "suspend") {
+      const finalReason = reason || "تم إيقاف الاشتراك مؤقتاً من قبل الإدارة";
+      transaction.set(subRef, {
+        merchantId,
+        status: "suspended",
+        subscriptionStatus: "suspended",
+        isSubscribed: false,
+        suspensionReason: finalReason,
+        suspendedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedByAdminUid: adminUid,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      transaction.set(merchantRef, {
+        subscriptionStatus: "suspended",
+        isSubscribed: false,
+        suspensionReason: finalReason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return { status: "suspended", reason: finalReason, ...meta };
+    }
+
+    // action === "cancel"
+    const cancelReason = reason || "تم إلغاء الاشتراك من قبل الإدارة";
+    transaction.set(subRef, {
+      merchantId,
+      status: "cancelled",
+      subscriptionStatus: "cancelled",
+      isSubscribed: false,
+      maxCaptains: 0,
+      cancellationReason: cancelReason,
+      suspensionReason: cancelReason,
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedByAdminUid: adminUid,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    transaction.set(merchantRef, {
+      subscriptionStatus: "cancelled",
+      isSubscribed: false,
+      maxCaptains: 0,
+      suspensionReason: cancelReason,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    return { status: "cancelled", reason: cancelReason, ...meta };
+  });
+
+  return { success: true, merchantId, ...result };
+});
+
+/**
+ * Callable endpoint allowing an authenticated merchant to query server-authoritative subscription status.
+ */
+export const getMySubscriptionStatus = functions.https.onCall(async (_data, context) => {
+  if (!context.auth || !context.auth.uid) {
+    throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً.");
+  }
+  const verification = await verifyMerchantSubscription(context.auth.uid);
+  return {
+    ...verification,
+    merchantId: context.auth.uid,
+    serverTimeMs: Date.now()
+  };
+});
+
+/**
+ * Bidirectional Loop-Safe Sync Trigger 1:
+ * When Admin Dashboard writes directly to `subscriptions/{subscriptionId}`, sync summary fields onto `merchants/{merchantId}`.
+ */
+export const onSubscriptionWriteSyncMerchant = functions.firestore
+  .document("subscriptions/{subscriptionId}")
+  .onWrite(async (change, context) => {
+    const subId = context.params.subscriptionId;
+    if (!change.after.exists) {
+      const targetId = String(change.before.data()?.merchantId || subId).trim();
+      if (!targetId) return;
+      const merchRef = db.collection("merchants").doc(targetId);
+      const merchSnap = await merchRef.get();
+      if (!merchSnap.exists || merchSnap.data()?.accountType !== "merchant") return;
+      await merchRef.set({
+        subscriptionStatus: "unsubscribed",
+        isSubscribed: false,
+        maxCaptains: 0,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      return;
+    }
+
+    const data = change.after.data() || {};
+    const targetMerchantId = String(data.merchantId || subId).trim();
+    if (!targetMerchantId) return;
+
+    const normalizedStatus = normalizeSubscriptionStatus(data.status || data.subscriptionStatus);
+    const isActive = normalizedStatus === "active" && data.isSubscribed !== false;
+    const maxCaptains = isActive ? Number(data.maxCaptains || 0) : (normalizedStatus === "cancelled" ? 0 : Number(data.maxCaptains || 0));
+
+    const merchRef = db.collection("merchants").doc(targetMerchantId);
+    const merchSnap = await merchRef.get();
+    if (!merchSnap.exists || merchSnap.data()?.accountType !== "merchant") return;
+
+    const mData = merchSnap.data() || {};
+    const currentMerchStatus = normalizeSubscriptionStatus(mData.subscriptionStatus);
+    const currentMerchSubFlag = Boolean(mData.isSubscribed);
+    const currentMerchPlan = Number(mData.planId || 0);
+    const currentMerchMax = Number(mData.maxCaptains || 0);
+    const currentMerchEndMs = parseMillis(mData.subscriptionEndDate);
+    const incomingEndMs = parseMillis(data.endDate || data.subscriptionEndDate);
+    const incomingReason = String(data.suspensionReason || data.cancellationReason || "").trim();
+    const currentReason = String(mData.suspensionReason || "").trim();
+
+    if (
+      currentMerchStatus === normalizedStatus &&
+      currentMerchSubFlag === isActive &&
+      currentMerchPlan === Number(data.planId || 0) &&
+      currentMerchMax === maxCaptains &&
+      currentMerchEndMs === incomingEndMs &&
+      currentReason === incomingReason
+    ) {
+      return; // Loop guard: already in sync
+    }
+
+    const mirrorPayload: Record<string, any> = {
+      subscriptionStatus: normalizedStatus,
+      isSubscribed: isActive,
+      planId: Number(data.planId || 0),
+      planName: data.planName || mData.planName || "",
+      maxCaptains,
+      price: Number(data.price || mData.price || 0),
+      paymentStatus: data.paymentStatus || mData.paymentStatus || (isActive ? "paid" : "unpaid"),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (data.startDate) mirrorPayload.subscriptionStartDate = data.startDate;
+    if (data.endDate) mirrorPayload.subscriptionEndDate = data.endDate;
+    if (incomingReason) {
+      mirrorPayload.suspensionReason = incomingReason;
+    } else if (isActive) {
+      mirrorPayload.suspensionReason = admin.firestore.FieldValue.delete();
+    }
+
+    await merchRef.set(mirrorPayload, { merge: true });
+  });
+
+/**
+ * Bidirectional Loop-Safe Sync Trigger 2:
+ * When Admin Dashboard writes subscription fields directly onto `merchants/{merchantId}`, mirror them onto canonical `subscriptions/{merchantId}`.
+ */
+export const onMerchantSubscriptionWriteSync = functions.firestore
+  .document("merchants/{merchantId}")
+  .onUpdate(async (change, context) => {
+    const merchantId = context.params.merchantId;
+    const before = change.before.data() || {};
+    const after = change.after.data() || {};
+    if (after.accountType !== "merchant") return;
+
+    const trackedFields = [
+      "subscriptionStatus",
+      "isSubscribed",
+      "planId",
+      "planName",
+      "maxCaptains",
+      "price",
+      "subscriptionStartDate",
+      "subscriptionEndDate",
+      "suspensionReason",
+      "paymentStatus"
+    ];
+    const hasSubDiff = trackedFields.some((f) => JSON.stringify(before[f]) !== JSON.stringify(after[f]));
+    if (!hasSubDiff) return;
+
+    const merchStatus = normalizeSubscriptionStatus(after.subscriptionStatus);
+    const isActive = merchStatus === "active" && after.isSubscribed !== false;
+    const subRef = db.collection("subscriptions").doc(merchantId);
+    const subSnap = await subRef.get();
+    const sData = subSnap.data() || {};
+
+    const currentSubStatus = subSnap.exists ? normalizeSubscriptionStatus(sData.status || sData.subscriptionStatus) : "unsubscribed";
+    const currentSubFlag = subSnap.exists ? Boolean(sData.isSubscribed) : false;
+    const currentSubPlan = Number(sData.planId || 0);
+    const currentSubMax = Number(sData.maxCaptains || 0);
+    const currentSubEndMs = parseMillis(sData.endDate);
+    const afterEndMs = parseMillis(after.subscriptionEndDate);
+    const afterReason = String(after.suspensionReason || "").trim();
+    const currentReason = String(sData.suspensionReason || sData.cancellationReason || "").trim();
+
+    if (
+      subSnap.exists &&
+      currentSubStatus === merchStatus &&
+      currentSubFlag === isActive &&
+      currentSubPlan === Number(after.planId || 0) &&
+      currentSubMax === Number(after.maxCaptains || 0) &&
+      currentSubEndMs === afterEndMs &&
+      currentReason === afterReason
+    ) {
+      return; // Loop guard: already in sync
+    }
+
+    const subPayload: Record<string, any> = {
+      merchantId,
+      status: merchStatus,
+      subscriptionStatus: merchStatus,
+      isSubscribed: isActive,
+      planId: Number(after.planId || 0),
+      planName: after.planName || sData.planName || "",
+      maxCaptains: Number(after.maxCaptains || 0),
+      price: Number(after.price || sData.price || 0),
+      paymentStatus: after.paymentStatus || sData.paymentStatus || (isActive ? "paid" : "unpaid"),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (after.subscriptionStartDate) subPayload.startDate = after.subscriptionStartDate;
+    if (after.subscriptionEndDate) subPayload.endDate = after.subscriptionEndDate;
+    if (afterReason) {
+      subPayload.suspensionReason = afterReason;
+    } else if (isActive) {
+      subPayload.suspensionReason = admin.firestore.FieldValue.delete();
+      subPayload.cancellationReason = admin.firestore.FieldValue.delete();
+    }
+
+    await subRef.set(subPayload, { merge: true });
+  });
 
 /**
  * Cloud Function: createOrderWithCode
