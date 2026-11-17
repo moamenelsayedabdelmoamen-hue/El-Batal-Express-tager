@@ -16,3 +16,7 @@
 local.properties
 .env
 debug.keystore
+
+# Node.js dependencies and audit reports
+node_modules/
+npm-audit.json

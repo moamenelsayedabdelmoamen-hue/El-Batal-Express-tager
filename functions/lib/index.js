@@ -5,10 +5,12 @@ exports.calculateHaversineDistance = calculateHaversineDistance;
 exports.runAutoDispatch = runAutoDispatch;
 exports.generateDistinct6DigitCode = generateDistinct6DigitCode;
 exports.verifyMerchantSubscription = verifyMerchantSubscription;
-const functions = require("firebase-functions");
-const admin = require("firebase-admin");
-admin.initializeApp();
-const db = admin.firestore();
+const functions = require("firebase-functions/v1");
+const app_1 = require("firebase-admin/app");
+const firestore_1 = require("firebase-admin/firestore");
+const messaging_1 = require("firebase-admin/messaging");
+(0, app_1.initializeApp)();
+const db = (0, firestore_1.getFirestore)();
 /**
  * Calculates the great-circle distance between two points on the Earth's surface
  * using the Haversine formula.
@@ -59,7 +61,7 @@ async function runAutoDispatch(orderId, orderData) {
         await db.collection("orders").doc(orderId).update({
             dispatchStatus: "failed",
             dispatchError: "المطعم غير موجود بالنظام",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            updatedAt: firestore_1.FieldValue.serverTimestamp()
         });
         return false;
     }
@@ -79,7 +81,7 @@ async function runAutoDispatch(orderId, orderData) {
             status: "cancelled",
             dispatchStatus: "failed",
             cancelReason: "اشتراك المطعم غير فعال أو منتهي",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            updatedAt: firestore_1.FieldValue.serverTimestamp()
         });
         return false;
     }
@@ -107,7 +109,7 @@ async function runAutoDispatch(orderId, orderData) {
         await db.collection("orders").doc(orderId).update({
             dispatchStatus: "searching",
             dispatchNote: "في انتظار تحديد إحداثيات المطعم",
-            lastSearchAt: admin.firestore.FieldValue.serverTimestamp()
+            lastSearchAt: firestore_1.FieldValue.serverTimestamp()
         });
         return false;
     }
@@ -126,8 +128,8 @@ async function runAutoDispatch(orderId, orderData) {
         console.log(`[AutoDispatch] No online, available, approved captains currently available.`);
         await db.collection("orders").doc(orderId).update({
             dispatchStatus: "searching",
-            lastSearchAt: admin.firestore.FieldValue.serverTimestamp(),
-            searchAttempts: admin.firestore.FieldValue.increment(1)
+            lastSearchAt: firestore_1.FieldValue.serverTimestamp(),
+            searchAttempts: firestore_1.FieldValue.increment(1)
         });
         return false;
     }
@@ -175,8 +177,8 @@ async function runAutoDispatch(orderId, orderData) {
         console.log(`[AutoDispatch] No captains passed the fresh-location and active status filters.`);
         await db.collection("orders").doc(orderId).update({
             dispatchStatus: "searching",
-            lastSearchAt: admin.firestore.FieldValue.serverTimestamp(),
-            searchAttempts: admin.firestore.FieldValue.increment(1)
+            lastSearchAt: firestore_1.FieldValue.serverTimestamp(),
+            searchAttempts: firestore_1.FieldValue.increment(1)
         });
         return false;
     }
@@ -217,7 +219,7 @@ async function runAutoDispatch(orderId, orderData) {
                 transaction.update(captainRef, {
                     availabilityStatus: "busy",
                     currentOrderId: orderId,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    updatedAt: firestore_1.FieldValue.serverTimestamp()
                 });
                 // Atomically update Order: assign captain
                 transaction.update(orderRef, {
@@ -229,10 +231,10 @@ async function runAutoDispatch(orderId, orderData) {
                     driverPhone: candidate.phone,
                     status: "accepted",
                     dispatchStatus: "assigned",
-                    assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    assignedAt: firestore_1.FieldValue.serverTimestamp(),
                     distanceToRestaurantKm: Math.round(candidate.distanceKm * 100) / 100,
                     estimatedArrival: `${estimatedMins} دقيقة`,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    updatedAt: firestore_1.FieldValue.serverTimestamp()
                 });
             });
             // If transaction committed successfully, we have won the reservation!
@@ -273,7 +275,7 @@ async function runAutoDispatch(orderId, orderData) {
                         }
                     }
                 };
-                await admin.messaging().send(messagePayload);
+                await (0, messaging_1.getMessaging)().send(messagePayload);
                 console.log(`[AutoDispatch] FCM notification successfully sent to captain ${assignedCaptain.id}`);
             }
             catch (fcmError) {
@@ -286,8 +288,8 @@ async function runAutoDispatch(orderId, orderData) {
         console.log(`[AutoDispatch] Could not reserve any candidate for order ${orderId}. Remains in searching.`);
         await db.collection("orders").doc(orderId).update({
             dispatchStatus: "searching",
-            lastSearchAt: admin.firestore.FieldValue.serverTimestamp(),
-            searchAttempts: admin.firestore.FieldValue.increment(1)
+            lastSearchAt: firestore_1.FieldValue.serverTimestamp(),
+            searchAttempts: firestore_1.FieldValue.increment(1)
         });
         return false;
     }
@@ -357,7 +359,7 @@ exports.onOrderStatusChanged = functions.firestore
             await db.collection("captains").doc(captainId).update({
                 availabilityStatus: "available",
                 currentOrderId: null,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                updatedAt: firestore_1.FieldValue.serverTimestamp()
             });
             console.log(`[AutoDispatch] Captain ${captainId} freed and set to available.`);
         }
@@ -610,7 +612,7 @@ exports.createOrderWithCode = functions.https.onCall(async (data, context) => {
     const restDoc = await db.collection("restaurants").doc(uid).get();
     const restData = restDoc.exists ? restDoc.data() || {} : {};
     const restaurantName = restData.name || restData.restaurantName || "مطعم";
-    const restaurantLoc = restData.location || (restData.latitude && restData.longitude ? new admin.firestore.GeoPoint(restData.latitude, restData.longitude) : new admin.firestore.GeoPoint(30.0444, 31.2357));
+    const restaurantLoc = restData.location || (restData.latitude && restData.longitude ? new firestore_1.GeoPoint(restData.latitude, restData.longitude) : new firestore_1.GeoPoint(30.0444, 31.2357));
     // 4. Atomic Transaction: Find unique 6-digit code and create order
     const MAX_ATTEMPTS = 15;
     let allocatedCode = "";
@@ -639,7 +641,7 @@ exports.createOrderWithCode = functions.https.onCall(async (data, context) => {
                     code: candidateCode,
                     orderId: candidateOrderId,
                     merchantId: uid,
-                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                    createdAt: firestore_1.FieldValue.serverTimestamp()
                 });
                 // Create Order Document
                 const orderRef = db.collection("orders").doc(candidateOrderId);
@@ -678,12 +680,12 @@ exports.createOrderWithCode = functions.https.onCall(async (data, context) => {
                     customerDetailsSubmitted: false,
                     customerDetailsConfirmed: false,
                     customerDetailsRejected: false,
-                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    created_at: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    createdAt: firestore_1.FieldValue.serverTimestamp(),
+                    created_at: firestore_1.FieldValue.serverTimestamp(),
+                    updatedAt: firestore_1.FieldValue.serverTimestamp()
                 };
                 if (customerLatitude !== null && customerLongitude !== null) {
-                    orderPayload.customerLocation = new admin.firestore.GeoPoint(customerLatitude, customerLongitude);
+                    orderPayload.customerLocation = new firestore_1.GeoPoint(customerLatitude, customerLongitude);
                     orderPayload.customerLatitude = customerLatitude;
                     orderPayload.customerLongitude = customerLongitude;
                 }
@@ -696,7 +698,7 @@ exports.createOrderWithCode = functions.https.onCall(async (data, context) => {
                         orderId: candidateOrderId,
                         orderCode: candidateCode,
                         merchantId: uid,
-                        createdAt: admin.firestore.FieldValue.serverTimestamp()
+                        createdAt: firestore_1.FieldValue.serverTimestamp()
                     });
                 }
             });
