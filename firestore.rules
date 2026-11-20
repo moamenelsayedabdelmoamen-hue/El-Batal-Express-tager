@@ -30,11 +30,13 @@ service cloud.firestore {
     // and must never be used as a client-controlled privilege source.
     function isAdmin() {
       return isSignedIn() && (
-        request.auth.token.get('role', '') == 'admin' ||
-        request.auth.token.get('admin', false) == true ||
+        (('role' in request.auth.token) && request.auth.token.role == 'admin') ||
+        (('admin' in request.auth.token) && request.auth.token.admin == true) ||
         (
-          request.auth.token.get('email_verified', false) == true &&
-          request.auth.token.get('email', '') in [
+          ('email_verified' in request.auth.token) &&
+          request.auth.token.email_verified == true &&
+          ('email' in request.auth.token) &&
+          request.auth.token.email in [
             'moamen.elsayed.abdelmoamen@gmail.com',
             'admin@elbatalexpress.com'
           ]
@@ -195,13 +197,65 @@ service cloud.firestore {
           isAdmin() ||
           (
             request.auth.uid == captainId
-            && !isMerchantAccount()
-            && (!('accountType' in existing()) || existing().accountType == 'captain')
-            && !('accountType' in incoming().diff(existing()).affectedKeys())
-            && (!('emailVerified' in incoming().diff(existing()).affectedKeys()) || incoming().emailVerified == false || request.auth.token.get('email_verified', false) == true)
-            && (!('isEmailVerified' in incoming().diff(existing()).affectedKeys()) || incoming().isEmailVerified == false || request.auth.token.get('email_verified', false) == true)
-            && isValidCaptainProfileShape(incoming(), captainId)
+            // A UID with an existing merchant profile may never update captain data.
+            && !exists(/databases/$(database)/documents/merchants/$(request.auth.uid))
+            && existing().get('accountType', 'captain') == 'captain'
+            && incoming().get('uid', '') == existing().get('uid', captainId)
             && isAllowedCaptainSelfUpdateKeys()
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['emailVerified']) ||
+              incoming().emailVerified == false ||
+              (('email_verified' in request.auth.token) && request.auth.token.email_verified == true)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['isEmailVerified']) ||
+              incoming().isEmailVerified == false ||
+              (('email_verified' in request.auth.token) && request.auth.token.email_verified == true)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['isOnline']) ||
+              incoming().isOnline is bool
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['isLoggedIn']) ||
+              incoming().isLoggedIn is bool
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['idDocumentsComplete']) ||
+              incoming().idDocumentsComplete is bool
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['name']) ||
+              isOptionalBoundedString(incoming(), 'name', 120)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['fullName']) ||
+              isOptionalBoundedString(incoming(), 'fullName', 120)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['phone']) ||
+              isOptionalBoundedString(incoming(), 'phone', 32)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['phoneNumber']) ||
+              isOptionalBoundedString(incoming(), 'phoneNumber', 32)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['profileImagePath']) ||
+              isOptionalBoundedString(incoming(), 'profileImagePath', 300)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['idFrontImagePath']) ||
+              isOptionalBoundedString(incoming(), 'idFrontImagePath', 300)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['idBackImagePath']) ||
+              isOptionalBoundedString(incoming(), 'idBackImagePath', 300)
+            )
+            && (
+              !incoming().diff(existing()).affectedKeys().hasAny(['licenseImagePath']) ||
+              isOptionalBoundedString(incoming(), 'licenseImagePath', 300)
+            )
           )
         );
 
