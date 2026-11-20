@@ -166,8 +166,8 @@ class MerchantSubscriptionRepository {
     companion object {
         private const val TAG = "MerchantSubRepo"
         const val FUNCTIONS_REGION = "us-central1"
-        const val PRIMARY_ORDER_FUNCTION = "requestCaptains"
-        const val LEGACY_SERVER_ORDER_FUNCTION = "createOrderWithCode"
+        const val PRIMARY_ORDER_FUNCTION = "merchantCreateOrder"
+        const val LEGACY_SERVER_ORDER_FUNCTION = "requestCaptains"
         const val MANUAL_SUBSCRIPTION_FUNCTION = "submitManualSubscriptionRequest"
 
         fun normalizeEgyptianMobile(rawPhone: String?): String? {
