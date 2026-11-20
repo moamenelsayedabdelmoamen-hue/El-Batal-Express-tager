@@ -308,7 +308,20 @@ service cloud.firestore {
 
       // All order creation, assignment, status, confirmation and settlement writes
       // are executed by the Dashboard Cloud Functions using the Admin SDK.
-      allow create, update, delete: if isAdmin();
+      allow create, delete: if isAdmin();
+
+      // Merchant feedback is the only direct merchant write permitted on an order.
+      // Status, dispatch, delivery confirmation, fees and settlement remain server-only.
+      allow update: if isAdmin() || (
+        isMerchantAccount() &&
+        (resource.data.merchantId == request.auth.uid ||
+         resource.data.userId == request.auth.uid ||
+         resource.data.restaurantId == request.auth.uid) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rating', 'ratedAt']) &&
+        request.resource.data.rating is int &&
+        request.resource.data.rating >= 1 &&
+        request.resource.data.rating <= 5
+      );
     }
     // Subscriptions collection:
     // Canonical document path: subscriptions/{merchantId}.
