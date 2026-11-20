@@ -590,8 +590,54 @@ class MerchantSubscriptionRepository {
     }
 
     /**
+     * Confirms or rejects the delivery details submitted by the assigned captain.
+     * All order state changes are applied transactionally by the Dashboard Cloud Function.
+     */
+    suspend fun confirmMerchantOrder(
+        orderId: String,
+        confirmed: Boolean,
+        rejectionReason: String = ""
+    ): Result<Unit> {
+        return runCatching {
+            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
+            functionsClient()
+                .getHttpsCallable("merchantConfirmOrder")
+                .call(
+                    hashMapOf(
+                        "orderId" to orderId,
+                        "confirmed" to confirmed,
+                        "rejectionReason" to rejectionReason.trim().take(500)
+                    )
+                )
+                .await()
+        }
+    }
+
+    /**
+     * Cancels a merchant-owned order through the server. The server validates the
+     * merchant owner, lifecycle status and releases any captain reservation atomically.
+     */
+    suspend fun cancelMerchantOrder(
+        orderId: String,
+        reason: String
+    ): Result<Unit> {
+        return runCatching {
+            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
+            functionsClient()
+                .getHttpsCallable("merchantCancelOrder")
+                .call(
+                    hashMapOf(
+                        "orderId" to orderId,
+                        "reason" to reason.trim().take(500)
+                    )
+                )
+                .await()
+        }
+    }
+
+    /**
      * Fetches the official Vodafone Cash wallet number, optional wallet holder name, dynamic plans,
-     * and instructions configured by Admin in Firebase Firestore (`settings/subscription_config`).
+     * and instructions configured by Admin in Firestore.
      */
     suspend fun fetchVodafoneCashSettings(): VodafoneCashSettings {
         return try {
