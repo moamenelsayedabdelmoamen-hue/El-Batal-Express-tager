@@ -57,7 +57,9 @@ service firebase.storage {
 
     // Merchant is permitted ONLY when authenticated as a merchant AND explicitly linked to THIS order
     function isMerchantOfOrder(orderData) {
-      return isMerchantAccount() && (
+      return isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && (
         ('merchantId' in orderData && orderData.merchantId == request.auth.uid) ||
         ('restaurantId' in orderData && orderData.restaurantId == request.auth.uid) ||
         ('storeId' in orderData && orderData.storeId == request.auth.uid) ||
@@ -139,6 +141,7 @@ service firebase.storage {
         isAdmin() ||
         (
           isMerchantAccount() &&
+          request.auth.token.get('email_verified', false) == true &&
           isCaptainLinkedToActiveMerchant(
             firestore.get(/databases/(default)/documents/captains/$(captainId))
           )
