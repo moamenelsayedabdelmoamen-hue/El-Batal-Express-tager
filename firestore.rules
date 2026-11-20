@@ -29,10 +29,11 @@ service cloud.firestore {
     // /admins from this helper: per-request document lookups add evaluation cost
     // and must never be used as a client-controlled privilege source.
     function isRegisteredAdmin() {
+      let adminDoc = get(/databases/$(database)/documents/admins/$(request.auth.uid));
       return isSignedIn()
-        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'admin'
-        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('status', 'active') in ['active', 'approved'];
+        && adminDoc.data != null
+        && adminDoc.data.get('role', '') == 'admin'
+        && adminDoc.data.get('status', 'active') in ['active', 'approved'];
     }
 
     function isAdmin() {
@@ -138,11 +139,9 @@ service cloud.firestore {
         'availabilityStatus', 'shiftStatus', 'isOnline', 'isLoggedIn',
         'fcmToken', 'updatedAt'
       ])
-      && incoming().get('uid', '') == request.auth.uid
-      && incoming().get('accountType', 'captain') == 'captain'
-      && incoming().get('isOnline', false) is bool
-      && incoming().get('isLoggedIn', false) is bool
-      && incoming().get('idDocumentsComplete', false) is bool;
+      && (!changed.hasAny(['isOnline']) || incoming().isOnline is bool)
+      && (!changed.hasAny(['isLoggedIn']) || incoming().isLoggedIn is bool)
+      && (!changed.hasAny(['idDocumentsComplete']) || incoming().idDocumentsComplete is bool);
     }
 
     match /captains/{captainId} {
