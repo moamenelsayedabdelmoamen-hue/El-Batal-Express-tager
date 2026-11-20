@@ -22,6 +22,7 @@ import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.firestore
+import com.google.firebase.functions.functions
 import com.google.firebase.storage.storage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -1837,19 +1838,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 val matchedDoc = findMerchantOrderDocument(orderId)
 
                 if (matchedDoc != null) {
-                    val updates = hashMapOf<String, Any?>(
-                        "customerDetailsConfirmed" to true,
-                        "merchantConfirmed" to true,
-                        "isConfirmed" to true,
-                        "customerDetailsRejected" to false,
-                        "rejectionReason" to "",
-                        "confirmedAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp(),
-                        "status" to "customer_confirmed",
-                        "orderStatus" to "customer_confirmed",
-                        "status_ar" to "جاري التوصيل"
-                    )
-                    matchedDoc.reference.update(updates).await()
+                    Firebase.functions("us-central1")
+                        .getHttpsCallable("merchantConfirmOrder")
+                        .call(mapOf("orderId" to matchedDoc.id, "confirmed" to true))
+                        .await()
 
                     // Update in-memory list immediately so UI reflects confirmation right away
                     val docRealId = matchedDoc.safeString("orderId") ?: matchedDoc.id
@@ -1914,20 +1906,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 val matchedDoc = findMerchantOrderDocument(orderId)
 
                 if (matchedDoc != null) {
-                    val updates = hashMapOf<String, Any?>(
-                        "customerDetailsRejected" to true,
-                        "customerDetailsConfirmed" to false,
-                        "merchantConfirmed" to false,
-                        "isConfirmed" to false,
-                        "customerDetailsSubmitted" to false,
-                        "rejectionReason" to reason.trim(),
-                        "rejectedAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp(),
-                        "status" to "customer_rejected",
-                        "orderStatus" to "customer_rejected",
-                        "status_ar" to "بيانات مرفوضة"
-                    )
-                    matchedDoc.reference.update(updates).await()
+                    Firebase.functions("us-central1")
+                        .getHttpsCallable("merchantConfirmOrder")
+                        .call(mapOf(
+                            "orderId" to matchedDoc.id,
+                            "confirmed" to false,
+                            "rejectionReason" to reason.trim()
+                        ))
+                        .await()
 
                     val docRealId = matchedDoc.safeString("orderId") ?: matchedDoc.id
                     _firestoreOrders.value = _firestoreOrders.value.map { item ->
@@ -1981,30 +1967,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             try {
-                val intId = orderId.toString().toIntOrNull() ?: 0
-                if (intId != 0) {
-                    repository.updateOrderStatus(intId, "ملغي")
-                }
-                val uid = Firebase.auth.currentUser?.uid ?: ""
-                if (uid.isNotEmpty()) {
-                    val snapshot = Firebase.firestore.collection("orders")
-                        .whereEqualTo("userId", uid)
-                        .get().await()
-                    for (doc in snapshot.documents) {
-                        val idHash = doc.safeString("orderId")?.hashCode() ?: doc.id.hashCode()
-                        if (idHash == intId || doc.id == orderId.toString() || doc.safeString("orderId") == orderId.toString()) {
-                            doc.reference.update(
-                                mapOf(
-                                    "status" to "cancelled",
-                                    "status_ar" to "ملغي",
-                                    "cancelReason" to reason,
-                                    "cancelledAt" to FieldValue.serverTimestamp()
-                                )
-                            ).await()
-                            break
-                        }
-                    }
-                }
+                val matchedDoc = findMerchantOrderDocument(orderId)
+                    ?: throw IllegalStateException("الطلب غير موجود في حساب التاجر")
+                Firebase.functions("us-central1")
+                    .getHttpsCallable("merchantCancelOrder")
+                    .call(mapOf("orderId" to matchedDoc.id, "reason" to reason))
+                    .await()
+                val intId = orderId.toString().toIntOrNull() ?: matchedDoc.id.hashCode()
+                repository.updateOrderStatus(intId, "ملغي")
                 _snackbarMessage.value = "تم إلغاء الطلب بنجاح"
                 onSuccess()
             } catch (e: Exception) {
@@ -2056,30 +2026,32 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
-            repository.updateOrderDetails(
-                orderId = orderId,
-                destinationAddress = destinationAddress,
-                orderDetails = orderDetails,
-                customerPhone = customerPhone,
-                customerName = customerName,
-                serviceFee = serviceFee
-            )
             try {
                 val matchedDoc = findMerchantOrderDocument(orderId)
-                matchedDoc?.reference?.update(
-                    mapOf(
-                        "address" to destinationAddress,
-                        "deliveryAddress" to destinationAddress,
+                    ?: throw IllegalStateException("الطلب غير موجود في حساب التاجر")
+                Firebase.functions("us-central1")
+                    .getHttpsCallable("merchantUpdateOrderDetails")
+                    .call(mapOf(
+                        "orderId" to matchedDoc.id,
                         "destinationAddress" to destinationAddress,
-                        "items" to orderDetails,
                         "orderDetails" to orderDetails,
-                        "price" to serviceFee,
-                        "totalAmount" to serviceFee,
-                        "serviceFee" to serviceFee
-                    )
-                )?.await()
+                        "customerPhone" to customerPhone,
+                        "customerName" to customerName,
+                        "serviceFee" to serviceFee,
+                        "deliveryNotes" to ""
+                    ))
+                    .await()
+                repository.updateOrderDetails(
+                    orderId = orderId,
+                    destinationAddress = destinationAddress,
+                    orderDetails = orderDetails,
+                    customerPhone = customerPhone,
+                    customerName = customerName,
+                    serviceFee = serviceFee
+                )
             } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error updating order details in Firestore", e)
+                Log.e("OrderViewModel", "Error updating order details through server", e)
+                _snackbarMessage.value = "تعذر تعديل الطلب: ${e.localizedMessage}"
             }
         }
     }
