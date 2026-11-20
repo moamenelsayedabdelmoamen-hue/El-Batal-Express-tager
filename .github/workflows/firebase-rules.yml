@@ -29,4 +29,4 @@ jobs:
       - run: node -e "JSON.parse(require('fs').readFileSync('firestore.indexes.json', 'utf8')); console.log('Firestore indexes JSON valid')"
       - run: npm install --prefix .ci-deps @firebase/rules-unit-testing
       - run: npm install --global firebase-tools
-      - run: firebase emulators:exec --only firestore --project demo-elbatal "NODE_PATH=$GITHUB_WORKSPACE/.ci-deps/node_modules node --test firestore.test.js"
+      - run: firebase emulators:exec --only firestore --project demo-elbatal "GCP_PROJECT=demo-elbatal NODE_PATH=$GITHUB_WORKSPACE/.ci-deps/node_modules node --test firestore.test.js"
