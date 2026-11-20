@@ -17,6 +17,9 @@ interface OrderDao {
     @Query("SELECT COUNT(*) FROM delivery_orders")
     suspend fun getOrderCount(): Int
 
+    @Query("DELETE FROM delivery_orders")
+    suspend fun clearAllOrders()
+
     @Query("UPDATE delivery_orders SET status = :status WHERE id = :orderId")
     suspend fun updateOrderStatus(orderId: Int, status: String)
 
