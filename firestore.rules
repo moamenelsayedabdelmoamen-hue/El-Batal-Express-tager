@@ -9,7 +9,10 @@ service cloud.firestore {
     
     // Check if user has admin privileges via Custom Claims, verified email whitelist, or admins collection
     function isAdmin() {
-      return isSignedIn() && (
+      return isSignedIn()
+        && 'email_verified' in request.auth.token
+        && request.auth.token.email_verified == true
+        && (
         ('role' in request.auth.token && request.auth.token.role == 'admin') ||
         ('admin' in request.auth.token && request.auth.token.admin == true) ||
         ('email' in request.auth.token &&
@@ -32,6 +35,8 @@ service cloud.firestore {
     function isMerchantAccount() {
       let merch = get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data;
       return isSignedIn() &&
+        'email_verified' in request.auth.token &&
+        request.auth.token.email_verified == true &&
         hasMerchantAccount(request.auth.uid) &&
         !hasCaptainAccount(request.auth.uid) &&
         (merch.accountType == 'merchant' || (!('accountType' in merch) && merch.role == 'merchant'));
@@ -101,7 +106,10 @@ service cloud.firestore {
     
     // Check if user is the captain
     function isCaptain(captainId) {
-      return isSignedIn() && (
+      return isSignedIn() &&
+        'email_verified' in request.auth.token &&
+        request.auth.token.email_verified == true &&
+        (
         (request.auth.token.role == 'captain' && request.auth.token.captainId == captainId) ||
         request.auth.uid == captainId
       );
