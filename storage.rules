@@ -138,8 +138,8 @@ service firebase.storage {
     //   Blanket read access across all captains by arbitrary merchants is DENIED.
     // - Write: ONLY the owning captain (non-merchant) with validated image MIME & size.
     match /captains/{captainId}/profile/profile.jpg {
-      allow read: if isAuthenticated() && (
-        request.auth.uid == captainId ||
+      allow read: if (
+        (isCaptainAccount() && request.auth.uid == captainId) ||
         isAdmin() ||
         (
           isMerchantAccount() &&
@@ -149,9 +149,8 @@ service firebase.storage {
         )
       );
 
-      allow create, update: if isAuthenticated()
+      allow create, update: if isCaptainAccount()
         && request.auth.uid == captainId
-        && !isMerchantAccount()
         && isValidImageUpload();
 
       allow delete: if isAdmin();
@@ -163,13 +162,12 @@ service firebase.storage {
     // - Write: ONLY the owning captain.
     match /captains/{captainId}/documents/{docFile} {
       allow read: if isAuthenticated() && (
-        (request.auth.uid == captainId && !isMerchantAccount()) ||
+        (isCaptainAccount() && request.auth.uid == captainId) ||
         isAdmin()
       );
 
-      allow create, update: if isAuthenticated()
+      allow create, update: if isCaptainAccount()
         && request.auth.uid == captainId
-        && !isMerchantAccount()
         && (docFile == 'id_front.jpg' || docFile == 'id_back.jpg' || docFile == 'license.jpg')
         && isValidImageUpload();
 
