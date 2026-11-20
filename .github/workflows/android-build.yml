@@ -35,7 +35,10 @@ jobs:
       - name: Generate CI debug keystore
         run: |
           keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
-      - run: gradle :app:assembleDebug
+      - name: Run merchant app unit tests
+        run: gradle :app:testDebugUnitTest
+      - name: Build merchant debug APK
+        run: gradle :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-debug-apk
