@@ -1630,8 +1630,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
-            val feeDigits = Regex("""\d+(?:\.\d+)?""")
-                .find(normalizedFeeInput.replace(",", ""))?.value?.toDoubleOrNull()
+            val feeNumberText = normalizedFeeInput
+                .replace(",", "")
+                .replace("٬", "")
+                .replace(Regex("""\s*جنيه$"""), "")
+                .trim()
+            val feeDigits = feeNumberText
+                .takeIf { Regex("""^\d+(?:\.\d{1,2})?$""").matches(it) }
+                ?.toDoubleOrNull()
             if (feeInput.isBlank() || feeDigits == null || !feeDigits.isFinite() || feeDigits < 0.0 || feeDigits > 100000.0) {
                 val feeMsg = "يرجى إدخال قيمة صحيحة لخدمة التوصيل من تطبيق التاجر."
                 _snackbarMessage.value = feeMsg
