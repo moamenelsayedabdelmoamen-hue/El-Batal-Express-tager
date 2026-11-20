@@ -7,7 +7,7 @@ const { test, before, after, beforeEach } = require("node:test");
 const fs = require("node:fs");
 
 let testEnv;
-const PROJECT_ID = process.env.GCP_PROJECT || "demo-no-project";
+const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT || "demo-no-project";
 const MERCHANT_A = "merchant_a_101";
 const MERCHANT_B = "merchant_b_202";
 const CAPTAIN_UID = "captain_999";
