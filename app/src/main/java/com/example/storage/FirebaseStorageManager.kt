@@ -507,7 +507,7 @@ object FirebaseStorageManager {
 
     /**
      * Uploads a Vodafone Cash transfer receipt image EXCLUSIVELY to Firebase Storage
-     * under `merchants/{uid}/subscription_receipts/{requestId}.jpg`.
+     * under a unique `merchants/{uid}/subscription_receipts/{uploadId}.jpg` path.
      * Never uses external third-party image hosts.
      */
     suspend fun uploadSubscriptionReceiptImage(
