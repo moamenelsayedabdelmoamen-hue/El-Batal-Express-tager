@@ -365,6 +365,9 @@ test("Ongoing orders, Captain delivery workflow, Captain earnings protection, an
       captainName: "كابتن أحمد",
       status: "accepted",
       dispatchStatus: "assigned",
+      customerDetailsSubmitted: true,
+      customerDetailsConfirmed: false,
+      customerDetailsRejected: false,
       captainEarnings: 30,
     });
 
@@ -386,11 +389,26 @@ test("Ongoing orders, Captain delivery workflow, Captain earnings protection, an
     .authenticatedContext(OTHER_CAPTAIN_UID, { email: "cap2@example.com", email_verified: true })
     .firestore();
 
-  // Ongoing order remains readable & confirmable by Merchant even after subscription suspension
+  // Ongoing order remains readable after subscription suspension.
+  // Merchant may confirm only a submitted receipt through the explicit lifecycle transition.
   await assertSucceeds(merchDb.collection("orders").doc("ord_active").get());
   await assertSucceeds(merchDb.collection("orders").doc("ord_legacy_rest").get());
-  await assertSucceeds(
+  await assertFails(
     merchDb.collection("orders").doc("ord_active").update({ customerDetailsConfirmed: true })
+  );
+  await assertSucceeds(
+    merchDb.collection("orders").doc("ord_active").update({
+      customerDetailsConfirmed: true,
+      customerDetailsRejected: false,
+      merchantConfirmed: true,
+      isConfirmed: true,
+      rejectionReason: "",
+      confirmedAt: new Date(),
+      updatedAt: new Date(),
+      status: "en_route",
+      orderStatus: "en_route",
+      status_ar: "جاري التوصيل"
+    })
   );
 
   // Merchant CANNOT tamper with assigned order's financial/assignment/capacity fields
@@ -418,12 +436,12 @@ test("Ongoing orders, Captain delivery workflow, Captain earnings protection, an
     })
   );
 
-  // Assigned captain CAN read & progress delivery status
+  // Assigned Captain can read order details but MUST use authenticated server callables to mutate.
   await assertSucceeds(captainDb.collection("orders").doc("ord_active").get());
-  await assertSucceeds(
+  await assertFails(
     captainDb.collection("orders").doc("ord_active").update({ status: "in_progress" })
   );
-  await assertSucceeds(
+  await assertFails(
     captainDb.collection("orders").doc("ord_active").update({ status: "delivered" })
   );
 
