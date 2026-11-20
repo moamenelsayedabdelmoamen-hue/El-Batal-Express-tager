@@ -2806,11 +2806,24 @@ export const onMerchantSubscriptionWriteSync = functions.firestore
     await applyMerchantSubscriptionWriteSync(db, merchantId, before, after);
   });
 
+function parseMerchantServiceFee(raw: unknown): number {
+  if (typeof raw === "number") return raw;
+  const arabicDigits: Record<string, string> = {
+    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+    "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9"
+  };
+  const normalized = String(raw ?? "").trim().replace(/[٠-٩۰-۹]/g, (digit) => arabicDigits[digit] || digit);
+  const token = normalized.replace(/,/g, ".").match(/-?\d+(?:\.\d{1,2})?/);
+  return token ? Number(token[0]) : Number.NaN;
+}
+
 export interface ReserveOrderParams {
   uid: string;
   actionName: string;
   destinationAddress: string;
-  serviceFee: string;
+  serviceFee: number;
   customerName?: string;
   customerPhone?: string;
   orderDetails?: string;
@@ -2861,7 +2874,13 @@ export async function reserveAndCreateOrderAtomic(
   const idempotencyKey = String(params.idempotencyKey || "").trim();
   const requestId = String(params.requestId || idempotencyKey || crypto.randomBytes(6).toString("hex")).trim();
   const destinationAddress = String(params.destinationAddress || "").trim();
-  const serviceFee = String(params.serviceFee || "30 جنيه").trim();
+  const serviceFee = parseMerchantServiceFee(params.serviceFee);
+  if (!Number.isFinite(serviceFee) || serviceFee <= 0 || serviceFee > 10000) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "قيمة خدمة التوصيل يجب أن تكون مبلغاً صحيحاً أكبر من صفر ولا يتجاوز 10000 جنيه."
+    );
+  }
   const customerName = String(params.customerName || "").trim();
   const customerPhone = String(params.customerPhone || "").trim();
   const orderDetails = String(params.orderDetails || "").trim();
@@ -2913,8 +2932,12 @@ export async function reserveAndCreateOrderAtomic(
     );
   }
   const merchantPreData = merchantPreDoc.data() || {};
-  const merchantName = merchantPreData.name || "تاجر";
-  const merchantPhone = String(merchantPreData.phone || params.merchantPhone || "").trim();
+  const merchantName = String(merchantPreData.name || merchantPreData.restaurantName || "").trim();
+  const merchantPhone = String(merchantPreData.phone || merchantPreData.phoneNumber || "").trim();
+  const merchantImage = String(
+    merchantPreData.logo || merchantPreData.photoUrl || merchantPreData.logoUrl ||
+    merchantPreData.imageUrl || merchantPreData.profileImageUrl || merchantPreData.storagePath || ""
+  ).trim();
   const clientLat = typeof params.merchantLatitude === "number" ? params.merchantLatitude : null;
   const clientLng = typeof params.merchantLongitude === "number" ? params.merchantLongitude : null;
   const merchantLoc =
@@ -3076,6 +3099,9 @@ export async function reserveAndCreateOrderAtomic(
           price: serviceFee,
           totalAmount: serviceFee,
           serviceFee,
+          deliveryFee: serviceFee,
+          shippingFee: serviceFee,
+          currency: "EGP",
           customerName,
           customerPhone,
           orderDetails,
@@ -3088,7 +3114,15 @@ export async function reserveAndCreateOrderAtomic(
           userId: uid,
           restaurantId: uid,
           merchantName,
+          storeName: merchantName,
+          restaurantName: merchantName,
           merchantPhone,
+          storePhone: merchantPhone,
+          restaurantPhone: merchantPhone,
+          merchantLogo: merchantImage,
+          merchantLogoUrl: merchantImage,
+          storeImage: merchantImage,
+          storePhotoUrl: merchantImage,
           merchantLocation: merchantLoc,
           pickupLocation: merchantLoc,
           merchantLatitude: merchantLoc.latitude,
@@ -3244,7 +3278,7 @@ async function executeServerOrderCreation(
       actionName,
       requestId,
       destinationAddress: String(data?.destinationAddress || data?.address || "").trim(),
-      serviceFee: String(data?.serviceFee || data?.price || "30 جنيه").trim(),
+      serviceFee: parseMerchantServiceFee(data?.serviceFee ?? data?.deliveryFee ?? data?.price),
       customerName: String(data?.customerName || "").trim(),
       customerPhone: String(data?.customerPhone || "").trim(),
       orderDetails: String(data?.orderDetails || data?.items || "").trim(),
