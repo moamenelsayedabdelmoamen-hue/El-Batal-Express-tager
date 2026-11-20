@@ -14,14 +14,20 @@ data class SubscriptionStatusState(
     val isSuspended: Boolean = false,
     val isCancelled: Boolean = false,
     val isPending: Boolean = false,
+    val isPendingReview: Boolean = false,
+    val isRejected: Boolean = false,
+    val isResubmissionRequired: Boolean = false,
     val isOfflineUnverified: Boolean = false,
     val isFromCache: Boolean = false,
     val status: String = "unsubscribed",
     val startDateMillis: Long? = null,
+    val approvedAtMillis: Long? = null,
     val endDateMillis: Long? = null,
     val lastServerSyncMillis: Long? = null,
     val message: String? = null,
     val suspensionReason: String? = null,
+    val rejectionReason: String? = null,
+    val resubmissionReason: String? = null,
     val serverError: String? = null,
     val isChecking: Boolean = false,
     val planId: Int = 0,
@@ -31,13 +37,18 @@ data class SubscriptionStatusState(
     val activeCaptainsCount: Int = 0,
     val availableCaptainSlots: Int = 0,
     val paymentStatus: String = "unpaid",
+    val paymentMethod: String? = null,
+    val pendingRequestId: String? = null,
+    val senderPhone: String? = null,
+    val transactionReference: String? = null,
+    val receiptStoragePath: String? = null,
     val subscriptionVersion: Long = 0L,
     val updatedBy: String? = null
 ) {
     fun canRequestCaptain(nowMillis: Long = System.currentTimeMillis()): Boolean {
-        if (!isSubscribed || isExpired || isSuspended || isCancelled || isPending || isOfflineUnverified) return false
+        if (!isSubscribed || isExpired || isSuspended || isCancelled || isPending || isPendingReview || isRejected || isResubmissionRequired || isOfflineUnverified) return false
         if (status != "active") return false
-        if (paymentStatus in listOf("failed", "unpaid", "pending")) return false
+        if (paymentStatus in listOf("failed", "unpaid", "pending", "pending_review", "rejected", "resubmission_required")) return false
         if (maxCaptains <= 0) return false
         if (endDateMillis != null && nowMillis >= endDateMillis) return false
         return true
@@ -87,11 +98,19 @@ data class RawSubscriptionSnapshot(
     val maxCaptains: Int? = null,
     val price: Int? = null,
     val startDateMillis: Long? = null,
+    val approvedAtMillis: Long? = null,
     val endDateMillis: Long? = null,
     val updatedAtMillis: Long? = null,
     val subscriptionUpdatedAtMillis: Long? = null,
     val lastLoginAtMillis: Long? = null,
     val reason: String? = null,
+    val rejectionReason: String? = null,
+    val resubmissionReason: String? = null,
+    val paymentMethod: String? = null,
+    val pendingRequestId: String? = null,
+    val senderPhone: String? = null,
+    val transactionReference: String? = null,
+    val receiptStoragePath: String? = null,
     val subscriptionVersion: Long? = null,
     val updatedBy: String? = null,
     val isFromCache: Boolean = false
@@ -134,7 +153,16 @@ object SubscriptionSyncResolver {
 
             "expired", "منتهي", "منتهية", "منتهي الصلاحية" -> "expired"
 
-            "pending", "under_review", "in_review", "merchant_pending",
+            "pending_review", "awaiting_review", "manual_pending", "under_review", "in_review",
+            "في انتظار مراجعة الإدارة", "في انتظار مراجعة الادارة", "قيد مراجعة الإدارة", "بانتظار مراجعة الإدارة" -> "pending_review"
+
+            "rejected", "request_rejected", "manual_rejected",
+            "مرفوض", "مرفوضة", "تم رفض الطلب", "تم الرفض" -> "rejected"
+
+            "resubmission_required", "resubmit", "resubmit_required", "reupload_receipt", "receipt_resubmission_required",
+            "مطلوب إعادة إرسال الإيصال", "مطلوب اعادة ارسال الايصال", "إعادة إرسال الإيصال", "اعادة ارسال الايصال" -> "resubmission_required"
+
+            "pending", "merchant_pending",
             "قيد المراجعة", "معلق", "معلقة", "بانتظار التفعيل" -> "pending"
 
             "payment_failed", "failed", "declined" -> "payment_failed"
@@ -219,20 +247,31 @@ object SubscriptionSyncResolver {
                 snapshot,
                 listOf("activatedAt", "startDate", "subscriptionStartDate", "createdAt")
             ),
+            approvedAtMillis = parseDateFields(
+                snapshot,
+                listOf("approvedAt", "activatedAt", "startDate")
+            ),
             endDateMillis = parseDateFields(
                 snapshot,
                 listOf("expiresAt", "endDate", "subscriptionEndDate", "renewalDate", "nextBillingDate", "expiryDate")
             ),
             updatedAtMillis = parseDateFields(
                 snapshot,
-                listOf("updatedAt", "cancelledAt", "suspendedAt")
+                listOf("updatedAt", "cancelledAt", "suspendedAt", "rejectedAt", "resubmissionRequestedAt")
             ),
             subscriptionUpdatedAtMillis = parseDateFields(
                 snapshot,
-                listOf("subscriptionUpdatedAt", "activatedAt", "suspendedAt", "cancelledAt")
+                listOf("subscriptionUpdatedAt", "activatedAt", "suspendedAt", "cancelledAt", "rejectedAt", "resubmissionRequestedAt")
             ),
             lastLoginAtMillis = parseDateFields(snapshot, listOf("lastLoginAt")),
-            reason = snapshot.getAnyString("suspensionReason", "cancellationReason", "reason"),
+            reason = snapshot.getAnyString("suspensionReason", "cancellationReason", "resubmissionReason", "rejectionReason", "reason"),
+            rejectionReason = snapshot.getAnyString("rejectionReason"),
+            resubmissionReason = snapshot.getAnyString("resubmissionReason", "rejectionReason"),
+            paymentMethod = snapshot.getAnyString("paymentMethod"),
+            pendingRequestId = snapshot.getAnyString("pendingRequestId"),
+            senderPhone = snapshot.getAnyString("senderPhone"),
+            transactionReference = snapshot.getAnyString("transactionReference"),
+            receiptStoragePath = snapshot.getAnyString("receiptStoragePath"),
             subscriptionVersion = (snapshot.get("subscriptionVersion") as? Number)?.toLong(),
             updatedBy = snapshot.getAnyString("updatedBy", "updatedByAdminUid"),
             isFromCache = snapshot.metadata.isFromCache
@@ -251,17 +290,30 @@ object SubscriptionSyncResolver {
         val limit = (data["captainLimit"] as? Number)?.toInt() ?: (data["maxCaptains"] as? Number)?.toInt()
         val price = (data["price"] as? Number)?.toInt()
         val startMs = parseDateMillis(data["activatedAt"]) ?: parseDateMillis(data["startDate"])
+        val approvedMs = parseDateMillis(data["approvedAt"]) ?: startMs
         val endMs = parseDateMillis(data["expiresAt"]) ?: parseDateMillis(data["endDate"])
         val serverTimeMs = parseDateMillis(data["serverTimeMs"]) ?: System.currentTimeMillis()
         val version = (data["subscriptionVersion"] as? Number)?.toLong()
         val updatedBy = data["updatedBy"]?.toString()
-        val reason = data["reason"]?.toString()?.takeIf { it.isNotBlank() }
+        val rejectionReason = data["rejectionReason"]?.toString()?.takeIf { it.isNotBlank() }
+        val resubmissionReason = data["resubmissionReason"]?.toString()?.takeIf { it.isNotBlank() } ?: rejectionReason
+        val reason = resubmissionReason
+            ?: rejectionReason
+            ?: data["reason"]?.toString()?.takeIf { it.isNotBlank() }
             ?: data["errorMessage"]?.toString()?.takeIf { it.isNotBlank() && normalized != "active" }
+        val derivedPaymentStatus = when (normalized) {
+            "active" -> "paid"
+            "pending_review" -> "pending_review"
+            "rejected" -> "rejected"
+            "resubmission_required" -> "resubmission_required"
+            "payment_failed", "pending_payment" -> "failed"
+            else -> data["paymentStatus"]?.toString()?.trim()?.ifBlank { null } ?: "unpaid"
+        }
         return RawSubscriptionSnapshot(
             exists = rawStatus != "not_found",
             status = rawStatus,
             subscriptionStatus = rawStatus,
-            paymentStatus = if (normalized == "payment_failed" || normalized == "pending_payment") "failed" else "paid",
+            paymentStatus = derivedPaymentStatus,
             isActive = isActive,
             isSubscribed = isActive,
             planId = planId,
@@ -269,10 +321,15 @@ object SubscriptionSyncResolver {
             maxCaptains = limit,
             price = price,
             startDateMillis = startMs,
+            approvedAtMillis = approvedMs,
             endDateMillis = endMs,
             updatedAtMillis = serverTimeMs,
             subscriptionUpdatedAtMillis = serverTimeMs,
             reason = reason,
+            rejectionReason = rejectionReason,
+            resubmissionReason = resubmissionReason,
+            paymentMethod = data["paymentMethod"]?.toString()?.takeIf { it.isNotBlank() },
+            pendingRequestId = data["pendingRequestId"]?.toString()?.takeIf { it.isNotBlank() },
             subscriptionVersion = version,
             updatedBy = updatedBy,
             isFromCache = false
@@ -341,7 +398,7 @@ object SubscriptionSyncResolver {
                 val merchUpdated = effectiveMerchantSubTimestamp(merchantDoc)
                 val subVersion = subscriptionDoc.subscriptionVersion ?: 0L
                 val merchVersion = merchantDoc.subscriptionVersion ?: 0L
-                val merchExplicitRestrictive = merchStatusNorm in listOf("suspended", "inactive", "cancelled", "expired", "payment_failed", "pending")
+                val merchExplicitRestrictive = merchStatusNorm in listOf("suspended", "inactive", "cancelled", "expired", "payment_failed", "pending", "pending_review", "rejected", "resubmission_required")
                 val subExplicitDeactivated = subscriptionDoc.isActive == false && subscriptionDoc.isSubscribed != true
                 val subExplicitActive = subStatusNorm == "active" && !subExplicitDeactivated
                 when {
@@ -419,7 +476,15 @@ object SubscriptionSyncResolver {
         val rawPaymentStatus = (primary.paymentStatus ?: secondary.paymentStatus)?.trim()?.lowercase(Locale.ROOT) ?: "paid"
         val endDateMillis = primary.endDateMillis ?: secondary.endDateMillis
         val startDateMillis = primary.startDateMillis ?: secondary.startDateMillis
+        val approvedAtMillis = primary.approvedAtMillis ?: secondary.approvedAtMillis ?: startDateMillis
         val reason = (primary.reason ?: secondary.reason)?.trim()?.takeIf { it.isNotBlank() }
+        val rejectionReason = (primary.rejectionReason ?: secondary.rejectionReason)?.trim()?.takeIf { it.isNotBlank() }
+        val resubmissionReason = (primary.resubmissionReason ?: secondary.resubmissionReason ?: rejectionReason)?.trim()?.takeIf { it.isNotBlank() }
+        val paymentMethod = (primary.paymentMethod ?: secondary.paymentMethod)?.trim()?.takeIf { it.isNotBlank() }
+        val pendingRequestId = (primary.pendingRequestId ?: secondary.pendingRequestId)?.trim()?.takeIf { it.isNotBlank() }
+        val senderPhone = (primary.senderPhone ?: secondary.senderPhone)?.trim()?.takeIf { it.isNotBlank() }
+        val transactionReference = (primary.transactionReference ?: secondary.transactionReference)?.trim()?.takeIf { it.isNotBlank() }
+        val receiptStoragePath = (primary.receiptStoragePath ?: secondary.receiptStoragePath)?.trim()?.takeIf { it.isNotBlank() }
         val version = maxOf(primary.subscriptionVersion ?: 0L, secondary.subscriptionVersion ?: 0L)
         val updatedBy = primary.updatedBy ?: secondary.updatedBy
 
@@ -530,29 +595,116 @@ object SubscriptionSyncResolver {
             )
         }
 
-        // Handle pending admin review
-        if (chosenStatus == "pending") {
+        // Handle pending_review / pending admin review
+        if (chosenStatus == "pending_review" || chosenStatus == "pending") {
             return SubscriptionStatusState(
                 isSubscribed = false,
                 isExpired = false,
                 isSuspended = false,
                 isCancelled = false,
                 isPending = true,
+                isPendingReview = true,
+                isRejected = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = chosenIsFromCache,
-                status = "pending",
+                status = if (chosenStatus == "pending_review") "pending_review" else "pending",
                 startDateMillis = startDateMillis,
                 endDateMillis = endDateMillis,
                 lastServerSyncMillis = if (!chosenIsFromCache && isOnline) nowMillis else null,
-                message = reason ?: "طلب الاشتراك قيد المراجعة من قبل الإدارة. سيتم التفعيل تلقائياً فور الموافقة.",
+                message = if (chosenStatus == "pending_review") {
+                    "طلب الاشتراك في انتظار مراجعة الإدارة. سيتم تفعيل الباقة تلقائياً فور الموافقة على إيصال التحويل."
+                } else {
+                    "طلب الاشتراك قيد المراجعة من الإدارة. سيتم تفعيل الباقة فور الموافقة."
+                },
                 isChecking = false,
                 planId = if (hasValidPlan) effectivePlanId else 0,
-                planName = if (hasValidPlan) planName else "قيد المراجعة",
+                planName = if (hasValidPlan) planName else if (chosenStatus == "pending_review") "في انتظار مراجعة الإدارة" else "قيد المراجعة",
                 maxCaptains = 0,
                 price = if (hasValidPlan) planPrice else 0,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = rawPaymentStatus,
+                paymentStatus = "pending_review",
+                paymentMethod = paymentMethod,
+                pendingRequestId = pendingRequestId,
+                senderPhone = senderPhone,
+                transactionReference = transactionReference,
+                receiptStoragePath = receiptStoragePath,
+                subscriptionVersion = version,
+                updatedBy = updatedBy
+            )
+        }
+
+        // Handle Admin rejection of manual Vodafone Cash request
+        if (chosenStatus == "rejected") {
+            val resolvedRejection = rejectionReason ?: reason
+                ?: "تم رفض طلب الاشتراك من الإدارة. يرجى التأكد من بيانات وإيصال التحويل وإعادة المحاولة."
+            return SubscriptionStatusState(
+                isSubscribed = false,
+                isExpired = false,
+                isSuspended = false,
+                isCancelled = false,
+                isPending = false,
+                isPendingReview = false,
+                isRejected = true,
+                isOfflineUnverified = !isOnline,
+                isFromCache = chosenIsFromCache,
+                status = "rejected",
+                startDateMillis = startDateMillis,
+                endDateMillis = endDateMillis,
+                lastServerSyncMillis = if (!chosenIsFromCache && isOnline) nowMillis else null,
+                message = resolvedRejection,
+                rejectionReason = resolvedRejection,
+                isChecking = false,
+                planId = if (hasValidPlan) effectivePlanId else 0,
+                planName = if (hasValidPlan) planName else "تم رفض الطلب",
+                maxCaptains = 0,
+                price = if (hasValidPlan) planPrice else 0,
+                activeCaptainsCount = activeCaptainsCount,
+                availableCaptainSlots = 0,
+                paymentStatus = "rejected",
+                paymentMethod = paymentMethod,
+                senderPhone = senderPhone,
+                transactionReference = transactionReference,
+                receiptStoragePath = receiptStoragePath,
+                subscriptionVersion = version,
+                updatedBy = updatedBy
+            )
+        }
+
+        // Handle Admin request to re-upload/resubmit transfer receipt
+        if (chosenStatus == "resubmission_required") {
+            val resolvedResubmission = resubmissionReason ?: rejectionReason ?: reason
+                ?: "صورة إيصال التحويل غير واضحة. يرجى إعادة رفع صورة واضحة للإيصال وإعادة الإرسال."
+            return SubscriptionStatusState(
+                isSubscribed = false,
+                isExpired = false,
+                isSuspended = false,
+                isCancelled = false,
+                isPending = false,
+                isPendingReview = false,
+                isRejected = false,
+                isResubmissionRequired = true,
+                isOfflineUnverified = !isOnline,
+                isFromCache = chosenIsFromCache,
+                status = "resubmission_required",
+                startDateMillis = startDateMillis,
+                endDateMillis = endDateMillis,
+                lastServerSyncMillis = if (!chosenIsFromCache && isOnline) nowMillis else null,
+                message = resolvedResubmission,
+                rejectionReason = resolvedResubmission,
+                resubmissionReason = resolvedResubmission,
+                isChecking = false,
+                planId = if (hasValidPlan) effectivePlanId else 0,
+                planName = if (hasValidPlan) planName else "مطلوب إعادة إرسال الإيصال",
+                maxCaptains = 0,
+                price = if (hasValidPlan) planPrice else 0,
+                activeCaptainsCount = activeCaptainsCount,
+                availableCaptainSlots = 0,
+                paymentStatus = "resubmission_required",
+                paymentMethod = paymentMethod,
+                senderPhone = senderPhone,
+                transactionReference = transactionReference,
+                receiptStoragePath = receiptStoragePath,
                 subscriptionVersion = version,
                 updatedBy = updatedBy
             )
@@ -710,14 +862,20 @@ object SubscriptionSyncResolver {
             isSuspended = false,
             isCancelled = false,
             isPending = false,
+            isPendingReview = false,
+            isRejected = false,
+            isResubmissionRequired = false,
             isOfflineUnverified = false,
             isFromCache = chosenIsFromCache,
             status = "active",
             startDateMillis = startDateMillis,
+            approvedAtMillis = approvedAtMillis,
             endDateMillis = endDateMillis,
             lastServerSyncMillis = if (!chosenIsFromCache) nowMillis else null,
             message = null,
             suspensionReason = null,
+            rejectionReason = null,
+            resubmissionReason = null,
             serverError = null,
             isChecking = false,
             planId = effectivePlanId,
@@ -728,6 +886,7 @@ object SubscriptionSyncResolver {
             availableCaptainSlots = availableSlots,
             // Admin-activated active subscription is always treated as paid so stale unpaid flags cannot block requests
             paymentStatus = "paid",
+            paymentMethod = paymentMethod,
             subscriptionVersion = version,
             updatedBy = updatedBy
         )
@@ -745,7 +904,7 @@ object SubscriptionSyncResolver {
 
         return when {
             !wasActive && isNowActive && !current.isOfflineUnverified -> SubscriptionTransitionEvent(
-                title = "تم تفعيل الاشتراك ✓",
+                title = "تمت الموافقة على الاشتراك ✓",
                 body = "تم تفعيل ${current.planName} (${current.maxCaptains} كابتن) بنجاح. يمكنك الآن طلب الكباتن.",
                 isActivation = true
             )
@@ -771,9 +930,23 @@ object SubscriptionSyncResolver {
                 body = current.message ?: "انتهت فترة اشتراكك، يرجى تجديد الاشتراك.",
                 isActivation = false
             )
-            !previous.isPending && current.isPending -> SubscriptionTransitionEvent(
-                title = "الاشتراك قيد المراجعة ⏳",
-                body = current.message ?: "طلب اشتراكك قيد المراجعة من الإدارة.",
+            !previous.isRejected && current.isRejected -> SubscriptionTransitionEvent(
+                title = "تم رفض طلب الاشتراك ❌",
+                body = current.rejectionReason ?: current.message ?: "تم رفض طلب الاشتراك من الإدارة.",
+                isActivation = false
+            )
+            !previous.isResubmissionRequired && current.isResubmissionRequired -> SubscriptionTransitionEvent(
+                title = "مطلوب إعادة إرسال الإيصال 📄",
+                body = current.resubmissionReason ?: current.message ?: "يرجى إعادة رفع صورة واضحة لإيصال التحويل وإعادة الإرسال.",
+                isActivation = false
+            )
+            !previous.isPendingReview && current.isPendingReview -> SubscriptionTransitionEvent(
+                title = if (current.status == "pending_review") {
+                    "طلب الاشتراك قيد مراجعة الإدارة ⏳"
+                } else {
+                    "طلب الاشتراك قيد المراجعة ⏳"
+                },
+                body = current.message ?: "تم إرسال طلب اشتراكك للمراجعة من الإدارة.",
                 isActivation = false
             )
             else -> null

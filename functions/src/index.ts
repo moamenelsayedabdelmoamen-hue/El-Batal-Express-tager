@@ -746,6 +746,11 @@ export interface VerifySubscriptionResult {
   subscriptionVersion: number;
   updatedBy?: string;
   reason?: string;
+  rejectionReason?: string;
+  resubmissionReason?: string;
+  paymentMethod?: string;
+  pendingRequestId?: string;
+  approvedAt?: number | null;
 }
 
 const ADMIN_EMAIL_ALLOWLIST = [
@@ -830,11 +835,79 @@ export function normalizeSubscriptionStatus(raw: unknown): string {
     "ملغي", "ملغى", "ملغاة"
   ].includes(s)) return "cancelled";
   if (["expired", "منتهي", "منتهية", "منتهي الصلاحية"].includes(s)) return "expired";
-  if (["pending", "under_review", "in_review", "قيد المراجعة", "معلق", "معلقة", "بانتظار التفعيل"].includes(s)) return "pending";
+  if ([
+    "pending_review", "awaiting_review", "manual_pending", "under_review", "in_review",
+    "في انتظار مراجعة الإدارة", "في انتظار مراجعة الادارة", "قيد مراجعة الإدارة", "بانتظار مراجعة الإدارة"
+  ].includes(s)) return "pending_review";
+  if ([
+    "rejected", "request_rejected", "manual_rejected",
+    "مرفوض", "مرفوضة", "تم رفض الطلب", "تم الرفض"
+  ].includes(s)) return "rejected";
+  if ([
+    "resubmission_required", "resubmit", "resubmit_required", "reupload_receipt", "receipt_resubmission_required",
+    "مطلوب إعادة إرسال الإيصال", "مطلوب اعادة ارسال الايصال", "إعادة إرسال الإيصال", "اعادة ارسال الايصال"
+  ].includes(s)) return "resubmission_required";
+  if (["pending", "قيد المراجعة", "معلق", "معلقة", "بانتظار التفعيل"].includes(s)) return "pending";
   if (["pending_payment", "awaiting_payment", "في انتظار الدفع"].includes(s)) return "pending_payment";
   if (["payment_failed", "failed", "declined"].includes(s)) return "payment_failed";
   if (["unsubscribed", "none", ""].includes(s)) return "unsubscribed";
   return s;
+}
+
+export interface OfficialSubscriptionPlan {
+  planId: number;
+  planName: string;
+  maxCaptains: number;
+  captainLimit: number;
+  price: number;
+  durationDays: number;
+}
+
+export const OFFICIAL_SUBSCRIPTION_PLANS: Record<number, OfficialSubscriptionPlan> = {
+  1: { planId: 1, planName: "الباقة الأساسية", maxCaptains: 2, captainLimit: 2, price: 400, durationDays: 30 },
+  2: { planId: 2, planName: "الباقة المتوسطة", maxCaptains: 4, captainLimit: 4, price: 800, durationDays: 30 },
+  3: { planId: 3, planName: "الباقة المميزة", maxCaptains: 6, captainLimit: 6, price: 1200, durationDays: 30 },
+  4: { planId: 4, planName: "الباقة المتقدمة", maxCaptains: 8, captainLimit: 8, price: 1600, durationDays: 30 }
+};
+
+/**
+ * Resolves a plan STRICTLY from the server-trusted catalog (ignoring any client-tampered price/maxCaptains).
+ */
+export function resolveTrustedServerPlan(rawPlanId: unknown): OfficialSubscriptionPlan | null {
+  const numId = Number(rawPlanId);
+  if (!Number.isInteger(numId)) return null;
+  return OFFICIAL_SUBSCRIPTION_PLANS[numId] || null;
+}
+
+export function normalizeEgyptianMobile(rawPhone: unknown): string | null {
+  const cleaned = String(rawPhone || "")
+    .trim()
+    .replace(/[\s\-()]/g, "");
+  if (!cleaned) return null;
+  let normalized = cleaned;
+  if (normalized.startsWith("+20")) {
+    normalized = "0" + normalized.slice(3);
+  } else if (normalized.startsWith("20") && normalized.length === 12) {
+    normalized = "0" + normalized.slice(2);
+  } else if (normalized.startsWith("1") && normalized.length === 10) {
+    normalized = "0" + normalized;
+  }
+  if (!/^01[0125][0-9]{8}$/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+export function isValidMerchantReceiptStoragePath(merchantId: string, rawPath: unknown): string | null {
+  const cleaned = String(rawPath || "").trim().replace(/^\/+/, "");
+  if (!cleaned || cleaned.includes("..")) return null;
+  const expectedPrefix = `merchants/${merchantId}/subscription_receipts/`;
+  if (!cleaned.startsWith(expectedPrefix)) return null;
+  const fileName = cleaned.slice(expectedPrefix.length);
+  if (!/^[A-Za-z0-9_\-]{6,120}\.(jpg|jpeg|png|webp)$/i.test(fileName)) {
+    return null;
+  }
+  return cleaned;
 }
 
 export function resolvePlanMetadata(rawPlanId: any, rawPlanName: any, rawMaxCaptains: any, rawPrice: any) {
@@ -843,13 +916,7 @@ export function resolvePlanMetadata(rawPlanId: any, rawPlanName: any, rawMaxCapt
     String(rawPlanName || "").includes("المميزة") || String(rawPlanName || "").includes("6") ? 3 :
     String(rawPlanName || "").includes("المتوسطة") || String(rawPlanName || "").includes("4") ? 2 : 1
   );
-  const defaults: Record<number, { planName: string; maxCaptains: number; price: number }> = {
-    1: { planName: "الباقة الأساسية", maxCaptains: 2, price: 400 },
-    2: { planName: "الباقة المتوسطة", maxCaptains: 4, price: 800 },
-    3: { planName: "الباقة المميزة", maxCaptains: 6, price: 1200 },
-    4: { planName: "الباقة المتقدمة", maxCaptains: 8, price: 1600 }
-  };
-  const def = defaults[planId] || defaults[1];
+  const def = OFFICIAL_SUBSCRIPTION_PLANS[planId] || OFFICIAL_SUBSCRIPTION_PLANS[1];
   const planName = String(rawPlanName || "").trim() || def.planName;
   const maxCaptains = Number(rawMaxCaptains) > 0 ? Number(rawMaxCaptains) : def.maxCaptains;
   const price = Number(rawPrice) > 0 ? Number(rawPrice) : def.price;
@@ -1013,7 +1080,7 @@ export function evaluateDualDocSubscription(
       merchVer === subVer &&
       subUpdatedMs === 0 &&
       merchUpdatedMs > 0 &&
-      ["suspended", "inactive", "cancelled", "expired", "pending"].includes(merchSubStatus)
+      ["suspended", "inactive", "cancelled", "expired", "pending", "pending_review", "rejected", "resubmission_required"].includes(merchSubStatus)
     ) {
       effectiveDoc = { ...subData, ...merchantData! };
       effectiveStatus = merchSubStatus;
@@ -1043,6 +1110,9 @@ export function evaluateDualDocSubscription(
       subData.startDate ||
       merchantData!.subscriptionStartDate
   );
+  const approvedAtMs = parseMillis(
+    effectiveDoc.approvedAt || subData.approvedAt || merchantData!.approvedAt || startDateMs
+  );
   const endDateMs = parseMillis(
     effectiveDoc.expiresAt ||
       effectiveDoc.endDate ||
@@ -1053,8 +1123,18 @@ export function evaluateDualDocSubscription(
       merchantData!.subscriptionEndDate
   );
   const remaining = computeRemainingDuration(endDateMs, now);
-  const reason = String(effectiveDoc.suspensionReason || effectiveDoc.cancellationReason || merchantData!.suspensionReason || "").trim();
+  const rejectionReason = String(
+    effectiveDoc.rejectionReason || subData.rejectionReason || merchantData!.rejectionReason || ""
+  ).trim();
+  const resubmissionReason = String(
+    effectiveDoc.resubmissionReason || subData.resubmissionReason || merchantData!.resubmissionReason || ""
+  ).trim();
+  const reason = String(
+    effectiveDoc.suspensionReason || effectiveDoc.cancellationReason || resubmissionReason || rejectionReason || merchantData!.suspensionReason || ""
+  ).trim();
   const updatedBy = String(effectiveDoc.updatedBy || effectiveDoc.updatedByAdminUid || merchantData!.updatedBy || "").trim() || undefined;
+  const paymentMethod = String(effectiveDoc.paymentMethod || subData.paymentMethod || merchantData!.paymentMethod || "").trim() || undefined;
+  const pendingRequestId = String(effectiveDoc.pendingRequestId || subData.pendingRequestId || merchantData!.pendingRequestId || "").trim() || undefined;
   const paymentStatus = String(effectiveDoc.paymentStatus || merchantData!.paymentStatus || "paid").toLowerCase().trim();
 
   // Only treat boolean flags as disabling an "active" doc when Admin explicitly turned BOTH flags off
@@ -1119,12 +1199,12 @@ export function evaluateDualDocSubscription(
         : "تم إلغاء اشتراكك. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة."
     };
   }
-  if (effectiveStatus === "pending") {
+  if (effectiveStatus === "pending_review" || effectiveStatus === "pending") {
     return {
       isValid: false,
       isActive: false,
       isSubscribed: false,
-      status: "pending",
+      status: effectiveStatus === "pending_review" ? "pending_review" : "pending",
       planId: meta.planId,
       planName: meta.planName,
       maxCaptains: 0,
@@ -1141,7 +1221,68 @@ export function evaluateDualDocSubscription(
       remainingCaptains: 0,
       subscriptionVersion: subVersion,
       updatedBy,
-      errorMessage: "اشتراكك قيد المراجعة من الإدارة ولم يتم تفعيله بعد."
+      paymentMethod,
+      pendingRequestId,
+      errorMessage: "طلب الاشتراك في انتظار مراجعة الإدارة ولم يتم تفعيله بعد."
+    };
+  }
+  if (effectiveStatus === "rejected") {
+    const rejectText = rejectionReason || reason || "تم رفض طلب الاشتراك من الإدارة.";
+    return {
+      isValid: false,
+      isActive: false,
+      isSubscribed: false,
+      status: "rejected",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: 0,
+      captainLimit: 0,
+      price: meta.price,
+      startDate: startDateMs,
+      activatedAt: startDateMs,
+      endDate: endDateMs,
+      expiresAt: endDateMs,
+      remainingMillis: 0,
+      remainingDays: 0,
+      remainingHours: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
+      paymentMethod,
+      reason: rejectText,
+      rejectionReason: rejectText,
+      errorMessage: `تم رفض طلب الاشتراك (${rejectText}). يمكنك مراجعة البيانات وإعادة الإرسال.`
+    };
+  }
+  if (effectiveStatus === "resubmission_required") {
+    const resubmitText = resubmissionReason || reason || "يرجى إعادة إرسال صورة واضحة لإيصال التحويل.";
+    return {
+      isValid: false,
+      isActive: false,
+      isSubscribed: false,
+      status: "resubmission_required",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: 0,
+      captainLimit: 0,
+      price: meta.price,
+      startDate: startDateMs,
+      activatedAt: startDateMs,
+      endDate: endDateMs,
+      expiresAt: endDateMs,
+      remainingMillis: 0,
+      remainingDays: 0,
+      remainingHours: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
+      paymentMethod,
+      pendingRequestId,
+      reason: resubmitText,
+      resubmissionReason: resubmitText,
+      errorMessage: `مطلوب إعادة إرسال الإيصال (${resubmitText}). يرجى رفع صورة واضحة للإيصال وإعادة الإرسال.`
     };
   }
   if (
@@ -1263,7 +1404,9 @@ export function evaluateDualDocSubscription(
     activeCaptainsCount,
     remainingCaptains,
     subscriptionVersion: subVersion,
-    updatedBy
+    updatedBy,
+    paymentMethod,
+    approvedAt: approvedAtMs
   };
 }
 
@@ -1370,7 +1513,7 @@ export async function applyAdminSubscriptionUpdate(
   if (!merchantId) {
     throw new functions.https.HttpsError("invalid-argument", "معرف التاجر merchantId مطلوب.");
   }
-  const supportedActions = ["activate", "reactivate", "suspend", "deactivate", "cancel", "change_plan", "extend", "set_pending"];
+  const supportedActions = ["activate", "reactivate", "suspend", "deactivate", "cancel", "change_plan", "extend", "set_pending", "reject", "resubmission_required", "request_resubmission"];
   if (!supportedActions.includes(action)) {
     throw new functions.https.HttpsError(
       "invalid-argument",
@@ -1378,7 +1521,8 @@ export async function applyAdminSubscriptionUpdate(
     );
   }
 
-  const reason = String(data?.reason || "").trim();
+  const reason = String(data?.reason || data?.resubmissionReason || data?.rejectionReason || "").trim();
+  const explicitRequestId = String(data?.requestId || "").trim();
   const durationDays = Math.max(1, Math.min(3650, Number(data?.durationDays || 30)));
   // Merchant approval is strictly independent from subscription activation unless explicitly requested by Admin.
   const explicitApproveMerchant = data?.approveMerchant === true;
@@ -1435,6 +1579,7 @@ export async function applyAdminSubscriptionUpdate(
       const endTs = admin.firestore.Timestamp.fromMillis(endMs);
       const willApproveMerchant = explicitApproveMerchant && existingMerchantStatus !== "approved" && existingMerchantStatus !== "active";
       const resultingMerchantStatus = willApproveMerchant ? "approved" : existingMerchantStatus;
+      const linkedRequestId = explicitRequestId || String(existingSub.pendingRequestId || existingMerch.pendingRequestId || "").trim();
 
       transaction.set(subRef, {
         merchantId,
@@ -1450,10 +1595,15 @@ export async function applyAdminSubscriptionUpdate(
         price: meta.price,
         startDate: startTs,
         activatedAt: startTs,
+        approvedAt: startTs,
+        approvedBy: adminUid,
         endDate: endTs,
         expiresAt: endTs,
         suspensionReason: admin.firestore.FieldValue.delete(),
         cancellationReason: admin.firestore.FieldValue.delete(),
+        rejectionReason: admin.firestore.FieldValue.delete(),
+        resubmissionReason: admin.firestore.FieldValue.delete(),
+        pendingRequestId: admin.firestore.FieldValue.delete(),
         expiryNotifiedAt: admin.firestore.FieldValue.delete(),
         updatedBy: adminUid,
         updatedByAdminUid: adminUid,
@@ -1480,6 +1630,9 @@ export async function applyAdminSubscriptionUpdate(
         subscriptionEndDate: endTs,
         expiresAt: endTs,
         suspensionReason: admin.firestore.FieldValue.delete(),
+        rejectionReason: admin.firestore.FieldValue.delete(),
+        resubmissionReason: admin.firestore.FieldValue.delete(),
+        pendingRequestId: admin.firestore.FieldValue.delete(),
         updatedBy: adminUid,
         subscriptionVersion: nextVersion,
         subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1493,15 +1646,176 @@ export async function applyAdminSubscriptionUpdate(
       }
       transaction.set(merchantRef, merchantUpdate, { merge: true });
 
+      if (linkedRequestId) {
+        const reqRef = targetDb.collection("subscription_requests").doc(linkedRequestId);
+        transaction.set(reqRef, {
+          status: "approved",
+          reviewedBy: adminUid,
+          reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+          approvedAt: startTs,
+          startDate: startTs,
+          endDate: endTs,
+          rejectionReason: admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+
       return {
         previousStatus,
         status: "active",
         subscriptionVersion: nextVersion,
         startDateMs: startMs,
         endDateMs: endMs,
+        requestId: linkedRequestId || null,
         merchantStatus: resultingMerchantStatus,
         merchantApproved: resultingMerchantStatus === "approved" || resultingMerchantStatus === "active",
         merchantApprovedExplicitly: willApproveMerchant,
+        ...meta
+      };
+    }
+
+    if (action === "reject") {
+      const rejectReason = reason || "تم رفض طلب الاشتراك من الإدارة. يرجى مراجعة إيصال التحويل وإعادة المحاولة.";
+      const linkedRequestId = explicitRequestId || String(existingSub.pendingRequestId || existingMerch.pendingRequestId || "").trim();
+
+      transaction.set(subRef, {
+        merchantId,
+        status: "rejected",
+        subscriptionStatus: "rejected",
+        isActive: false,
+        isSubscribed: false,
+        paymentStatus: "rejected",
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        price: meta.price,
+        rejectionReason: rejectReason,
+        suspensionReason: admin.firestore.FieldValue.delete(),
+        pendingRequestId: admin.firestore.FieldValue.delete(),
+        rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+        rejectedBy: adminUid,
+        updatedBy: adminUid,
+        updatedByAdminUid: adminUid,
+        subscriptionVersion: nextVersion,
+        lastAuditLoggedVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      transaction.set(merchantRef, {
+        subscriptionStatus: "rejected",
+        isActive: false,
+        isSubscribed: false,
+        paymentStatus: "rejected",
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        price: meta.price,
+        rejectionReason: rejectReason,
+        pendingRequestId: admin.firestore.FieldValue.delete(),
+        updatedBy: adminUid,
+        subscriptionVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      if (linkedRequestId) {
+        const reqRef = targetDb.collection("subscription_requests").doc(linkedRequestId);
+        transaction.set(reqRef, {
+          status: "rejected",
+          rejectionReason: rejectReason,
+          reviewedBy: adminUid,
+          reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+
+      return {
+        previousStatus,
+        status: "rejected",
+        subscriptionVersion: nextVersion,
+        reason: rejectReason,
+        rejectionReason: rejectReason,
+        requestId: linkedRequestId || null,
+        merchantStatus: existingMerchantStatus,
+        merchantApproved: existingMerchantStatus === "approved" || existingMerchantStatus === "active",
+        merchantApprovedExplicitly: false,
+        ...meta
+      };
+    }
+
+    if (action === "resubmission_required" || action === "request_resubmission") {
+      const resubmitReason = reason || "يرجى إعادة إرسال صورة واضحة لإيصال تحويل فودافون كاش.";
+      const linkedRequestId = explicitRequestId || String(existingSub.pendingRequestId || existingMerch.pendingRequestId || "").trim();
+
+      transaction.set(subRef, {
+        merchantId,
+        status: "resubmission_required",
+        subscriptionStatus: "resubmission_required",
+        isActive: false,
+        isSubscribed: false,
+        paymentStatus: "resubmission_required",
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        price: meta.price,
+        resubmissionReason: resubmitReason,
+        rejectionReason: admin.firestore.FieldValue.delete(),
+        suspensionReason: admin.firestore.FieldValue.delete(),
+        pendingRequestId: admin.firestore.FieldValue.delete(),
+        resubmissionRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+        resubmissionRequestedBy: adminUid,
+        updatedBy: adminUid,
+        updatedByAdminUid: adminUid,
+        subscriptionVersion: nextVersion,
+        lastAuditLoggedVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      transaction.set(merchantRef, {
+        subscriptionStatus: "resubmission_required",
+        isActive: false,
+        isSubscribed: false,
+        paymentStatus: "resubmission_required",
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        price: meta.price,
+        resubmissionReason: resubmitReason,
+        rejectionReason: admin.firestore.FieldValue.delete(),
+        pendingRequestId: admin.firestore.FieldValue.delete(),
+        updatedBy: adminUid,
+        subscriptionVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      if (linkedRequestId) {
+        const reqRef = targetDb.collection("subscription_requests").doc(linkedRequestId);
+        transaction.set(reqRef, {
+          status: "resubmission_required",
+          resubmissionReason: resubmitReason,
+          reviewedBy: adminUid,
+          reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+
+      return {
+        previousStatus,
+        status: "resubmission_required",
+        subscriptionVersion: nextVersion,
+        reason: resubmitReason,
+        resubmissionReason: resubmitReason,
+        requestId: linkedRequestId || null,
+        merchantStatus: existingMerchantStatus,
+        merchantApproved: existingMerchantStatus === "approved" || existingMerchantStatus === "active",
+        merchantApprovedExplicitly: false,
         ...meta
       };
     }
@@ -2011,13 +2325,22 @@ export async function applySubscriptionWriteSync(
     const rawLimit = isActive
       ? resolvedMeta.captainLimit
       : Number(data.captainLimit || data.maxCaptains || 0);
-    const maxCaptains = normalizedStatus === "cancelled" || normalizedStatus === "pending" ? 0 : rawLimit;
+    const maxCaptains =
+      normalizedStatus === "cancelled" ||
+      normalizedStatus === "pending" ||
+      normalizedStatus === "pending_review" ||
+      normalizedStatus === "rejected" ||
+      normalizedStatus === "resubmission_required"
+        ? 0
+        : rawLimit;
     const resolvedPlanId = isActive ? resolvedMeta.planId : Number(data.planId || mData.planId || 0);
     const resolvedPlanName = String(data.planName || (isActive ? resolvedMeta.planName : mData.planName || "")).trim();
     const resolvedPrice = Number(data.price || (isActive ? resolvedMeta.price : mData.price || 0));
     const resolvedPaymentStatus = isActive
       ? "paid"
       : String(data.paymentStatus || mData.paymentStatus || "unpaid").toLowerCase().trim();
+    const incomingRejectionReason = String(data.rejectionReason || "").trim();
+    const incomingResubmissionReason = String(data.resubmissionReason || "").trim();
 
     const prevLimit = Number(before.captainLimit || before.maxCaptains || 0);
     const prevEndMs = parseMillis(before.expiresAt || before.endDate || before.subscriptionEndDate);
@@ -2092,6 +2415,18 @@ export async function applySubscriptionWriteSync(
       pushBody = incomingReason
         ? `تم إلغاء اشتراكك (${incomingReason}). يرجى التواصل مع الإدارة.`
         : "تم إلغاء اشتراكك من الإدارة. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة.";
+    } else if (statusChanged && normalizedStatus === "rejected") {
+      pushType = "SUBSCRIPTION_REJECTED";
+      pushTitle = "تم رفض طلب الاشتراك ❌";
+      pushBody = incomingRejectionReason
+        ? `تم رفض طلب الاشتراك: ${incomingRejectionReason}`
+        : "تم رفض طلب الاشتراك من الإدارة. يرجى مراجعة البيانات وإعادة المحاولة.";
+    } else if (statusChanged && normalizedStatus === "resubmission_required") {
+      pushType = "SUBSCRIPTION_RESUBMISSION_REQUIRED";
+      pushTitle = "مطلوب إعادة إرسال إيصال التحويل 📄";
+      pushBody = incomingResubmissionReason
+        ? `يرجى إعادة رفع الإيصال: ${incomingResubmissionReason}`
+        : "طلبت الإدارة إعادة إرسال صورة واضحة لإيصال تحويل فودافون كاش.";
     } else if (statusChanged && normalizedStatus === "expired" && data.updatedBy !== "system_expiry_scheduler") {
       pushType = "SUBSCRIPTION_EXPIRED";
       pushTitle = "انتهى اشتراكك ⌛";
@@ -2199,6 +2534,24 @@ export async function applySubscriptionWriteSync(
       } else if (isActive) {
         mirrorPayload.suspensionReason = admin.firestore.FieldValue.delete();
       }
+      if (incomingRejectionReason) {
+        mirrorPayload.rejectionReason = incomingRejectionReason;
+      } else if (isActive || normalizedStatus === "pending_review" || normalizedStatus === "resubmission_required") {
+        mirrorPayload.rejectionReason = admin.firestore.FieldValue.delete();
+      }
+      if (incomingResubmissionReason) {
+        mirrorPayload.resubmissionReason = incomingResubmissionReason;
+      } else if (isActive || normalizedStatus === "pending_review" || normalizedStatus === "rejected") {
+        mirrorPayload.resubmissionReason = admin.firestore.FieldValue.delete();
+      }
+      if (data.pendingRequestId) {
+        mirrorPayload.pendingRequestId = data.pendingRequestId;
+      } else if (isActive || normalizedStatus === "rejected" || normalizedStatus === "resubmission_required") {
+        mirrorPayload.pendingRequestId = admin.firestore.FieldValue.delete();
+      }
+      if (data.paymentMethod) {
+        mirrorPayload.paymentMethod = data.paymentMethod;
+      }
       transaction.set(merchRef, mirrorPayload, { merge: true });
     }
 
@@ -2297,6 +2650,10 @@ export async function applyMerchantSubscriptionWriteSync(
     "subscriptionEndDate",
     "expiresAt",
     "suspensionReason",
+    "rejectionReason",
+    "resubmissionReason",
+    "pendingRequestId",
+    "paymentMethod",
     "paymentStatus",
     "subscriptionVersion"
   ];
@@ -2355,7 +2712,7 @@ export async function applyMerchantSubscriptionWriteSync(
     const afterPlanName = String(after.planName || (isActive ? resolvedMeta.planName : sData.planName || "")).trim();
     const afterMax = isActive
       ? resolvedMeta.captainLimit
-      : merchStatus === "cancelled" || merchStatus === "pending"
+      : merchStatus === "cancelled" || merchStatus === "pending" || merchStatus === "pending_review" || merchStatus === "rejected" || merchStatus === "resubmission_required"
         ? 0
         : Number(after.captainLimit || after.maxCaptains || 0);
     const afterPrice = Number(after.price || (isActive ? resolvedMeta.price : sData.price || 0));
@@ -3008,5 +3365,508 @@ export const createOrderWithCode = functions
   .https.onCall(async (data, context) => {
     return executeServerOrderCreation(context, data || {}, "createOrderWithCode");
   });
+
+export interface ManualSubscriptionRequestInput {
+  merchantId: string;
+  planId?: unknown;
+  packageId?: unknown;
+  planName?: unknown;
+  maxCaptains?: unknown;
+  expectedAmount?: unknown;
+  amount?: unknown;
+  senderPhone: unknown;
+  transactionReference?: unknown;
+  notes?: unknown;
+  receiptStoragePath: unknown;
+  requestId?: unknown;
+  idempotencyKey?: unknown;
+  nowMs?: number;
+}
+
+/**
+ * Enforces that the requested merchantId (if supplied by the client) strictly matches
+ * the authenticated Firebase Auth UID. Prevents cross-merchant impersonation.
+ */
+export function assertManualRequestMerchantOwnership(
+  authUid: string,
+  requestedMerchantId: unknown
+): string {
+  const cleanAuthUid = String(authUid || "").trim();
+  if (!cleanAuthUid) {
+    throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً لإرسال طلب الاشتراك.");
+  }
+  const requested = String(requestedMerchantId ?? "").trim();
+  if (requested && requested !== cleanAuthUid) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "لا يمكنك إرسال طلب اشتراك لحساب تاجر آخر."
+    );
+  }
+  return cleanAuthUid;
+}
+
+export interface ReceiptVerificationResult {
+  exists: boolean;
+  sizeBytes?: number;
+  contentType?: string;
+}
+
+export async function defaultVerifyReceiptInStorage(
+  storagePath: string
+): Promise<ReceiptVerificationResult> {
+  const candidateBuckets: string[] = [];
+  try {
+    const defaultBucket = admin.storage().bucket();
+    if (defaultBucket?.name) candidateBuckets.push(defaultBucket.name);
+  } catch {
+    // Ignore default bucket lookup error and try explicit buckets below
+  }
+  const projectId =
+    process.env.GCLOUD_PROJECT ||
+    process.env.GCP_PROJECT ||
+    admin.app().options.projectId ||
+    "el-batal-express-956ae";
+  for (const name of [
+    `${projectId}.firebasestorage.app`,
+    `${projectId}.appspot.com`
+  ]) {
+    if (name && !candidateBuckets.includes(name)) {
+      candidateBuckets.push(name);
+    }
+  }
+
+  for (const bucketName of candidateBuckets) {
+    try {
+      const bucket = admin.storage().bucket(bucketName);
+      const file = bucket.file(storagePath);
+      const [exists] = await file.exists();
+      if (exists) {
+        const [metadata] = await file.getMetadata();
+        return {
+          exists: true,
+          sizeBytes: Number(metadata.size || 0),
+          contentType: String(metadata.contentType || "")
+        };
+      }
+    } catch (err: any) {
+      console.warn(
+        `[ManualSubscription] Storage check warning on bucket ${bucketName} for ${storagePath}: ${err?.message || err}`
+      );
+    }
+  }
+  return { exists: false };
+}
+
+/**
+ * Core atomic transactional handler for manual Vodafone Cash subscription requests.
+ * Security invariants enforced:
+ * 1. Plan price, maxCaptains, and durationDays come EXCLUSIVELY from `OFFICIAL_SUBSCRIPTION_PLANS` (client values ignored).
+ * 2. Receipt path MUST belong to `merchants/{merchantId}/subscription_receipts/{file}` and MUST exist in Firebase Storage.
+ * 3. Subscription NEVER activates here — status is strictly set to `pending_review` with `isActive: false`, `isSubscribed: false`, `maxCaptains: 0`.
+ * 4. Duplicate concurrent or repeat submissions are blocked via Firestore Transaction + idempotency key + pending/active status check.
+ */
+export async function applyManualSubscriptionRequest(
+  targetDb: FirebaseFirestore.Firestore,
+  input: ManualSubscriptionRequestInput,
+  verifyReceipt: (storagePath: string) => Promise<ReceiptVerificationResult> = defaultVerifyReceiptInStorage
+) {
+  const merchantId = String(input.merchantId || "").trim();
+  if (!merchantId) {
+    throw new functions.https.HttpsError("unauthenticated", "معرف التاجر مطلوب.");
+  }
+
+  // 1. Validate plan STRICTLY against server-trusted catalog (ignore client-supplied price/maxCaptains)
+  const trustedPlan = resolveTrustedServerPlan(input.planId ?? input.packageId);
+  if (!trustedPlan) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "الباقة المختارة غير صالحة. يرجى اختيار إحدى الباقات الرسمية المتاحة."
+    );
+  }
+
+  // 2. Validate Egyptian sender phone number
+  const normalizedSenderPhone = normalizeEgyptianMobile(input.senderPhone);
+  if (!normalizedSenderPhone) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "يرجى إدخال رقم الهاتف المحوَّل منه بشكل صحيح (رقم مصري يبدأ بـ 01)."
+    );
+  }
+
+  // 3. Validate transaction reference & optional notes (sanitized)
+  const transactionReference = String(input.transactionReference || "").trim().slice(0, 80);
+  const notes = String(input.notes || "").trim().slice(0, 500);
+
+  // 4. Validate receipt Storage path ownership & format
+  const verifiedStoragePath = isValidMerchantReceiptStoragePath(merchantId, input.receiptStoragePath);
+  if (!verifiedStoragePath) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "مسار صورة إيصال التحويل غير صالح أو لا يتبع حسابك. يرجى رفع صورة الإيصال من جديد."
+    );
+  }
+
+  // 5. Verify uploaded receipt actually exists in Firebase Storage and is a valid image
+  const storageCheck = await verifyReceipt(verifiedStoragePath);
+  if (!storageCheck.exists) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "لم يتم العثور على صورة إيصال التحويل في Firebase Storage. يرجى رفع الإيصال أولاً قبل إرسال الطلب."
+    );
+  }
+  if (
+    typeof storageCheck.sizeBytes === "number" &&
+    storageCheck.sizeBytes <= 0
+  ) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "ملف إيصال التحويل فارغ أو تالف. يرجى رفع صورة واضحة للإيصال."
+    );
+  }
+  if (
+    storageCheck.contentType &&
+    !/^image\/(jpeg|jpg|png|webp)$/i.test(storageCheck.contentType)
+  ) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "نوع ملف الإيصال غير مدعوم. يرجى رفع صورة بصيغة JPG أو PNG أو WEBP."
+    );
+  }
+
+  const rawRequestId = String(input.requestId || input.idempotencyKey || "").trim();
+  const safeRequestId = /^[A-Za-z0-9_\-]{6,100}$/.test(rawRequestId)
+    ? rawRequestId
+    : `subreq_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+  const nowMs = input.nowMs ?? Date.now();
+
+  return targetDb.runTransaction(async (transaction) => {
+    const merchantRef = targetDb.collection("merchants").doc(merchantId);
+    const subRef = targetDb.collection("subscriptions").doc(merchantId);
+    const reqRef = targetDb.collection("subscription_requests").doc(safeRequestId);
+
+    const [merchantSnap, subSnap, existingReqSnap] = await Promise.all([
+      transaction.get(merchantRef),
+      transaction.get(subRef),
+      transaction.get(reqRef)
+    ]);
+
+    if (!merchantSnap.exists || !isMerchantAccountDoc(merchantSnap.data())) {
+      throw new functions.https.HttpsError("not-found", "تعذر العثور على حساب التاجر في قاعدة البيانات.");
+    }
+
+    // Idempotent replay check: if the exact same requestId was already submitted by this merchant, return it safely
+    if (existingReqSnap.exists) {
+      const existingReq = existingReqSnap.data() || {};
+      if (existingReq.merchantId !== merchantId) {
+        throw new functions.https.HttpsError("permission-denied", "معرف الطلب لا يتبع هذا التاجر.");
+      }
+      return {
+        success: true,
+        isReplay: true,
+        requestId: safeRequestId,
+        merchantId,
+        status: String(existingReq.status || "pending_review"),
+        planId: Number(existingReq.planId || trustedPlan.planId),
+        packageId: Number(existingReq.packageId || existingReq.planId || trustedPlan.planId),
+        planName: String(existingReq.planName || trustedPlan.planName),
+        maxCaptains: Number(existingReq.maxCaptains || trustedPlan.maxCaptains),
+        expectedAmount: Number(existingReq.expectedAmount || trustedPlan.price),
+        amount: Number(existingReq.amount || existingReq.expectedAmount || trustedPlan.price),
+        durationDays: Number(existingReq.durationDays || trustedPlan.durationDays),
+        paymentMethod: "vodafone_cash_manual",
+        notes: String(existingReq.notes || ""),
+        receiptStoragePath: String(existingReq.receiptStoragePath || verifiedStoragePath),
+        subscriptionVersion: Number(existingReq.subscriptionVersion || 1),
+        message: "تم استلام طلب الاشتراك مسبقاً وهو حالياً في انتظار مراجعة الإدارة."
+      };
+    }
+
+    const merchData = merchantSnap.data() || {};
+    const subData = subSnap.exists ? (subSnap.data() || {}) : {};
+    const currentStatus = normalizeSubscriptionStatus(
+      subSnap.exists
+        ? (subData.status || subData.subscriptionStatus)
+        : merchData.subscriptionStatus
+    );
+    const currentEndMs = parseMillis(
+      subData.expiresAt || subData.endDate || merchData.expiresAt || merchData.subscriptionEndDate
+    );
+
+    // Block duplicate submission if a pending_review request already exists
+    if (currentStatus === "pending_review" || currentStatus === "pending") {
+      throw new functions.https.HttpsError(
+        "already-exists",
+        "لديك بالفعل طلب اشتراك في انتظار مراجعة الإدارة حالياً. يرجى انتظار قرار الإدارة قبل إرسال طلب جديد."
+      );
+    }
+
+    // Block duplicate submission if merchant already has an active unexpired subscription
+    if (
+      currentStatus === "active" &&
+      subData.isActive !== false &&
+      (currentEndMs === null || currentEndMs > nowMs)
+    ) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "لديك اشتراك فعال وساري حالياً. لا يمكن إرسال طلب اشتراك جديد قبل انتهاء الباقة الحالية."
+      );
+    }
+
+    const nextVersion =
+      Math.max(Number(subData.subscriptionVersion || 0), Number(merchData.subscriptionVersion || 0)) + 1;
+    const merchantName = String(merchData.name || merchData.restaurantName || "").trim();
+    const merchantEmail = String(merchData.email || "").trim();
+    const merchantPhone = String(merchData.phone || "").trim();
+
+    // 1. Write immutable manual subscription request document for Admin Dashboard review queue
+    transaction.set(reqRef, {
+      requestId: safeRequestId,
+      merchantId,
+      merchantName,
+      merchantEmail,
+      merchantPhone,
+      planId: trustedPlan.planId,
+      packageId: trustedPlan.planId,
+      planName: trustedPlan.planName,
+      maxCaptains: trustedPlan.maxCaptains,
+      captainLimit: trustedPlan.captainLimit,
+      expectedAmount: trustedPlan.price,
+      amount: trustedPlan.price,
+      price: trustedPlan.price,
+      durationDays: trustedPlan.durationDays,
+      paymentMethod: "vodafone_cash_manual",
+      senderPhone: normalizedSenderPhone,
+      transactionReference,
+      notes,
+      receiptStoragePath: verifiedStoragePath,
+      receiptContentType: storageCheck.contentType || "image/jpeg",
+      receiptSizeBytes: storageCheck.sizeBytes || 0,
+      status: "pending_review",
+      subscriptionVersion: nextVersion,
+      submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 2. Update canonical subscriptions/{merchantId} to pending_review (NEVER active!)
+    transaction.set(
+      subRef,
+      {
+        merchantId,
+        status: "pending_review",
+        subscriptionStatus: "pending_review",
+        isActive: false,
+        isSubscribed: false,
+        paymentStatus: "pending_review",
+        paymentMethod: "vodafone_cash_manual",
+        planId: trustedPlan.planId,
+        packageId: trustedPlan.planId,
+        planName: trustedPlan.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        requestedMaxCaptains: trustedPlan.maxCaptains,
+        price: trustedPlan.price,
+        amount: trustedPlan.price,
+        durationDays: trustedPlan.durationDays,
+        pendingRequestId: safeRequestId,
+        senderPhone: normalizedSenderPhone,
+        transactionReference,
+        notes,
+        receiptStoragePath: verifiedStoragePath,
+        rejectionReason: admin.firestore.FieldValue.delete(),
+        resubmissionReason: admin.firestore.FieldValue.delete(),
+        suspensionReason: admin.firestore.FieldValue.delete(),
+        updatedBy: merchantId,
+        subscriptionVersion: nextVersion,
+        lastAuditLoggedVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    // 3. Mirror pending_review onto merchants/{merchantId} (keeping merchant account approval independent)
+    transaction.set(
+      merchantRef,
+      {
+        subscriptionStatus: "pending_review",
+        isActive: false,
+        isSubscribed: false,
+        paymentStatus: "pending_review",
+        paymentMethod: "vodafone_cash_manual",
+        planId: trustedPlan.planId,
+        planName: trustedPlan.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        price: trustedPlan.price,
+        pendingRequestId: safeRequestId,
+        rejectionReason: admin.firestore.FieldValue.delete(),
+        resubmissionReason: admin.firestore.FieldValue.delete(),
+        updatedBy: merchantId,
+        subscriptionVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    return {
+      success: true,
+      isReplay: false,
+      requestId: safeRequestId,
+      merchantId,
+      status: "pending_review",
+      planId: trustedPlan.planId,
+      packageId: trustedPlan.planId,
+      planName: trustedPlan.planName,
+      maxCaptains: trustedPlan.maxCaptains,
+      expectedAmount: trustedPlan.price,
+      amount: trustedPlan.price,
+      durationDays: trustedPlan.durationDays,
+      paymentMethod: "vodafone_cash_manual",
+      senderPhone: normalizedSenderPhone,
+      transactionReference,
+      notes,
+      receiptStoragePath: verifiedStoragePath,
+      subscriptionVersion: nextVersion,
+      message: "تم إرسال طلب الاشتراك بنجاح وهو الآن في انتظار مراجعة الإدارة."
+    };
+  });
+}
+
+/**
+ * Merchant Callable Cloud Function: Submits a manual Vodafone Cash subscription request for Admin review.
+ * Never activates the subscription; only transitions state to `pending_review` after validating auth,
+ * server-trusted plan pricing, Firebase Storage receipt ownership/existence, and duplicate guards.
+ */
+export const submitManualSubscriptionRequest = functions
+  .region("us-central1")
+  .https.onCall(async (data, context) => {
+    if (!context.auth || !context.auth.uid) {
+      throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً لإرسال طلب الاشتراك.");
+    }
+    if (context.auth.token.email_verified !== true) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "يجب تأكيد البريد الإلكتروني أولاً قبل إرسال طلب الاشتراك."
+      );
+    }
+
+    const uid = assertManualRequestMerchantOwnership(context.auth.uid, data?.merchantId);
+
+    const result = await applyManualSubscriptionRequest(db, {
+      merchantId: uid,
+      planId: data?.planId ?? data?.packageId,
+      packageId: data?.packageId ?? data?.planId,
+      planName: data?.planName,
+      maxCaptains: data?.maxCaptains,
+      expectedAmount: data?.expectedAmount ?? data?.amount,
+      amount: data?.amount ?? data?.expectedAmount,
+      senderPhone: data?.senderPhone,
+      transactionReference: data?.transactionReference,
+      notes: data?.notes,
+      receiptStoragePath: data?.receiptStoragePath,
+      requestId: data?.requestId,
+      idempotencyKey: data?.idempotencyKey
+    });
+
+    if (!result.isReplay) {
+      await writeOperationLog({
+        type: "manual_subscription_request_submitted",
+        action: "submit_manual_vodafone_cash",
+        merchantId: uid,
+        actorUid: uid,
+        actorRole: "merchant",
+        requestId: result.requestId,
+        planId: result.planId,
+        packageId: result.packageId,
+        planName: result.planName,
+        expectedAmount: result.expectedAmount,
+        amount: result.amount,
+        maxCaptains: result.maxCaptains,
+        paymentMethod: "vodafone_cash_manual",
+        receiptStoragePath: result.receiptStoragePath,
+        newStatus: "pending_review",
+        subscriptionVersion: result.subscriptionVersion,
+        success: true
+      });
+    }
+
+    return result;
+  });
+
+/**
+ * Trusted Admin Callable for reviewing a manual Vodafone Cash subscription request
+ * (`approve`, `reject`, or `resubmission_required`).
+ * Delegates directly to `applyAdminSubscriptionUpdate` so canonical `subscriptions/{merchantId}`,
+ * `merchants/{merchantId}`, `subscription_requests/{requestId}`, and `operation_logs` stay 100% consistent.
+ */
+export const adminReviewManualSubscriptionRequest = functions
+  .region("us-central1")
+  .https.onCall(async (data, context) => {
+    const authorizedAdmin = await isAdminCaller(context);
+    if (!authorizedAdmin || !context.auth) {
+      throw new functions.https.HttpsError("permission-denied", "هذه العملية مسموحة لمسؤولي الإدارة فقط.");
+    }
+
+    const requestId = String(data?.requestId || "").trim();
+    const decision = String(data?.decision || data?.action || "").toLowerCase().trim();
+    if (!requestId) {
+      throw new functions.https.HttpsError("invalid-argument", "معرف الطلب requestId مطلوب.");
+    }
+    if (!["approve", "activate", "reject", "resubmission_required", "request_resubmission"].includes(decision)) {
+      throw new functions.https.HttpsError("invalid-argument", "القرار يجب أن يكون approve أو reject أو resubmission_required.");
+    }
+
+    const reqSnap = await db.collection("subscription_requests").doc(requestId).get();
+    if (!reqSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "طلب الاشتراك غير موجود.");
+    }
+    const reqData = reqSnap.data() || {};
+    const merchantId = String(reqData.merchantId || data?.merchantId || "").trim();
+    if (!merchantId) {
+      throw new functions.https.HttpsError("failed-precondition", "بيانات التاجر غير مكتملة في الطلب.");
+    }
+
+    const mappedAction =
+      decision === "reject"
+        ? "reject"
+        : decision === "resubmission_required" || decision === "request_resubmission"
+          ? "resubmission_required"
+          : "activate";
+    const adminUid = context.auth.uid;
+    const result = await applyAdminSubscriptionUpdate(db, adminUid, {
+      merchantId,
+      action: mappedAction,
+      requestId,
+      planId: data?.planId ?? reqData.planId,
+      planName: data?.planName ?? reqData.planName,
+      captainLimit: data?.captainLimit ?? reqData.maxCaptains,
+      price: data?.price ?? reqData.expectedAmount,
+      durationDays: data?.durationDays ?? reqData.durationDays ?? 30,
+      reason: data?.resubmissionReason ?? data?.rejectionReason ?? data?.reason ?? "",
+      approveMerchant: data?.approveMerchant === true
+    });
+
+    await writeOperationLog({
+      type: "admin_manual_subscription_review",
+      action: mappedAction,
+      requestId,
+      merchantId,
+      actorUid: adminUid,
+      actorRole: "admin",
+      previousStatus: result.previousStatus,
+      newStatus: result.status,
+      planId: result.planId,
+      planName: result.planName,
+      captainLimit: result.captainLimit,
+      reason: result.reason || null,
+      subscriptionVersion: result.subscriptionVersion,
+      success: true
+    });
+
+    return result;
+  });
+
 
 

@@ -305,6 +305,12 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private val _subscriptionStatus = MutableStateFlow(SubscriptionStatusState())
     val subscriptionStatus: StateFlow<SubscriptionStatusState> = _subscriptionStatus.asStateFlow()
 
+    private val _vodafoneCashSettings = MutableStateFlow(VodafoneCashSettings(isLoading = true))
+    val vodafoneCashSettings: StateFlow<VodafoneCashSettings> = _vodafoneCashSettings.asStateFlow()
+
+    private val _manualSubscriptionUiState = MutableStateFlow<ManualSubscriptionUiState>(ManualSubscriptionUiState.Idle)
+    val manualSubscriptionUiState: StateFlow<ManualSubscriptionUiState> = _manualSubscriptionUiState.asStateFlow()
+
     private val _pushNotificationState = MutableStateFlow<PushNotificationBanner?>(null)
     val pushNotificationState: StateFlow<PushNotificationBanner?> = _pushNotificationState.asStateFlow()
 
@@ -1060,8 +1066,9 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
     fun isOrderActiveForCaptainLimit(status: String): Boolean {
         val s = status.trim().lowercase(Locale.ROOT)
+        if (s.isEmpty()) return false
         val isCompleted = s in listOf("completed", "delivered", "تم التسليم", "تم التوصيل", "مكتمل", "مكتملة", "تم") ||
-            s.contains("مكتمل") || s.contains("تسليم") || s.contains("توصيل بنجاح") || s.contains("deliver")
+            s.contains("مكتمل") || s.contains("تسليم") || s.contains("توصيل بنجاح") || s.contains("delivered")
         val isCancelled = s in listOf("cancelled", "canceled", "ملغي", "ملغية", "تم الإلغاء", "تم الالغاء") ||
             s.contains("ملغ") || s.contains("cancel")
         return !isCompleted && !isCancelled
@@ -2411,45 +2418,123 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    @Suppress("UNUSED_PARAMETER")
-    fun selectSubscriptionPlan(
-        planId: Int,
-        planName: String,
-        maxCaptains: Int,
-        price: Int,
-        walletPhone: String = "",
-        onSuccess: () -> Unit = {}
-    ) {
-        // Client must NEVER activate a subscription or write paymentStatus=paid.
-        // Only Admin Dashboard (`adminUpdateMerchantSubscription`) or Paymob's verified webhook may activate.
-        checkAndListenToRestaurantSubscription()
-        refreshSubscriptionFromServer()
-        _snackbarMessage.value = "طلب الاشتراك قيد المراجعة / التأكيد من السيرفر. سيتم تفعيل الباقة تلقائياً فور تأكيد الدفع أو موافقة الإدارة."
+    fun loadVodafoneCashSettings() {
+        viewModelScope.launch {
+            _vodafoneCashSettings.value = _vodafoneCashSettings.value.copy(isLoading = true, loadError = null)
+            val fetched = subscriptionRepository.fetchVodafoneCashSettings()
+            _vodafoneCashSettings.value = fetched
+        }
     }
 
-    fun markSubscriptionPaymentFailed(reason: String = "فشل عملية الدفع ولم يتم تأكيد الاشتراك من السيرفر") {
-        val currentSub = _subscriptionStatus.value
-        if (currentSub.canRequestCaptain()) {
-            _snackbarMessage.value = "باقتك الحالية نشطة وسارية ولا يمكن تغييرها قبل انتهائها."
+    fun resetManualSubscriptionUiState() {
+        _manualSubscriptionUiState.value = ManualSubscriptionUiState.Idle
+    }
+
+    /**
+     * Full manual Vodafone Cash subscription submission flow:
+     * 1. Validates inputs & ensures no active/pending_review duplicate exists.
+     * 2. Uploads receipt image EXCLUSIVELY to Firebase Storage (`merchants/{uid}/subscription_receipts/{reqId}.jpg`).
+     * 3. Calls Cloud Function `submitManualSubscriptionRequest` (region us-central1) to record `pending_review`.
+     * 4. Refreshes server subscription state (never activates locally).
+     */
+    fun submitManualVodafoneSubscription(
+        plan: SubscriptionPlanOption,
+        senderPhone: String,
+        transactionReference: String,
+        receiptLocalUri: String?,
+        notes: String = "",
+        onSuccess: (ManualSubscriptionSubmissionResult) -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        // Guard against concurrent double-taps
+        if (_manualSubscriptionUiState.value is ManualSubscriptionUiState.Submitting) {
             return
         }
 
-        // Keep failure feedback local. Only the verified server webhook or Admin may mutate subscription records.
-        _subscriptionStatus.value = _subscriptionStatus.value.copy(
-            isChecking = false,
-            isSubscribed = false,
-            isExpired = false,
-            isSuspended = false,
-            isCancelled = false,
-            isPending = false,
-            status = "payment_failed",
-            message = reason,
-            maxCaptains = 0,
-            availableCaptainSlots = 0,
-            paymentStatus = "failed"
+        if (!NetworkHelper.isNetworkAvailable(getApplication())) {
+            val noNetMsg = "لا يوجد اتصال بالإنترنت! يرجى الاتصال بالإنترنت لإرسال طلب الاشتراك."
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(noNetMsg)
+            _snackbarMessage.value = noNetMsg
+            onError(noNetMsg)
+            return
+        }
+
+        val currentUser = Firebase.auth.currentUser
+        if (currentUser == null || !currentUser.isEmailVerified) {
+            val authMsg = "يجب تسجيل الدخول بحساب تاجر مؤكد البريد الإلكتروني أولاً."
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(authMsg)
+            _snackbarMessage.value = authMsg
+            onError(authMsg)
+            return
+        }
+
+        val validationError = MerchantSubscriptionRepository.validateManualSubscriptionInput(
+            plan = plan,
+            senderPhone = senderPhone,
+            receiptLocalUri = receiptLocalUri,
+            currentSubscription = _subscriptionStatus.value
         )
-        _snackbarMessage.value = reason
-        checkAndListenToRestaurantSubscription()
+        if (validationError != null) {
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(validationError)
+            _snackbarMessage.value = validationError
+            onError(validationError)
+            return
+        }
+
+        val normalizedPhone = MerchantSubscriptionRepository.normalizeEgyptianMobile(senderPhone)!!
+        val uid = currentUser.uid
+        val requestId = "subreq_${System.currentTimeMillis()}_${UUID.randomUUID().toString().replace("-", "").take(10)}"
+
+        viewModelScope.launch {
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Submitting("جاري رفع صورة إيصال التحويل إلى Firebase Storage...")
+
+            val uploadResult = FirebaseStorageManager.uploadSubscriptionReceiptImage(
+                context = getApplication(),
+                uid = uid,
+                requestId = requestId,
+                localUriString = receiptLocalUri!!
+            )
+            if (uploadResult.isFailure) {
+                val uploadErr = uploadResult.exceptionOrNull()?.message
+                    ?: "تعذر رفع صورة إيصال التحويل. يرجى التأكد من الإنترنت والمحاولة مرة أخرى."
+                _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(uploadErr)
+                _snackbarMessage.value = uploadErr
+                onError(uploadErr)
+                return@launch
+            }
+
+            val uploadedReceipt = uploadResult.getOrThrow()
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Submitting("جاري إرسال طلب الاشتراك للمراجعة...")
+
+            val payload = ManualSubscriptionRequestPayload(
+                merchantId = uid,
+                planId = plan.id,
+                planName = plan.name,
+                maxCaptains = plan.maxCaptains,
+                expectedAmount = plan.priceEgp,
+                senderPhone = normalizedPhone,
+                transactionReference = transactionReference.trim(),
+                receiptStoragePath = uploadedReceipt.storagePath,
+                requestId = requestId,
+                notes = notes.trim().take(500)
+            )
+
+            val submitResult = subscriptionRepository.submitManualSubscriptionRequest(payload)
+            if (submitResult.isFailure) {
+                val submitErr = submitResult.exceptionOrNull()?.message
+                    ?: "تعذر إرسال طلب الاشتراك للمراجعة. يرجى المحاولة مرة أخرى."
+                _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(submitErr)
+                _snackbarMessage.value = submitErr
+                onError(submitErr)
+                return@launch
+            }
+
+            val submitted = submitResult.getOrThrow()
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Submitted(submitted)
+            _snackbarMessage.value = submitted.message
+            refreshSubscriptionFromServer(uid)
+            onSuccess(submitted)
+        }
     }
 
     fun recheckSubscription() {

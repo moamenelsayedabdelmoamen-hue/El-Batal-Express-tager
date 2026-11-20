@@ -421,10 +421,15 @@ object FirebaseStorageManager {
     }
 
     /**
-     * Reads and compresses a local image URI into a compact JPEG ByteArray (~15-30 KB)
-     * for fast upload and reliable persistence.
+     * Reads and compresses a local image URI into a compact JPEG ByteArray using memory-safe
+     * `inJustDecodeBounds` + `inSampleSize` decoding so high-resolution receipts never OOM.
      */
-    private fun readAndCompressLocalImage(context: Context, parsedUri: Uri): ByteArray {
+    private fun readAndCompressLocalImage(
+        context: Context,
+        parsedUri: Uri,
+        maxDim: Int = 720,
+        jpegQuality: Int = 85
+    ): ByteArray {
         val rawBytes = context.contentResolver.openInputStream(parsedUri)?.use { it.readBytes() }
             ?: throw IllegalStateException("تعذر فتح ملف الصورة المختارة من الجهاز")
         if (rawBytes.isEmpty()) {
@@ -432,9 +437,29 @@ object FirebaseStorageManager {
         }
 
         return try {
-            val originalBitmap = android.graphics.BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
+            val bounds = android.graphics.BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            android.graphics.BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, bounds)
+            val srcW = bounds.outWidth
+            val srcH = bounds.outHeight
+            var sampleSize = 1
+            if (srcW > maxDim || srcH > maxDim) {
+                while ((srcW / (sampleSize * 2)) >= maxDim || (srcH / (sampleSize * 2)) >= maxDim) {
+                    sampleSize *= 2
+                }
+            }
+
+            val decodeOptions = android.graphics.BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+            }
+            val originalBitmap = android.graphics.BitmapFactory.decodeByteArray(
+                rawBytes,
+                0,
+                rawBytes.size,
+                decodeOptions
+            )
             if (originalBitmap != null) {
-                val maxDim = 720
                 val width = originalBitmap.width.coerceAtLeast(1)
                 val height = originalBitmap.height.coerceAtLeast(1)
                 val scale = minOf(maxDim.toFloat() / width, maxDim.toFloat() / height, 1f)
@@ -446,13 +471,109 @@ object FirebaseStorageManager {
                     originalBitmap
                 }
                 val out = java.io.ByteArrayOutputStream()
-                scaledBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, out)
+                scaledBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, jpegQuality, out)
+                if (scaledBitmap !== originalBitmap) {
+                    scaledBitmap.recycle()
+                }
+                originalBitmap.recycle()
                 out.toByteArray().takeIf { it.isNotEmpty() } ?: rawBytes
             } else {
                 rawBytes
             }
         } catch (_: Throwable) {
             rawBytes
+        }
+    }
+
+    /**
+     * Builds the canonical Firebase Storage path for a merchant's manual Vodafone Cash receipt:
+     * `merchants/{uid}/subscription_receipts/{sanitizedRequestId}.jpg`
+     */
+    fun buildSubscriptionReceiptStoragePath(uid: String, requestId: String): String {
+        val safeUid = uid.trim()
+        val safeReq = requestId.trim().replace(Regex("[^A-Za-z0-9_\\-]"), "_")
+        require(safeUid.isNotEmpty()) { "معرف التاجر غير صالح" }
+        require(safeReq.length >= 6) { "معرف طلب الاشتراك غير صالح" }
+        return "merchants/$safeUid/subscription_receipts/$safeReq.jpg"
+    }
+
+    /**
+     * Uploads a Vodafone Cash transfer receipt image EXCLUSIVELY to Firebase Storage
+     * under `merchants/{uid}/subscription_receipts/{requestId}.jpg`.
+     * Never uses external third-party image hosts.
+     */
+    suspend fun uploadSubscriptionReceiptImage(
+        context: Context,
+        uid: String,
+        requestId: String,
+        localUriString: String
+    ): Result<StorageUploadResult> = withContext(Dispatchers.IO) {
+        if (uid.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("معرف التاجر (UID) غير صالح"))
+        }
+        if (requestId.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("معرف طلب الاشتراك غير صالح"))
+        }
+        if (!isLocalDeviceUri(localUriString)) {
+            return@withContext Result.failure(IllegalArgumentException("يرجى اختيار صورة إيصال صالحة من الجهاز"))
+        }
+
+        val storagePath = try {
+            buildSubscriptionReceiptStoragePath(uid, requestId)
+        } catch (e: IllegalArgumentException) {
+            return@withContext Result.failure(e)
+        }
+        val parsedUri = Uri.parse(localUriString)
+
+        val compressedBytes = try {
+            // Preserve crisp legibility of Vodafone Cash receipt text/reference numbers up to 1280px
+            readAndCompressLocalImage(context, parsedUri, maxDim = 1280, jpegQuality = 88)
+        } catch (readEx: Exception) {
+            safeLogE("Failed to read local receipt image $localUriString: ${readEx.message}", readEx)
+            return@withContext Result.failure(readEx)
+        }
+
+        if (compressedBytes.size > 10 * 1024 * 1024) {
+            return@withContext Result.failure(IllegalStateException("حجم صورة الإيصال يتجاوز الحد المسموح به (10 ميجابايت)"))
+        }
+
+        val storage = Firebase.storage
+        try {
+            storage.maxUploadRetryTimeMillis = 20_000L
+            storage.maxOperationRetryTimeMillis = 15_000L
+        } catch (_: Throwable) {}
+
+        val storageRef = storage.reference.child(storagePath)
+        val metadata = StorageMetadata.Builder()
+            .setContentType("image/jpeg")
+            .setCustomMetadata("merchantUid", uid)
+            .setCustomMetadata("requestId", requestId)
+            .setCustomMetadata("paymentMethod", "vodafone_cash_manual")
+            .setCustomMetadata("source", "firebase_storage_official")
+            .build()
+
+        return@withContext try {
+            val taskSnapshot = kotlinx.coroutines.withTimeout(30_000L) {
+                storageRef.putBytes(compressedBytes, metadata).await()
+            }
+            val downloadUrl = kotlinx.coroutines.withTimeout(10_000L) {
+                storageRef.downloadUrl.await().toString()
+            }
+            if (!isFirebaseStorageUrl(downloadUrl)) {
+                throw IllegalStateException("تعذر التحقق من رابط الإيصال على Firebase Storage")
+            }
+            resolvedStorageUrlCache[storagePath] = downloadUrl
+            safeLogD("Uploaded subscription receipt to Firebase Storage ($storagePath)")
+            Result.success(
+                StorageUploadResult(
+                    downloadUrl = downloadUrl,
+                    storagePath = storagePath,
+                    sizeBytes = taskSnapshot.totalByteCount.coerceAtLeast(compressedBytes.size.toLong())
+                )
+            )
+        } catch (storageEx: Exception) {
+            safeLogE("Firebase Storage receipt upload failed for $storagePath: ${storageEx.message}", storageEx)
+            Result.failure(storageEx)
         }
     }
 

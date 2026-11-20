@@ -140,9 +140,6 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -155,6 +152,9 @@ import com.example.auth.MerchantAuthManager
 import com.example.auth.MerchantRegistrationRequest
 import com.example.auth.MerchantRegistrationResult
 import com.example.auth.MerchantSignInResult
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import com.example.ui.subscription.SubscriptionStatusOverviewCard
+import com.example.ui.subscription.resolveSubscriptionStatusVisual
 
 @Composable
 fun LoginScreen(onLoginSuccess: (com.example.auth.MerchantAccount) -> Unit, onRegisterClick: () -> Unit) {
@@ -1612,7 +1612,15 @@ fun RegisterScreen(
     }
 }
 
-data class Plan(val id: Int, val captains: Int, val price: Int, val name: String, val subtitle: String, val isPopular: Boolean = false)
+data class Plan(
+    val id: Int,
+    val captains: Int,
+    val price: Int,
+    val name: String,
+    val subtitle: String,
+    val isPopular: Boolean = false,
+    val durationDays: Int = 30
+)
 
 @Composable
 fun RegistrationSuccessScreen() {
@@ -1624,62 +1632,42 @@ fun RegistrationSuccessScreen() {
 @Composable
 fun SubscriptionPlansScreen(
     onSkip: () -> Unit = {},
+    onProceedToVodafoneCash: (Int) -> Unit = {},
     orderViewModel: OrderViewModel = viewModel()
 ) {
     LaunchedEffect(Unit) {
         orderViewModel.listenToFirestore()
+        orderViewModel.loadVodafoneCashSettings()
     }
 
     val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
+    val vodafoneSettings by orderViewModel.vodafoneCashSettings.collectAsStateWithLifecycle()
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
 
-    val plans = listOf(
-        Plan(1, 2, 400, "2 كابتن", "الباقة الأساسية"),
-        Plan(2, 4, 800, "4 كابتن", "الباقة المتوسطة"),
-        Plan(3, 6, 1200, "6 كابتن", "الباقة المميزة", true),
-        Plan(4, 8, 1600, "8 كابتن", "الباقة المتقدمة")
-    )
+    val plans = remember(vodafoneSettings.plans) {
+        vodafoneSettings.plans.map { opt ->
+            Plan(
+                id = opt.id,
+                captains = opt.maxCaptains,
+                price = opt.priceEgp,
+                name = opt.captainsLabel,
+                subtitle = opt.name,
+                isPopular = opt.isPopular,
+                durationDays = opt.durationDays
+            )
+        }
+    }
+
     var selectedPlanId by remember(subscriptionStatus.planId) {
         mutableStateOf<Int?>(subscriptionStatus.planId.takeIf { it > 0 })
     }
-    var isLoading by remember { mutableStateOf(false) }
-    var showPaymentDialog by remember { mutableStateOf(false) }
-    val paymentMethod = "wallet"
-    var phoneNumber by remember { mutableStateOf("") }
-    var fallbackUrl by remember { mutableStateOf<String?>(null) }
-    var pendingPaymentPlan by remember { mutableStateOf<Plan?>(null) }
-    var paymentProcessedForCurrentSession by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-    val context = androidx.compose.ui.platform.LocalContext.current
 
     val isSubActive = subscriptionStatus.canRequestCaptain()
-    val subStatusText = when {
-        subscriptionStatus.isChecking && !isSubActive -> "جاري التحقق مع السيرفر..."
-        !subscriptionStatus.serverError.isNullOrBlank() && !isSubActive -> "تعذر التحقق من السيرفر"
-        subscriptionStatus.isOfflineUnverified -> "بانتظار مزامنة السيرفر (غير متصل)"
-        subscriptionStatus.status == "inactive" -> "غير نشط (متوقف من الإدارة)"
-        subscriptionStatus.isSuspended -> "موقوفة من الإدارة"
-        subscriptionStatus.isCancelled -> "ملغاة"
-        subscriptionStatus.isPending || subscriptionStatus.status == "pending" -> "قيد المراجعة من الإدارة ⏳"
-        subscriptionStatus.isExpired || subscriptionStatus.status == "expired" -> "منتهية"
-        subscriptionStatus.status == "payment_failed" || subscriptionStatus.paymentStatus == "failed" -> "فشل الدفع (غير مشترك)"
-        !subscriptionStatus.isSubscribed || subscriptionStatus.status == "unsubscribed" || subscriptionStatus.maxCaptains <= 0 -> "غير مشترك"
-        else -> "فعال ومتاح ✓"
-    }
-    val subStatusColor = when {
-        isSubActive -> Color(0xFF2E7D32)
-        subscriptionStatus.isChecking -> Primary
-        !subscriptionStatus.serverError.isNullOrBlank() || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending -> Color(0xFFE65100)
-        else -> Color(0xFFC62828)
-    }
-    val startDateText = remember(subscriptionStatus.startDateMillis, isSubActive, subscriptionStatus.isExpired, subscriptionStatus.isSuspended) {
-        val millis = subscriptionStatus.startDateMillis
-        if (millis != null && millis > 0L) {
-            SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(millis))
-        } else {
-            "—"
-        }
-    }
-    val renewalDateText = remember(subscriptionStatus.endDateMillis, subscriptionStatus.isSubscribed, isSubActive, subscriptionStatus.isExpired, subscriptionStatus.isSuspended) {
+    val isPendingReview = subscriptionStatus.isPendingReview || subscriptionStatus.status == "pending_review"
+    val isSubscriptionLocked = isSubActive || isPendingReview
+
+    val renewalDateText = remember(subscriptionStatus.endDateMillis) {
         val millis = subscriptionStatus.endDateMillis
         if (millis != null && millis > 0L) {
             SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(millis))
@@ -1687,371 +1675,11 @@ fun SubscriptionPlansScreen(
             "غير مشترك حالياً"
         }
     }
-    val remainingDurationText = remember(subscriptionStatus.endDateMillis, isSubActive, subscriptionStatus.isExpired) {
-        when {
-            isSubActive && subscriptionStatus.endDateMillis != null -> subscriptionStatus.remainingTimeLabel()
-            subscriptionStatus.isExpired -> "منتهي"
-            else -> "—"
-        }
-    }
-
-    fun activateConfirmedPlan(planToActivate: Plan, walletNumber: String) {
-        paymentProcessedForCurrentSession = true
-        fallbackUrl = null
-        pendingPaymentPlan = null
-        orderViewModel.selectSubscriptionPlan(
-            planId = planToActivate.id,
-            planName = planToActivate.subtitle,
-            maxCaptains = planToActivate.captains,
-            price = planToActivate.price,
-            walletPhone = walletNumber
-        ) {
-            Toast.makeText(
-                context,
-                "رد السيرفر: تم الاشتراك بنجاح ✓ تم تفعيل ${planToActivate.subtitle} (${planToActivate.name})",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
-    fun handleServerPaymentResult(urlOrContent: String, isUrl: Boolean) {
-        if (paymentProcessedForCurrentSession) return
-        val lower = urlOrContent.lowercase(Locale.ROOT)
-
-        // Check explicit failure indicators first (primarily from callback URL parameters)
-        val isServerFailure = lower.contains("success=false") ||
-            lower.contains("error_occured=true") ||
-            lower.contains("txn_response_code=declined") ||
-            lower.contains("data.message=declined") ||
-            (isUrl && lower.contains("status=failed")) ||
-            lower.contains("فشل الدفع") ||
-            lower.contains("payment failed")
-
-        val isServerSuccess = !isServerFailure && (
-            lower.contains("success=true") ||
-                lower.contains("txn_response_code=approved") ||
-                lower.contains("txn_response_code=00") ||
-                lower.contains("data.message=approved") ||
-                lower.contains("error_occured=false") ||
-                lower.contains("تم الاشتراك بنجاح") ||
-                lower.contains("تم الدفع بنجاح") ||
-                lower.contains("تمت عملية الدفع بنجاح") ||
-                lower.contains("payment successful") ||
-                lower.contains("transaction successful") ||
-                lower.contains("\"status\":\"success\"") ||
-                lower.contains("\"success\":true")
-            )
-
-        if (isServerSuccess) {
-            val planToActivate = pendingPaymentPlan
-            if (planToActivate != null) {
-                activateConfirmedPlan(planToActivate, phoneNumber.trim())
-            }
-        } else if (isServerFailure) {
-            paymentProcessedForCurrentSession = true
-            fallbackUrl = null
-            pendingPaymentPlan = null
-            orderViewModel.markSubscriptionPaymentFailed(
-                "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
-            )
-            Toast.makeText(
-                context,
-                "فشل عملية الدفع! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
-    if (fallbackUrl != null) {
-        AlertDialog(
-            onDismissRequest = {
-                if (!paymentProcessedForCurrentSession) {
-                    fallbackUrl = null
-                    pendingPaymentPlan = null
-                    orderViewModel.markSubscriptionPaymentFailed(
-                        "لم يكتمل الدفع من السيرفر، لم يتم تفعيل الاشتراك ولا يمكنك طلب كابتن."
-                    )
-                    Toast.makeText(
-                        context,
-                        "لم يتم تأكيد الدفع من السيرفر، لم يتم تفعيل الاشتراك.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                } else {
-                    fallbackUrl = null
-                }
-            },
-            modifier = Modifier.fillMaxSize(0.92f),
-            title = {
-                Text(
-                    text = "صفحة الدفع بالمحفظة الإلكترونية",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-            },
-            text = {
-                AndroidView(
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            webViewClient = object : WebViewClient() {
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    super.onPageFinished(view, url)
-                                    if (!url.isNullOrBlank()) {
-                                        handleServerPaymentResult(url, isUrl = true)
-                                    }
-                                    view?.evaluateJavascript(
-                                        "(function(){return document.body ? document.body.innerText : '';})()"
-                                    ) { bodyText ->
-                                        if (!bodyText.isNullOrBlank()) {
-                                            handleServerPaymentResult(bodyText, isUrl = false)
-                                        }
-                                    }
-                                }
-                            }
-                            loadUrl(fallbackUrl!!)
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val planToActivate = pendingPaymentPlan
-                        if (planToActivate != null) {
-                            activateConfirmedPlan(planToActivate, phoneNumber.trim())
-                        } else {
-                            fallbackUrl = null
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
-                ) {
-                    Text("تأكيد إتمام الدفع وتفعيل الباقة ✓", color = Color.White, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                OutlinedButton(
-                    onClick = {
-                        if (!paymentProcessedForCurrentSession) {
-                            fallbackUrl = null
-                            pendingPaymentPlan = null
-                            orderViewModel.markSubscriptionPaymentFailed(
-                                "تم إلغاء عملية الدفع قبل تأكيد الاشتراك. لا يمكنك طلب كابتن."
-                            )
-                            Toast.makeText(
-                                context,
-                                "تم إلغاء عملية الدفع. لم يتم تفعيل الباقة.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        } else {
-                            fallbackUrl = null
-                        }
-                    }
-                ) {
-                    Text("إلغاء الدفع")
-                }
-            }
-        )
-    }
-
-    if (showPaymentDialog && !isSubActive) {
-        val chosenPlan = plans.find { it.id == selectedPlanId }
-        AlertDialog(
-            onDismissRequest = { showPaymentDialog = false },
-            title = { Text("تأكيد الاشتراك في ${chosenPlan?.subtitle ?: "الباقة"}") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    if (chosenPlan != null) {
-                        Text(
-                            text = "الباقة المختارة: ${chosenPlan.subtitle} (${chosenPlan.name}) - ${chosenPlan.price} ج.م / شهرياً",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = Primary
-                        )
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = true, onClick = {})
-                        Text(
-                            text = "محفظة إلكترونية",
-                            style = MaterialTheme.typography.bodyLarge,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                    OutlinedTextField(
-                        value = phoneNumber,
-                        onValueChange = { phoneNumber = it },
-                        label = { Text("رقم المحفظة الإلكترونية") },
-                        placeholder = { Text("01xxxxxxxxx") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-                }
-            },
-            confirmButton = {
-                Button(onClick = {
-                    val cleanWalletPhone = phoneNumber.trim().replace(" ", "").replace("-", "")
-                    if (cleanWalletPhone.isBlank()) {
-                        Toast.makeText(context, "يرجى إدخال رقم المحفظة الإلكترونية", Toast.LENGTH_SHORT).show()
-                        return@Button
-                    }
-                    val isValidEgyptianWallet = Regex("^(\\+?20)?0?1[0125][0-9]{8}$").matches(cleanWalletPhone)
-                    if (!isValidEgyptianWallet) {
-                        showPaymentDialog = false
-                        orderViewModel.markSubscriptionPaymentFailed(
-                            "فشل عملية الدفع: رقم المحفظة الإلكترونية غير صحيح. لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
-                        )
-                        Toast.makeText(
-                            context,
-                            "رقم المحفظة غير صحيح! فشلت عملية الدفع ولم يتم تفعيل الباقة.",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        return@Button
-                    }
-
-                    if (!com.example.network.NetworkHelper.isNetworkAvailable(context)) {
-                        showPaymentDialog = false
-                        orderViewModel.markSubscriptionPaymentFailed(
-                            "فشل الاتصال بالسيرفر لعدم وجود إنترنت. لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
-                        )
-                        Toast.makeText(
-                            context,
-                            "لا يوجد اتصال بالإنترنت! فشلت عملية الدفع ولم يتم تفعيل الباقة.",
-                            Toast.LENGTH_LONG
-                        ).show()
-                        return@Button
-                    }
-
-                    val normalizedPhone = when {
-                        cleanWalletPhone.startsWith("+20") -> "0" + cleanWalletPhone.removePrefix("+20")
-                        cleanWalletPhone.startsWith("20") && cleanWalletPhone.length == 12 -> "0" + cleanWalletPhone.removePrefix("20")
-                        cleanWalletPhone.startsWith("1") && cleanWalletPhone.length == 10 -> "0$cleanWalletPhone"
-                        else -> cleanWalletPhone
-                    }
-
-                    showPaymentDialog = false
-                    val plan = plans.find { it.id == selectedPlanId }
-                    if (plan != null) {
-                        isLoading = true
-                        paymentProcessedForCurrentSession = false
-                        pendingPaymentPlan = plan
-
-                        // التواصل مع السيرفر لإتمام الدفع بالمحفظة الإلكترونية وتأكيد الاشتراك
-                        scope.launch(Dispatchers.IO) {
-                            var resolvedRedirectUrl = ""
-                            var isExplicitlyRejected = false
-                            var serverRespondedSuccess = false
-
-                            suspend fun tryGatewayRequest(walletNum: String): Boolean {
-                                return try {
-                                    val req = PaymentRequest(
-                                        amount = plan.price,
-                                        email = Firebase.auth.currentUser?.email ?: "merchant@elbatal.com",
-                                        first_name = "Merchant",
-                                        last_name = "ElBatal",
-                                        payment_method = paymentMethod,
-                                        phone_number = walletNum
-                                    )
-                                    val rawResp = RetrofitClient.instance.createPaymentRaw(req)
-                                    val bodyStr = rawResp.body()?.string() ?: rawResp.errorBody()?.string() ?: ""
-                                    if (rawResp.isSuccessful) {
-                                        if (bodyStr.isNotBlank()) {
-                                            try {
-                                                val json = org.json.JSONObject(bodyStr)
-                                                val dataObj = json.optJSONObject("data")
-                                                val candidateUrl = json.optString("url")
-                                                    .ifBlank { json.optString("redirect_url") }
-                                                    .ifBlank { json.optString("iframe_url") }
-                                                    .ifBlank { json.optString("payment_url") }
-                                                    .ifBlank { dataObj?.optString("url").orEmpty() }
-                                                    .ifBlank { dataObj?.optString("redirect_url").orEmpty() }
-                                                    .trim()
-                                                if (candidateUrl.startsWith("http://") || candidateUrl.startsWith("https://")) {
-                                                    resolvedRedirectUrl = candidateUrl
-                                                }
-                                                val statusVal = json.optString("status").lowercase(Locale.ROOT)
-                                                val hasSuccessField = json.has("success")
-                                                val successVal = json.optBoolean("success", true)
-                                                if ((hasSuccessField && !successVal) || statusVal == "failed" || statusVal == "declined") {
-                                                    isExplicitlyRejected = true
-                                                } else {
-                                                    serverRespondedSuccess = true
-                                                }
-                                            } catch (_: Exception) {
-                                                serverRespondedSuccess = true
-                                            }
-                                        } else {
-                                            serverRespondedSuccess = true
-                                        }
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } catch (e: Exception) {
-                                    android.util.Log.w("PaymentGateway", "Attempt with $walletNum note: ${e.message}")
-                                    false
-                                }
-                            }
-
-                            val firstAttemptOk = tryGatewayRequest(normalizedPhone)
-                            if (!firstAttemptOk && normalizedPhone != "01010101010") {
-                                // في حالة استخدام بيئة Paymob التجريبية على السيرفر والتي تقبل رقم المحفظة التجريبي 01010101010
-                                tryGatewayRequest("01010101010")
-                            }
-
-                            withContext(Dispatchers.Main) {
-                                isLoading = false
-                                when {
-                                    isExplicitlyRejected -> {
-                                        pendingPaymentPlan = null
-                                        orderViewModel.markSubscriptionPaymentFailed(
-                                            "فشل الدفع من السيرفر: تم رفض العملية ولم يتم تفعيل الاشتراك ولا يمكنك طلب كابتن."
-                                        )
-                                        Toast.makeText(
-                                            context,
-                                            "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                                    resolvedRedirectUrl.isNotBlank() -> {
-                                        // فتح صفحة الدفع لإكمال التأكيد
-                                        fallbackUrl = resolvedRedirectUrl
-                                    }
-                                    serverRespondedSuccess -> {
-                                        // إرسال طلب التحقق والمزامنة مع السيرفر دون تفعيل محلي غير مصرح به
-                                        activateConfirmedPlan(plan, normalizedPhone)
-                                    }
-                                    else -> {
-                                        pendingPaymentPlan = null
-                                        orderViewModel.markSubscriptionPaymentFailed(
-                                            "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن."
-                                        )
-                                        Toast.makeText(
-                                            context,
-                                            "فشل عملية الدفع من السيرفر! لم يتم تفعيل الباقة ولا يمكنك طلب كابتن.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }) {
-                    Text("تأكيد وتفعيل الباقة")
-                }
-            },
-            dismissButton = {
-                OutlinedButton(onClick = { showPaymentDialog = false }) {
-                    Text("إلغاء")
-                }
-            }
-        )
-    }
 
     Column(
-        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         ElBatalHeader(
@@ -2059,347 +1687,214 @@ fun SubscriptionPlansScreen(
             actionText = "رجوع",
             onActionClick = onSkip
         )
-        Spacer(modifier = Modifier.height(8.dp))
 
-        // Real-time Current Subscription Card synced with Firestore & Cloud Functions
-        Card(
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp)
-                .testTag("current_subscription_summary_card"),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surface
-            ),
-            border = BorderStroke(1.5.dp, Primary.copy(alpha = 0.5f)),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                .fillMaxSize()
+                .widthIn(max = 680.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(text = "💳", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            text = "باقتك الحالية المسجلة",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                    Surface(
-                        color = subStatusColor.copy(alpha = 0.14f),
-                        shape = RoundedCornerShape(20.dp),
-                        border = BorderStroke(1.dp, subStatusColor.copy(alpha = 0.4f))
-                    ) {
-                        Text(
-                            text = subStatusText,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = subStatusColor,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                        )
-                    }
-                }
-
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "اسم الباقة:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = if (subscriptionStatus.planId > 0 || subscriptionStatus.maxCaptains > 0) {
-                            "${subscriptionStatus.planName} (${subscriptionStatus.price} ج.م)"
-                        } else {
-                            "غير مشترك في باقة"
-                        },
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = if (isSubActive) Primary else Color(0xFFC62828)
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "الكباتن المسموح بهم:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = if (isSubActive && subscriptionStatus.maxCaptains > 0) {
-                            "${subscriptionStatus.maxCaptains} كابتن (النشط الآن: ${subscriptionStatus.activeCaptainsCount}/${subscriptionStatus.maxCaptains})"
-                        } else {
-                            "0 كابتن"
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "حالة الاشتراك:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = subStatusText,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = subStatusColor
-                    )
-                }
-
-                if (startDateText != "—") {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "تاريخ البداية:",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Text(
-                            text = startDateText,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "تاريخ الانتهاء / التجديد:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = renewalDateText,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-
-                if (remainingDurationText != "—") {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "المدة المتبقية:",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Text(
-                            text = remainingDurationText,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = if (isSubActive) Color(0xFF2E7D32) else Color(0xFFC62828)
-                        )
-                    }
-                }
-
-                if (!subscriptionStatus.suspensionReason.isNullOrBlank()) {
-                    Text(
-                        text = "السبب: ${subscriptionStatus.suspensionReason}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFC62828)
-                    )
-                }
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                SubscriptionStatusOverviewCard(
+                    subscriptionStatus = subscriptionStatus,
+                    onRefresh = { orderViewModel.recheckSubscription() }
+                )
             }
-        }
 
-        Spacer(modifier = Modifier.height(10.dp))
-
-        if (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired || subscriptionStatus.isPending || subscriptionStatus.isOfflineUnverified) {
-            val isAmberAlert = subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending
-            val alertBgColor = if (isAmberAlert) Color(0xFFFFF3E0) else Color(0xFFFFEBEE)
-            val alertBorderColor = if (isAmberAlert) Color(0xFFFF9800) else Color(0xFFEF5350)
-            val alertAccentColor = if (isAmberAlert) Color(0xFFE65100) else Color(0xFFC62828)
-            val alertTitle = when {
-                subscriptionStatus.isOfflineUnverified -> "بانتظار التحقق المباشر من السيرفر"
-                subscriptionStatus.isPending -> "طلب الاشتراك قيد المراجعة"
-                subscriptionStatus.status == "inactive" -> "اشتراكك غير نشط حالياً"
-                subscriptionStatus.isSuspended -> "تم إيقاف اشتراكك من الإدارة"
-                subscriptionStatus.isCancelled -> "تم إلغاء اشتراكك"
-                else -> "اشتراكك منتهي الصلاحية"
-            }
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 2.dp)
-                    .testTag("subscription_alert_banner"),
-                shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(containerColor = alertBgColor),
-                border = BorderStroke(1.2.dp, alertBorderColor)
-            ) {
-                Column(
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .testTag("vodafone_cash_banner_card"),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF5F5)),
+                    border = BorderStroke(1.2.dp, Color(0xFFE60000).copy(alpha = 0.35f))
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(
-                            imageVector = if (subscriptionStatus.isOfflineUnverified) Icons.Default.WifiOff else Icons.Default.Warning,
-                            contentDescription = alertTitle,
-                            tint = alertAccentColor,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Text(
-                            text = alertTitle,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = alertAccentColor
-                        )
-                    }
-                    Text(
-                        text = subscriptionStatus.message ?: "يرجى التواصل مع الإدارة أو تجديد الاشتراك لتفعيل طلب الكباتن.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = alertAccentColor.copy(alpha = 0.9f)
-                    )
-                    OutlinedButton(
-                        onClick = { orderViewModel.recheckSubscription() },
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, alertAccentColor),
-                        modifier = Modifier.testTag("refresh_subscription_status_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = null,
-                            tint = alertAccentColor,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "تحديث الحالة من السيرفر",
-                            color = alertAccentColor,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-        } else if (isSubActive) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 2.dp)
-                    .testTag("active_plan_locked_notice"),
-                shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1)),
-                border = BorderStroke(1.2.dp, Color(0xFFFFB74D))
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Lock,
-                        contentDescription = "الباقة نشطة ومقفل التبديل",
-                        tint = Color(0xFFE65100),
-                        modifier = Modifier.size(22.dp)
-                    )
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "لا يمكن تبديل أو تغيير الباقة حالياً",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color(0xFFE65100)
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = "لديك باقة نشطة وسارية حتى ($renewalDateText). يمكنك اختيار باقة أخرى أو التجديد عند انتهاء الباقة الحالية فقط.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF5D4037)
-                        )
-                    }
-                }
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-        }
-
-        if (isLoading) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Primary)
-            }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-                horizontalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                items(plans) { plan ->
-                    val matchesPlan = (subscriptionStatus.planId == plan.id) ||
-                        (subscriptionStatus.maxCaptains == plan.captains && subscriptionStatus.planName.contains(plan.subtitle))
-                    val isCurrentActivePlan = isSubActive && matchesPlan
-                    val lockedMessage = "لا يمكن تبديل أو تغيير الباقة إلا بعد انتهاء الباقة الحالية ($renewalDateText)"
-                    PlanCard(
-                        plan = plan,
-                        isSelected = isCurrentActivePlan || (!isSubActive && selectedPlanId == plan.id),
-                        isCurrentActivePlan = isCurrentActivePlan,
-                        isSubscriptionLocked = isSubActive,
-                        onSelect = {
-                            if (isSubActive) {
-                                Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
-                            } else {
-                                selectedPlanId = plan.id
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = stringResource(R.string.vodafone_cash_screen_title),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFFB71C1C)
+                                )
+                                Text(
+                                    text = if (vodafoneSettings.walletNumber.isNotBlank()) {
+                                        val holderSuffix = vodafoneSettings.walletHolderName.takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()
+                                        "الرقم الرسمي للتحويل: ${vodafoneSettings.walletNumber}$holderSuffix"
+                                    } else if (vodafoneSettings.isLoading) {
+                                        "جاري تحميل رقم محفظة فودافون كاش الرسمي..."
+                                    } else {
+                                        "اختر الباقة لإتمام التحويل اليدوي عبر فودافون كاش ورفع الإيصال للمراجعة."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF5D4037)
+                                )
                             }
-                        },
-                        onSubscribe = {
-                            if (isSubActive) {
-                                Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
-                            } else {
-                                selectedPlanId = plan.id
-                                showPaymentDialog = true
+                            if (vodafoneSettings.walletNumber.isNotBlank()) {
+                                OutlinedButton(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(vodafoneSettings.walletNumber))
+                                        Toast.makeText(
+                                            context,
+                                            context.getString(R.string.vodafone_wallet_copied),
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    },
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, Color(0xFFE60000)),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                    modifier = Modifier
+                                        .heightIn(min = 48.dp)
+                                        .testTag("plans_copy_wallet_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ContentCopy,
+                                        contentDescription = stringResource(R.string.vodafone_copy_number),
+                                        tint = Color(0xFFE60000),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = stringResource(R.string.vodafone_copy_number),
+                                        color = Color(0xFFE60000),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
-                    )
+                    }
                 }
+            }
+
+            if (isSubActive) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("active_plan_locked_notice"),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1)),
+                        border = BorderStroke(1.2.dp, Color(0xFFFFB74D))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "الباقة نشطة ومقفل التبديل",
+                                tint = Color(0xFFE65100),
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "لا يمكن تبديل أو تغيير الباقة حالياً",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFFE65100)
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "لديك باقة نشطة وسارية حتى ($renewalDateText). يمكنك اختيار باقة أخرى أو التجديد عند انتهاء الباقة الحالية فقط.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF5D4037)
+                                )
+                            }
+                        }
+                    }
+                }
+            } else if (isPendingReview) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("pending_review_locked_notice"),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBEB)),
+                        border = BorderStroke(1.2.dp, Color(0xFFD97706))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.HourglassTop,
+                                contentDescription = "طلب الاشتراك قيد المراجعة",
+                                tint = Color(0xFFD97706),
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "لديك طلب اشتراك في انتظار مراجعة الإدارة",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFFB45309)
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "لا يمكن إرسال طلب اشتراك مكرر أثناء مراجعة الإدارة للطلب الحالي. سيتم التحديث تلقائياً فور قرار الإدارة.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF78350F)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            items(plans) { plan ->
+                val matchesPlan = (subscriptionStatus.planId == plan.id) ||
+                    (subscriptionStatus.maxCaptains == plan.captains && subscriptionStatus.planName.contains(plan.subtitle))
+                val isCurrentActivePlan = isSubActive && matchesPlan
+                val isPendingThisPlan = isPendingReview && subscriptionStatus.planId == plan.id
+                val lockedMessage = when {
+                    isSubActive -> "لا يمكن تبديل أو تغيير الباقة إلا بعد انتهاء الباقة الحالية ($renewalDateText)"
+                    isPendingReview -> "لديك طلب اشتراك في انتظار مراجعة الإدارة حالياً ولا يمكن إرسال طلب آخر قبل قرار الإدارة."
+                    else -> ""
+                }
+                PlanCard(
+                    plan = plan,
+                    isSelected = isCurrentActivePlan || isPendingThisPlan || (!isSubscriptionLocked && selectedPlanId == plan.id),
+                    isCurrentActivePlan = isCurrentActivePlan,
+                    isPendingReviewPlan = isPendingThisPlan,
+                    isSubscriptionLocked = isSubscriptionLocked,
+                    onSelect = {
+                        if (isSubscriptionLocked) {
+                            Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
+                        } else {
+                            selectedPlanId = plan.id
+                        }
+                    },
+                    onSubscribe = {
+                        if (isSubscriptionLocked) {
+                            Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
+                        } else {
+                            selectedPlanId = plan.id
+                            onProceedToVodafoneCash(plan.id)
+                        }
+                    }
+                )
             }
         }
     }
@@ -2410,18 +1905,20 @@ fun PlanCard(
     plan: Plan,
     isSelected: Boolean,
     isCurrentActivePlan: Boolean = false,
+    isPendingReviewPlan: Boolean = false,
     isSubscriptionLocked: Boolean = false,
     onSelect: () -> Unit,
     onSubscribe: () -> Unit
 ) {
-    val isLockedOtherPlan = isSubscriptionLocked && !isCurrentActivePlan
+    val isLockedOtherPlan = isSubscriptionLocked && !isCurrentActivePlan && !isPendingReviewPlan
     val borderColor = when {
         isCurrentActivePlan -> Color(0xFF2E7D32)
+        isPendingReviewPlan -> Color(0xFFD97706)
         isLockedOtherPlan -> MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
         isSelected -> Primary
         else -> MaterialTheme.colorScheme.outlineVariant
     }
-    val borderWidth = if (isSelected || isCurrentActivePlan) 2.dp else 1.dp
+    val borderWidth = if (isSelected || isCurrentActivePlan || isPendingReviewPlan) 2.dp else 1.dp
     val backgroundColor = if (isLockedOtherPlan) {
         MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
     } else {
@@ -2432,12 +1929,13 @@ fun PlanCard(
         modifier = Modifier
             .fillMaxWidth()
             .border(borderWidth, borderColor, RoundedCornerShape(16.dp))
-            .clickable(onClick = onSelect),
+            .clickable(onClick = onSelect)
+            .testTag("plan_card_${plan.id}"),
         colors = CardDefaults.cardColors(containerColor = backgroundColor),
         shape = RoundedCornerShape(16.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (isLockedOtherPlan) 1.dp else 8.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isLockedOtherPlan) 1.dp else 6.dp)
     ) {
-        Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(modifier = Modifier.padding(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             if (isCurrentActivePlan) {
                 Surface(
                     color = Color(0xFF2E7D32).copy(alpha = 0.14f),
@@ -2446,6 +1944,21 @@ fun PlanCard(
                     Text(
                         text = "باقتك الحالية ✓",
                         color = Color(0xFF2E7D32),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+            } else if (isPendingReviewPlan) {
+                Surface(
+                    color = Color(0xFFFFFBEB),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, Color(0xFFD97706).copy(alpha = 0.45f))
+                ) {
+                    Text(
+                        text = "قيد المراجعة ⏳",
+                        color = Color(0xFFB45309),
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
@@ -2478,14 +1991,13 @@ fun PlanCard(
                 }
                 Spacer(modifier = Modifier.height(4.dp))
             } else if (plan.isPopular) {
-                Text(stringResource(R.string.most_popular), color = Primary, style = MaterialTheme.typography.labelSmall)
+                Text(stringResource(R.string.most_popular), color = Primary, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(4.dp))
             }
-            
-            // Icon
+
             Box(
                 modifier = Modifier
-                    .size(50.dp)
+                    .size(48.dp)
                     .clip(CircleShape)
                     .background(if (isLockedOtherPlan) MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f) else Primary.copy(alpha = 0.15f)),
                 contentAlignment = Alignment.Center
@@ -2494,11 +2006,11 @@ fun PlanCard(
                     Icons.Filled.Person,
                     contentDescription = null,
                     tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary,
-                    modifier = Modifier.size(30.dp)
+                    modifier = Modifier.size(28.dp)
                 )
             }
             Spacer(modifier = Modifier.height(8.dp))
-            
+
             Text(
                 plan.name,
                 color = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
@@ -2506,20 +2018,24 @@ fun PlanCard(
                 fontWeight = FontWeight.Bold
             )
             Text(plan.subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-            Spacer(modifier = Modifier.height(8.dp))
-            
+            Spacer(modifier = Modifier.height(6.dp))
+
             Text(
                 stringResource(R.string.plan_price, plan.price),
                 color = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold
             )
+            Text(
+                text = "المدة: ${plan.durationDays} يوماً",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall
+            )
             Spacer(modifier = Modifier.height(8.dp))
-            
+
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Spacer(modifier = Modifier.height(8.dp))
-            
-            // Features
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Filled.Add, contentDescription = null, tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(4.dp))
@@ -2532,17 +2048,28 @@ fun PlanCard(
                 Text(stringResource(R.string.feature_tech_support), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
             Spacer(modifier = Modifier.height(12.dp))
-            
+
             Button(
                 onClick = onSubscribe,
                 enabled = !isSubscriptionLocked,
                 shape = RoundedCornerShape(20.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isCurrentActivePlan) Color(0xFF2E7D32) else Primary,
-                    disabledContainerColor = if (isCurrentActivePlan) Color(0xFF2E7D32).copy(alpha = 0.75f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
-                    disabledContentColor = if (isCurrentActivePlan) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                    containerColor = when {
+                        isCurrentActivePlan -> Color(0xFF2E7D32)
+                        isPendingReviewPlan -> Color(0xFFD97706)
+                        else -> Primary
+                    },
+                    disabledContainerColor = when {
+                        isCurrentActivePlan -> Color(0xFF2E7D32).copy(alpha = 0.78f)
+                        isPendingReviewPlan -> Color(0xFFD97706).copy(alpha = 0.8f)
+                        else -> MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                    },
+                    disabledContentColor = if (isCurrentActivePlan || isPendingReviewPlan) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
                 ),
-                modifier = Modifier.testTag("plan_subscribe_button_${plan.id}")
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("plan_subscribe_button_${plan.id}")
             ) {
                 if (isLockedOtherPlan) {
                     Icon(
@@ -2555,7 +2082,8 @@ fun PlanCard(
                 Text(
                     text = when {
                         isCurrentActivePlan -> "باقتك نشطة ✓"
-                        isLockedOtherPlan -> "مقفل حتى الانتهاء"
+                        isPendingReviewPlan -> "بانتظار المراجعة"
+                        isLockedOtherPlan -> "مقفل حالياً"
                         else -> stringResource(R.string.subscribe_now)
                     },
                     color = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Color.White,
@@ -3226,45 +2754,46 @@ fun SideMenuContent(
             }
 
             // 3. 💳 الباقة الحالية (Current Subscription Plan - Connected to Firestore `subscriptions`)
-            val isPlanActive = subscriptionStatus.canRequestCaptain()
-            val planStatusLabel = when {
-                subscriptionStatus.isChecking && !isPlanActive -> "جاري التحقق..."
-                !subscriptionStatus.serverError.isNullOrBlank() && !isPlanActive -> "خطأ اتصال"
-                subscriptionStatus.isOfflineUnverified -> "غير متصل"
-                subscriptionStatus.isSuspended -> "موقوفة"
-                subscriptionStatus.isCancelled -> "ملغاة"
-                subscriptionStatus.isExpired || subscriptionStatus.status == "expired" -> "منتهية"
-                subscriptionStatus.status == "payment_failed" || subscriptionStatus.paymentStatus == "failed" -> "فشل الدفع"
-                !subscriptionStatus.isSubscribed || subscriptionStatus.status == "unsubscribed" || subscriptionStatus.maxCaptains <= 0 -> "غير مشترك"
-                else -> "فعال ✓"
-            }
-            val planStatusBadgeColor = when {
-                isPlanActive -> Color(0xFF2E7D32)
-                subscriptionStatus.isChecking -> Primary
-                !subscriptionStatus.serverError.isNullOrBlank() || subscriptionStatus.isOfflineUnverified -> Color(0xFFE65100)
-                else -> Color(0xFFC62828)
-            }
-            val formattedRenewalDate = remember(subscriptionStatus.endDateMillis, subscriptionStatus.isSubscribed, isPlanActive) {
+            val statusVisual = remember(subscriptionStatus) { resolveSubscriptionStatusVisual(subscriptionStatus) }
+            val isPlanActive = statusVisual.isActive
+            val planStatusLabel = statusVisual.badgeText
+            val planStatusBadgeColor = statusVisual.accentColor
+            val formattedRenewalDate = remember(subscriptionStatus, isPlanActive) {
                 val endMillis = subscriptionStatus.endDateMillis
-                if (isPlanActive && endMillis != null && endMillis > 0L) {
-                    val formatted = SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(endMillis))
-                    "ميعاد التجديد: $formatted"
-                } else if (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired || subscriptionStatus.isOfflineUnverified) {
-                    subscriptionStatus.message ?: "يرجى التواصل مع الإدارة أو تجديد الاشتراك"
-                } else {
-                    "يرجى الاشتراك في باقة لتفعيل طلب الكباتن"
+                when {
+                    isPlanActive && endMillis != null && endMillis > 0L -> {
+                        val formatted = SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(endMillis))
+                        "ينتهي في: $formatted • متبقي ${subscriptionStatus.remainingTimeLabel()}"
+                    }
+                    subscriptionStatus.isPendingReview || subscriptionStatus.isPending ->
+                        "طلب الاشتراك قيد مراجعة الإدارة (فودافون كاش)"
+                    subscriptionStatus.isResubmissionRequired ->
+                        "مطلوب إعادة إرسال الإيصال: ${subscriptionStatus.resubmissionReason ?: subscriptionStatus.message ?: "يرجى رفع صورة واضحة للإيصال"}"
+                    subscriptionStatus.isRejected ->
+                        "سبب الرفض: ${subscriptionStatus.rejectionReason ?: subscriptionStatus.message ?: "يرجى مراجعة الإدارة وإعادة الإرسال"}"
+                    subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired || subscriptionStatus.isOfflineUnverified ->
+                        subscriptionStatus.message ?: "يرجى التواصل مع الإدارة أو تجديد الاشتراك"
+                    else ->
+                        "لم يتم الاشتراك بعد — اشترك الآن عبر فودافون كاش"
                 }
             }
-            val selectedPlanDisplay = remember(subscriptionStatus.planName, subscriptionStatus.maxCaptains, subscriptionStatus.isSubscribed, subscriptionStatus.price) {
-                if (!subscriptionStatus.isSubscribed || subscriptionStatus.maxCaptains <= 0) {
-                    "غير مشترك في باقة"
-                } else {
-                    val baseName = subscriptionStatus.planName.ifBlank { "الباقة الأساسية" }
-                    if (subscriptionStatus.maxCaptains > 0 && !baseName.contains("كابتن")) {
-                        "$baseName (${subscriptionStatus.maxCaptains} كابتن - ${subscriptionStatus.price} ج.م)"
-                    } else {
-                        baseName
+            val selectedPlanDisplay = remember(subscriptionStatus, isPlanActive) {
+                when {
+                    isPlanActive -> {
+                        val baseName = subscriptionStatus.planName.ifBlank { "الباقة الأساسية" }
+                        if (subscriptionStatus.maxCaptains > 0 && !baseName.contains("كابتن")) {
+                            "$baseName (${subscriptionStatus.maxCaptains} كابتن - ${subscriptionStatus.price} ج.م)"
+                        } else {
+                            baseName
+                        }
                     }
+                    subscriptionStatus.isPendingReview && subscriptionStatus.planId > 0 ->
+                        "${subscriptionStatus.planName} (قيد مراجعة الإدارة)"
+                    subscriptionStatus.isResubmissionRequired ->
+                        "مطلوب إعادة إرسال الإيصال"
+                    subscriptionStatus.isRejected ->
+                        "تم رفض طلب الاشتراك"
+                    else -> "لم يتم الاشتراك في باقة"
                 }
             }
 
@@ -5044,16 +4573,27 @@ fun RequestCaptainPopupDialog(
                     }
                 } else if (!isSubscribedAndActive) {
                     val isServerErr = !subscriptionStatus.serverError.isNullOrBlank()
-                    val isAmberBanner = isServerErr || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending
+                    val isAmberBanner = isServerErr || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending || subscriptionStatus.isPendingReview || subscriptionStatus.isResubmissionRequired
                     val blockTitle = when {
                         isServerErr -> "⚠️ تعذر التحقق من الاشتراك مع السيرفر"
                         subscriptionStatus.isOfflineUnverified -> "⚠️ تعذر التحقق من الاشتراك (غير متصل)"
-                        subscriptionStatus.isPending -> "⏳ طلب الاشتراك قيد المراجعة"
-                        subscriptionStatus.status == "inactive" -> "⛔ اشتراكك غير نشط حالياً"
-                        subscriptionStatus.isSuspended -> "⛔ تم إيقاف الاشتراك من الإدارة"
+                        subscriptionStatus.isPendingReview || subscriptionStatus.isPending -> "⏳ قيد مراجعة الإدارة"
+                        subscriptionStatus.isResubmissionRequired -> "📄 مطلوب إعادة إرسال الإيصال"
+                        subscriptionStatus.isRejected -> "❌ تم رفض طلب الاشتراك"
+                        subscriptionStatus.status == "inactive" -> "⛔ الاشتراك موقوف حالياً"
+                        subscriptionStatus.isSuspended -> "⛔ الاشتراك موقوف من الإدارة"
                         subscriptionStatus.isCancelled -> "❌ تم إلغاء الاشتراك"
-                        subscriptionStatus.isExpired -> "⌛ انتهت فترة الاشتراك"
-                        else -> "⚠️ لا يمكن عمل طلب كابتن"
+                        subscriptionStatus.isExpired -> "⌛ الاشتراك منتهي"
+                        else -> "⚠️ لم يتم الاشتراك — لا يمكن طلب كابتن"
+                    }
+                    val blockMessage: String = when {
+                        !subscriptionStatus.serverError.isNullOrBlank() -> subscriptionStatus.serverError.orEmpty()
+                        subscriptionStatus.isResubmissionRequired && !subscriptionStatus.resubmissionReason.isNullOrBlank() ->
+                            "ملاحظة الإدارة: ${subscriptionStatus.resubmissionReason}"
+                        subscriptionStatus.isRejected && !subscriptionStatus.rejectionReason.isNullOrBlank() ->
+                            "سبب الرفض من الإدارة: ${subscriptionStatus.rejectionReason}"
+                        !subscriptionStatus.message.isNullOrBlank() -> subscriptionStatus.message.orEmpty()
+                        else -> "أنت غير مشترك في باقة حالياً. يجب الاشتراك عبر فودافون كاش وموافقة الإدارة أولاً لتتمكن من طلب كابتن."
                     }
                     Surface(
                         color = if (isAmberBanner) Color(0xFFFFF3E0) else Color(0xFFFFEBEE),
@@ -5072,8 +4612,7 @@ fun RequestCaptainPopupDialog(
                                 color = if (isAmberBanner) Color(0xFFE65100) else Color(0xFFC62828)
                             )
                             Text(
-                                text = subscriptionStatus.serverError ?: subscriptionStatus.message
-                                    ?: "أنت غير مشترك في باقة حالياً. يجب الاشتراك في إحدى الباقات المتاحة أولاً لتتمكن من طلب كابتن.",
+                                text = blockMessage,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = if (isAmberBanner) Color(0xFF5D4037) else Color(0xFFB71C1C),
                                 fontWeight = FontWeight.Medium
@@ -5196,10 +4735,12 @@ fun RequestCaptainPopupDialog(
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Text(
-                            text = if (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired) {
-                                "تجديد / عرض الباقات"
-                            } else {
-                                "الاشتراك في باقة الآن"
+                            text = when {
+                                subscriptionStatus.isPendingReview || subscriptionStatus.isPending -> "متابعة حالة الطلب"
+                                subscriptionStatus.isResubmissionRequired -> "إعادة إرسال الإيصال"
+                                subscriptionStatus.isRejected -> "إعادة إرسال طلب الاشتراك"
+                                subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired -> "تجديد / عرض الباقات"
+                                else -> "الاشتراك في باقة الآن"
                             },
                             color = Color.White,
                             fontWeight = FontWeight.Bold
@@ -5482,7 +5023,7 @@ fun isOrderCancelled(status: String): Boolean {
 fun isOrderCompleted(status: String): Boolean {
     val s = status.trim().lowercase(Locale.ROOT)
     return s in listOf("مكتملة", "مكتمل", "تم التسليم", "تم التوصيل", "تم", "completed", "delivered") ||
-           s.contains("مكتمل") || s.contains("تسليم") || s.contains("توصيل بنجاح") || s.contains("deliver")
+           s.contains("مكتمل") || s.contains("تسليم") || s.contains("توصيل بنجاح") || s.contains("delivered")
 }
 
 fun isOrderInProgress(status: String): Boolean {

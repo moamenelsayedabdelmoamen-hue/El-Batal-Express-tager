@@ -41,6 +41,121 @@ data class ServerSubscriptionValidationResult(
     val message: String? = null
 )
 
+data class SubscriptionPlanOption(
+    val id: Int,
+    val name: String,
+    val captainsLabel: String,
+    val maxCaptains: Int,
+    val priceEgp: Int,
+    val durationDays: Int = 30,
+    val isPopular: Boolean = false
+)
+
+data class VodafoneCashSettings(
+    val walletNumber: String = OFFICIAL_VODAFONE_CASH_NUMBER,
+    val walletHolderName: String = "",
+    val instructions: String = "1. قم بتحويل قيمة الباقة عبر فودافون كاش إلى الرقم الرسمي الموضح أعلاه.\n2. التقط صورة واضحة (سكرين شوت) لإيصال أو رسالة تأكيد التحويل.\n3. أدخل رقم الهاتف المحوَّل منه وارفع صورة الإيصال ثم اضغط إرسال للمراجعة.\n4. سيتم تفعيل باقتك تلقائياً فور مراجعة وموافقة الإدارة.",
+    val plans: List<SubscriptionPlanOption> = OFFICIAL_PLANS,
+    val isConfiguredOnServer: Boolean = false,
+    val isLoading: Boolean = false,
+    val loadError: String? = null
+) {
+    companion object {
+        // Official Vodafone Cash wallet number (overridden dynamically if Admin sets a newer number in Firestore settings/subscription_config)
+        const val OFFICIAL_VODAFONE_CASH_NUMBER: String = "01095783737"
+
+        // Official 4 subscription plans matching server OFFICIAL_SUBSCRIPTION_PLANS (prices preserved untouched)
+        val OFFICIAL_PLANS: List<SubscriptionPlanOption> = listOf(
+            SubscriptionPlanOption(
+                id = 1,
+                name = "الباقة الأساسية",
+                captainsLabel = "2 كابتن",
+                maxCaptains = 2,
+                priceEgp = 400,
+                durationDays = 30,
+                isPopular = false
+            ),
+            SubscriptionPlanOption(
+                id = 2,
+                name = "الباقة المتوسطة",
+                captainsLabel = "4 كابتن",
+                maxCaptains = 4,
+                priceEgp = 800,
+                durationDays = 30,
+                isPopular = false
+            ),
+            SubscriptionPlanOption(
+                id = 3,
+                name = "الباقة المميزة",
+                captainsLabel = "6 كابتن",
+                maxCaptains = 6,
+                priceEgp = 1200,
+                durationDays = 30,
+                isPopular = true
+            ),
+            SubscriptionPlanOption(
+                id = 4,
+                name = "الباقة المتقدمة",
+                captainsLabel = "8 كابتن",
+                maxCaptains = 8,
+                priceEgp = 1600,
+                durationDays = 30,
+                isPopular = false
+            )
+        )
+    }
+}
+
+data class ManualSubscriptionRequestPayload(
+    val merchantId: String,
+    val planId: Int,
+    val planName: String,
+    val maxCaptains: Int,
+    val expectedAmount: Int,
+    val senderPhone: String,
+    val transactionReference: String,
+    val receiptStoragePath: String,
+    val requestId: String,
+    val notes: String = ""
+) {
+    fun toCallableMap(): HashMap<String, Any> = hashMapOf(
+        "merchantId" to merchantId,
+        "planId" to planId,
+        "packageId" to planId,
+        "planName" to planName,
+        "maxCaptains" to maxCaptains,
+        "expectedAmount" to expectedAmount,
+        "amount" to expectedAmount,
+        "senderPhone" to senderPhone,
+        "transactionReference" to transactionReference,
+        "notes" to notes,
+        "receiptStoragePath" to receiptStoragePath,
+        "requestId" to requestId,
+        "idempotencyKey" to requestId
+    )
+}
+
+data class ManualSubscriptionSubmissionResult(
+    val requestId: String,
+    val status: String,
+    val planId: Int,
+    val planName: String,
+    val maxCaptains: Int,
+    val expectedAmount: Int,
+    val durationDays: Int,
+    val receiptStoragePath: String,
+    val subscriptionVersion: Long,
+    val message: String,
+    val isReplay: Boolean = false
+)
+
+sealed class ManualSubscriptionUiState {
+    data object Idle : ManualSubscriptionUiState()
+    data class Submitting(val stepMessage: String = "جاري رفع إيصال التحويل وإرسال الطلب...") : ManualSubscriptionUiState()
+    data class Submitted(val result: ManualSubscriptionSubmissionResult) : ManualSubscriptionUiState()
+    data class Error(val message: String) : ManualSubscriptionUiState()
+}
+
 /**
  * Central repository bridging the Merchant Android App with:
  * 1. Real-time Firestore snapshot listeners (`subscriptions/{uid}` and `merchants/{uid}`) with MetadataChanges.INCLUDE.
@@ -54,6 +169,120 @@ class MerchantSubscriptionRepository {
         const val FUNCTIONS_REGION = "us-central1"
         const val PRIMARY_ORDER_FUNCTION = "requestCaptains"
         const val LEGACY_SERVER_ORDER_FUNCTION = "createOrderWithCode"
+        const val MANUAL_SUBSCRIPTION_FUNCTION = "submitManualSubscriptionRequest"
+
+        fun normalizeEgyptianMobile(rawPhone: String?): String? {
+            val cleaned = rawPhone?.trim()?.replace(Regex("[\\s\\-()]"), "").orEmpty()
+            if (cleaned.isEmpty()) return null
+            val normalized = when {
+                cleaned.startsWith("+20") -> "0" + cleaned.removePrefix("+20")
+                cleaned.startsWith("20") && cleaned.length == 12 -> "0" + cleaned.removePrefix("20")
+                cleaned.startsWith("1") && cleaned.length == 10 -> "0$cleaned"
+                else -> cleaned
+            }
+            return if (Regex("^01[0125][0-9]{8}$").matches(normalized)) normalized else null
+        }
+
+        /**
+         * Parses dynamic plan definitions from Firebase settings (`plans` or `packages` list)
+         * while falling back safely to [VodafoneCashSettings.OFFICIAL_PLANS].
+         */
+        fun parseConfiguredPlans(rawPlans: Any?): List<SubscriptionPlanOption> {
+            val list = rawPlans as? List<*> ?: return VodafoneCashSettings.OFFICIAL_PLANS
+            val parsed = list.mapNotNull { entry ->
+                val map = entry as? Map<*, *> ?: return@mapNotNull null
+                val id = (map["id"] as? Number)?.toInt()
+                    ?: (map["planId"] as? Number)?.toInt()
+                    ?: (map["packageId"] as? Number)?.toInt()
+                    ?: return@mapNotNull null
+                if (id !in 1..4) return@mapNotNull null
+                val defaultPlan = VodafoneCashSettings.OFFICIAL_PLANS.firstOrNull { it.id == id }
+                    ?: return@mapNotNull null
+                val name = (map["name"] ?: map["planName"] ?: map["title"])?.toString()?.trim()
+                    ?.takeIf { it.isNotBlank() } ?: defaultPlan.name
+                val maxCaptains = (map["maxCaptains"] as? Number)?.toInt()
+                    ?: (map["captainLimit"] as? Number)?.toInt()
+                    ?: defaultPlan.maxCaptains
+                val priceEgp = (map["price"] as? Number)?.toInt()
+                    ?: (map["priceEgp"] as? Number)?.toInt()
+                    ?: (map["amount"] as? Number)?.toInt()
+                    ?: defaultPlan.priceEgp
+                val durationDays = (map["durationDays"] as? Number)?.toInt()
+                    ?.takeIf { it > 0 } ?: defaultPlan.durationDays
+                val isPopular = (map["isPopular"] as? Boolean) ?: defaultPlan.isPopular
+                SubscriptionPlanOption(
+                    id = id,
+                    name = name,
+                    captainsLabel = "$maxCaptains كابتن",
+                    maxCaptains = maxCaptains,
+                    priceEgp = priceEgp,
+                    durationDays = durationDays,
+                    isPopular = isPopular
+                )
+            }.sortedBy { it.id }
+            return if (parsed.isNotEmpty()) parsed else VodafoneCashSettings.OFFICIAL_PLANS
+        }
+
+        /**
+         * Validates user inputs before receipt upload or server submission.
+         * Returns an Arabic error message if invalid, or null if valid.
+         */
+        fun validateManualSubscriptionInput(
+            plan: SubscriptionPlanOption?,
+            senderPhone: String,
+            receiptLocalUri: String?,
+            currentSubscription: SubscriptionStatusState
+        ): String? {
+            if (currentSubscription.canRequestCaptain()) {
+                return "لديك باقة نشطة وسارية حالياً ولا يمكن إرسال طلب اشتراك جديد قبل انتهائها."
+            }
+            if (currentSubscription.isPendingReview || currentSubscription.status == "pending_review") {
+                return "لديك بالفعل طلب اشتراك قيد مراجعة الإدارة حالياً. يرجى انتظار قرار الإدارة."
+            }
+            if (plan == null || plan.id !in 1..4) {
+                return "يرجى اختيار إحدى الباقات الرسمية المتاحة."
+            }
+            if (normalizeEgyptianMobile(senderPhone) == null) {
+                return "يرجى إدخال رقم هاتف مصري صحيح المحوَّل منه (يبدأ بـ 01 ومكون من 11 رقم)."
+            }
+            if (receiptLocalUri.isNullOrBlank()) {
+                return "يجب رفع صورة إيصال التحويل عبر فودافون كاش قبل إرسال الطلب للمراجعة."
+            }
+            return null
+        }
+
+        fun mapManualSubscriptionError(
+            code: FirebaseFunctionsException.Code,
+            rawMessage: String?,
+            details: Any?
+        ): String {
+            if (isEndpointNotFoundError(code, rawMessage, details)) {
+                return "خدمة إرسال طلبات الاشتراك غير متاحة حالياً على السيرفر ($MANUAL_SUBSCRIPTION_FUNCTION في منطقة $FUNCTIONS_REGION). يرجى التأكد من نشر Cloud Functions ثم المحاولة مرة أخرى."
+            }
+            val cleaned = rawMessage?.trim()?.takeIf {
+                it.isNotBlank() &&
+                    !it.equals("NOT_FOUND", ignoreCase = true) &&
+                    !it.equals("INTERNAL", ignoreCase = true) &&
+                    !it.equals("UNKNOWN", ignoreCase = true)
+            }
+            return when (code) {
+                FirebaseFunctionsException.Code.ALREADY_EXISTS ->
+                    cleaned ?: "لديك بالفعل طلب اشتراك في انتظار مراجعة الإدارة حالياً."
+                FirebaseFunctionsException.Code.FAILED_PRECONDITION ->
+                    cleaned ?: "تعذر إرسال طلب الاشتراك: يرجى التأكد من رفع الإيصال وحالة اشتراكك الحالي."
+                FirebaseFunctionsException.Code.INVALID_ARGUMENT ->
+                    cleaned ?: "بيانات طلب الاشتراك غير مكتملة أو غير صالحة. يرجى مراجعة الرقم وصورة الإيصال."
+                FirebaseFunctionsException.Code.UNAUTHENTICATED ->
+                    cleaned ?: "يجب تسجيل الدخول أولاً لإرسال طلب الاشتراك."
+                FirebaseFunctionsException.Code.PERMISSION_DENIED ->
+                    cleaned ?: "غير مسموح بتنفيذ هذا الإجراء لهذا الحساب."
+                FirebaseFunctionsException.Code.UNAVAILABLE,
+                FirebaseFunctionsException.Code.DEADLINE_EXCEEDED ->
+                    "تعذر الاتصال بالسيرفر حالياً. يرجى التحقق من الإنترنت والمحاولة مرة أخرى."
+                else ->
+                    cleaned ?: "حدث خطأ أثناء إرسال طلب الاشتراك للمراجعة. يرجى المحاولة مرة أخرى."
+            }
+        }
 
         /**
          * Distinguishes HTTP 404 endpoint-missing `NOT_FOUND` (undeployed Cloud Function or wrong region)
@@ -375,6 +604,143 @@ class MerchantSubscriptionRepository {
             Result.failure(
                 IllegalStateException(
                     e.localizedMessage ?: "تعذر إنشاء الطلب عبر السيرفر، يرجى المحاولة مرة أخرى.",
+                    e
+                )
+            )
+        }
+    }
+
+    /**
+     * Fetches the official Vodafone Cash wallet number, optional wallet holder name, dynamic plans,
+     * and instructions configured by Admin in Firebase Firestore (`settings/subscription_config`).
+     */
+    suspend fun fetchVodafoneCashSettings(): VodafoneCashSettings {
+        val candidateDocIds = listOf(
+            "subscription_config",
+            "vodafone_cash",
+            "payments",
+            "app_settings",
+            "general"
+        )
+        var resolvedWallet = VodafoneCashSettings.OFFICIAL_VODAFONE_CASH_NUMBER
+        var resolvedHolder = ""
+        var resolvedInstructions = VodafoneCashSettings().instructions
+        var resolvedPlans = VodafoneCashSettings.OFFICIAL_PLANS
+        var foundOnServer = false
+
+        for (docId in candidateDocIds) {
+            try {
+                val snap = try {
+                    Firebase.firestore.collection("settings").document(docId).get(Source.SERVER).await()
+                } catch (_: Exception) {
+                    Firebase.firestore.collection("settings").document(docId).get().await()
+                }
+                if (snap.exists()) {
+                    val rawPlans = snap.get("plans") ?: snap.get("packages")
+                    if (rawPlans != null) {
+                        resolvedPlans = parseConfiguredPlans(rawPlans)
+                    }
+                    val wallet = snap.getAnyString(
+                        "vodafoneCashNumber",
+                        "vodafone_cash_number",
+                        "vodafoneCashWallet",
+                        "walletNumber",
+                        "officialWalletNumber",
+                        "paymentWalletNumber",
+                        "subscriptionWalletNumber"
+                    )?.trim().orEmpty()
+                    if (wallet.isNotBlank()) {
+                        resolvedWallet = wallet
+                        foundOnServer = true
+                        snap.getAnyString(
+                            "vodafoneCashAccountName",
+                            "walletHolderName",
+                            "accountName"
+                        )?.trim()?.takeIf { it.isNotBlank() }?.let { resolvedHolder = it }
+                        snap.getAnyString(
+                            "vodafoneCashInstructions",
+                            "paymentInstructions",
+                            "instructions"
+                        )?.trim()?.takeIf { it.isNotBlank() }?.let { resolvedInstructions = it }
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Reading settings/$docId note: ${e.message}")
+            }
+        }
+
+        return VodafoneCashSettings(
+            walletNumber = resolvedWallet,
+            walletHolderName = resolvedHolder,
+            instructions = resolvedInstructions,
+            plans = resolvedPlans,
+            isConfiguredOnServer = foundOnServer,
+            isLoading = false,
+            loadError = null
+        )
+    }
+
+    /**
+     * Calls the trusted Cloud Function `submitManualSubscriptionRequest` (region us-central1).
+     * Never activates the subscription locally — only registers a `pending_review` request for Admin review.
+     */
+    suspend fun submitManualSubscriptionRequest(
+        payload: ManualSubscriptionRequestPayload
+    ): Result<ManualSubscriptionSubmissionResult> {
+        return try {
+            val result = functionsClient()
+                .getHttpsCallable(MANUAL_SUBSCRIPTION_FUNCTION)
+                .call(payload.toCallableMap())
+                .await()
+
+            val data = result.getData() as? Map<*, *>
+                ?: throw IllegalStateException("استجابة غير صالحة من السيرفر عند إرسال طلب الاشتراك.")
+
+            val requestId = data["requestId"]?.toString()?.trim().orEmpty().ifBlank { payload.requestId }
+            val status = data["status"]?.toString()?.trim().orEmpty().ifBlank { "pending_review" }
+            val planId = (data["planId"] as? Number)?.toInt() ?: payload.planId
+            val planName = data["planName"]?.toString()?.trim().orEmpty().ifBlank { payload.planName }
+            val maxCaptains = (data["maxCaptains"] as? Number)?.toInt() ?: payload.maxCaptains
+            val expectedAmount = (data["expectedAmount"] as? Number)?.toInt() ?: payload.expectedAmount
+            val durationDays = (data["durationDays"] as? Number)?.toInt() ?: 30
+            val receiptPath = data["receiptStoragePath"]?.toString()?.trim().orEmpty().ifBlank { payload.receiptStoragePath }
+            val version = (data["subscriptionVersion"] as? Number)?.toLong() ?: 1L
+            val isReplay = (data["isReplay"] as? Boolean) == true
+            val message = data["message"]?.toString()?.trim().orEmpty()
+                .ifBlank { "تم إرسال طلب الاشتراك بنجاح وهو الآن في انتظار مراجعة الإدارة." }
+
+            Result.success(
+                ManualSubscriptionSubmissionResult(
+                    requestId = requestId,
+                    status = status,
+                    planId = planId,
+                    planName = planName,
+                    maxCaptains = maxCaptains,
+                    expectedAmount = expectedAmount,
+                    durationDays = durationDays,
+                    receiptStoragePath = receiptPath,
+                    subscriptionVersion = version,
+                    message = message,
+                    isReplay = isReplay
+                )
+            )
+        } catch (fnEx: FirebaseFunctionsException) {
+            Log.e(
+                TAG,
+                "submitManualSubscriptionRequest failed | code=${fnEx.code} requestId=${payload.requestId} msg=${fnEx.message}"
+            )
+            Result.failure(
+                IllegalStateException(
+                    mapManualSubscriptionError(fnEx.code, fnEx.message, fnEx.details),
+                    fnEx
+                )
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Unexpected error calling submitManualSubscriptionRequest: ${e.message}", e)
+            Result.failure(
+                IllegalStateException(
+                    e.localizedMessage ?: "تعذر إرسال طلب الاشتراك للمراجعة. يرجى المحاولة مرة أخرى.",
                     e
                 )
             )

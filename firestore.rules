@@ -84,7 +84,7 @@ service cloud.firestore {
       let isMerchDoc = merch.accountType == 'merchant' || (!('accountType' in merch) && merch.role == 'merchant');
       return isMerchDoc &&
         merch.status in ['approved', 'active'] &&
-        !('subscriptionStatus' in merch && merch.subscriptionStatus in ['suspended', 'inactive', 'cancelled', 'canceled', 'expired', 'pending', 'pending_payment', 'payment_failed']) &&
+        !('subscriptionStatus' in merch && merch.subscriptionStatus in ['suspended', 'inactive', 'cancelled', 'canceled', 'expired', 'pending', 'pending_review', 'rejected', 'resubmission_required', 'pending_payment', 'payment_failed']) &&
         (
           exists(/databases/$(database)/documents/subscriptions/$(uid))
             ? isSubscriptionDocActive(get(/databases/$(database)/documents/subscriptions/$(uid)).data)
@@ -366,6 +366,20 @@ service cloud.firestore {
       );
       allow list: if isAdmin();
       // Subscription activation, suspension, cancellation, and extension are strictly server/Admin-only.
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Manual Vodafone Cash Subscription Requests collection:
+    // Created exclusively by trusted Cloud Function `submitManualSubscriptionRequest` (Admin SDK).
+    // Reviewed/approved/rejected exclusively by Admins via `adminReviewManualSubscriptionRequest` / `adminUpdateMerchantSubscription`.
+    match /subscription_requests/{requestId} {
+      allow get, list: if isAdmin() || (
+        isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        !hasCaptainAccount(request.auth.uid) &&
+        resource != null &&
+        resource.data.merchantId == request.auth.uid
+      );
       allow create, update, delete: if isAdmin();
     }
 
