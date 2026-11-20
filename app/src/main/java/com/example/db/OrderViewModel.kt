@@ -1968,10 +1968,11 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         "orderId" to matchedDoc.id,
                         "destinationAddress" to destinationAddress,
                         "orderDetails" to orderDetails,
-                        "customerPhone" to customerPhone,
-                        "customerName" to customerName,
+                        "customerPhone" to customerPhone.ifBlank { matchedDoc.getString("customerPhone").orEmpty() },
+                        "customerName" to customerName.ifBlank { matchedDoc.getString("customerName").orEmpty() },
                         "serviceFee" to serviceFee,
-                        "deliveryNotes" to ""
+                        "deliveryNotes" to (matchedDoc.getString("deliveryNotes")
+                            ?: matchedDoc.getString("notes").orEmpty())
                     ))
                     .await()
                 repository.updateOrderDetails(
