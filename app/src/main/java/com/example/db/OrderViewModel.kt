@@ -1313,7 +1313,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             "customer_details_submitted", "بانتظار تأكيد البيانات", "في انتظار تأكيد البيانات",
             "بانتظار التأكيد", "تأكيد البيانات", "تم إرسال البيانات", "تم ارسال البيانات" -> "بانتظار تأكيد البيانات"
             "customer_confirmed", "confirmed_by_merchant", "merchant_confirmed", "en_route", "تم تأكيد البيانات" -> "جاري التوصيل"
-            "customer_rejected", "بيانات مرفوضة" -> "بيانات مرفوضة"
+            "merchant_rejected", "customer_rejected", "بيانات مرفوضة" -> "بيانات مرفوضة"
             "in_progress", "out_for_delivery", "جاري التوصيل", "delivering", "في الطريق إلى العميل" -> "جاري التوصيل"
             "completed", "delivered", "تم التسليم", "مكتمل", "مكتملة", "تم التوصيل" -> "تم التسليم"
             "cancelled", "canceled", "ملغي", "ملغية", "تم الإلغاء", "تم الالغاء" -> "ملغي"
