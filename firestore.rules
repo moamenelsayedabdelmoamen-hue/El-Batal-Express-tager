@@ -24,24 +24,10 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    // Resolve the server-provisioned admin registry directly. The /admins match
-    // below is owner-read-only, so the authorization helper cannot recurse through
-    // that match when a captain or merchant rule asks whether a caller is an admin.
-    function isRegisteredAdmin() {
-      let adminPath = /databases/$(database)/documents/admins/$(request.auth.uid);
-      let adminExists = exists(adminPath);
-      let adminRecord = get(adminPath);
-      // Read the registry document once. Do not access .data unless it exists.
-      return adminExists
-        && adminRecord.data != null
-        && (
-          adminRecord.data.get('role', '') == 'admin' ||
-          adminRecord.data.get('isAdmin', false) == true ||
-          adminRecord.data.get('isSuperAdmin', false) == true
-        )
-        && adminRecord.data.get('status', 'active') in ['active', 'approved'];
-    }
-
+    // Administrator access is granted only by server-issued Firebase Auth
+    // custom claims or a verified allowlisted administrator email. Do not read
+    // /admins from this helper: per-request document lookups add evaluation cost
+    // and must never be used as a client-controlled privilege source.
     function isAdmin() {
       return isSignedIn() && (
         request.auth.token.get('role', '') == 'admin' ||
@@ -52,8 +38,7 @@ service cloud.firestore {
             'moamen.elsayed.abdelmoamen@gmail.com',
             'admin@elbatalexpress.com'
           ]
-        ) ||
-        isRegisteredAdmin()
+        )
       );
     }
 
