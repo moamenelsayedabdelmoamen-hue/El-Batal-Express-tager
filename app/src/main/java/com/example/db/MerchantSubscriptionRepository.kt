@@ -256,7 +256,7 @@ class MerchantSubscriptionRepository {
             if (currentSubscription.isResubmissionRequired && currentSubscription.pendingRequestId.isNullOrBlank()) {
                 return "تعذر العثور على رقم طلب الاشتراك المطلوب إعادة إرساله. حدّث حالة الاشتراك من السيرفر ثم حاول مرة أخرى."
             }
-            if (plan == null || plan.id !in 1..4) {
+            if (plan == null || plan.id !in 1..4 || plan.maxCaptains !in listOf(2, 4, 6, 8) || plan.priceEgp <= 0) {
                 return "يرجى اختيار إحدى الباقات الرسمية المتاحة."
             }
             if (normalizeEgyptianMobile(senderPhone) == null) {
