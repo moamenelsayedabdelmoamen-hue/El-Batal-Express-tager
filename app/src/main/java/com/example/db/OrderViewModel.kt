@@ -1577,9 +1577,18 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
+            val enteredFee = serviceFee.trim()
+            if (enteredFee.isBlank() || enteredFee.replace(",", "").toDoubleOrNull() == null ||
+                enteredFee.replace(",", "").toDoubleOrNull()!! < 0
+            ) {
+                val feeMsg = "يرجى إدخال قيمة خدمة التوصيل من تطبيق التاجر قبل طلب الكابتن."
+                _snackbarMessage.value = feeMsg
+                onError?.invoke(feeMsg)
+                return@launch
+            }
             val sdf = SimpleDateFormat("dd MMMM yyyy - hh:mm a", Locale("ar"))
             val currentDate = sdf.format(Date())
-            val formattedFee = if (serviceFee.isBlank()) "30 جنيه" else if (serviceFee.contains("جنيه")) serviceFee.trim() else "${serviceFee.trim()} جنيه"
+            val formattedFee = if (enteredFee.contains("جنيه")) enteredFee else "$enteredFee جنيه"
             val uid = currentUser.uid
             val idempotencyKey = UUID.randomUUID().toString()
             val profile = _restaurantProfile.value
