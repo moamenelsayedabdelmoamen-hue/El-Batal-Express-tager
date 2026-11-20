@@ -9,6 +9,13 @@ service firebase.storage {
     // Admin authorization mirrors Firestore: server-issued claims or a verified
     // allowlisted administrator email. Never infer admin privilege from mere profile
     // document existence.
+    function isRegisteredAdmin() {
+      return isAuthenticated()
+        && firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'admin'
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.get('status', 'active') in ['active', 'approved'];
+    }
+
     function isAdmin() {
       return isAuthenticated() && (
         (('admin' in request.auth.token) && request.auth.token.admin == true) ||
@@ -21,7 +28,8 @@ service firebase.storage {
             'moamen.elsayed.abdelmoamen@gmail.com',
             'admin@elbatalexpress.com'
           ]
-        )
+        ) ||
+        isRegisteredAdmin()
       );
     }
 
