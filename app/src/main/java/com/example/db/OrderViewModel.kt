@@ -1617,8 +1617,21 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val feeInput = serviceFee.trim()
+            val normalizedFeeInput = buildString {
+                feeInput.forEach { character ->
+                    val arabicIndex = "٠١٢٣٤٥٦٧٨٩".indexOf(character)
+                    val persianIndex = "۰۱۲۳۴۵۶۷۸۹".indexOf(character)
+                    append(
+                        when {
+                            arabicIndex >= 0 -> arabicIndex
+                            persianIndex >= 0 -> persianIndex
+                            else -> character
+                        }
+                    )
+                }
+            }
             val feeDigits = Regex("""\d+(?:\.\d+)?""")
-                .find(feeInput.replace(",", ""))?.value?.toDoubleOrNull()
+                .find(normalizedFeeInput.replace(",", ""))?.value?.toDoubleOrNull()
             if (feeInput.isBlank() || feeDigits == null || !feeDigits.isFinite() || feeDigits < 0.0 || feeDigits > 100000.0) {
                 val feeMsg = "يرجى إدخال قيمة صحيحة لخدمة التوصيل من تطبيق التاجر."
                 _snackbarMessage.value = feeMsg
