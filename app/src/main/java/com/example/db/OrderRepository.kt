@@ -9,6 +9,10 @@ class OrderRepository(private val orderDao: OrderDao) {
         orderDao.insertOrder(order)
     }
 
+    suspend fun clearAllOrders() {
+        orderDao.deleteAllOrders()
+    }
+
     suspend fun updateOrderStatus(orderId: Int, status: String) {
         orderDao.updateOrderStatus(orderId, status)
     }
