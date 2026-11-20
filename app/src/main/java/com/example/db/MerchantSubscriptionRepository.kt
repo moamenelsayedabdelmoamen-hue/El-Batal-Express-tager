@@ -183,8 +183,8 @@ class MerchantSubscriptionRepository {
         }
 
         /**
-         * Parses dynamic plan definitions from Firebase settings (`plans` or `packages` list)
-         * while falling back safely to [VodafoneCashSettings.OFFICIAL_PLANS].
+         * Parses the server-authored plan catalog by captain limit and excludes inactive or
+         * unsupported plans. No local price catalog is used as a payment fallback.
          */
         fun parseConfiguredPlans(rawPlans: Any?): List<SubscriptionPlanOption> {
             val list = rawPlans as? List<*> ?: return emptyList()
