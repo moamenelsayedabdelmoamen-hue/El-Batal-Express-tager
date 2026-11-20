@@ -670,29 +670,6 @@ class MerchantSubscriptionRepository {
     }
 
     /**
-     * Cancels a merchant-owned order through the server. The server validates the
-     * merchant owner, lifecycle status and releases any captain reservation atomically.
-     */
-    suspend fun cancelMerchantOrder(
-        orderId: String,
-        reason: String
-    ): Result<Unit> {
-        return runCatching {
-            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
-            functionsClient()
-                .getHttpsCallable("merchantCancelOrder")
-                .call(
-                    hashMapOf(
-                        "orderId" to orderId,
-                        "reason" to reason.trim().take(500)
-                    )
-                )
-                .await()
-            Unit
-        }
-    }
-
-    /**
      * Fetches the official Vodafone Cash wallet number, optional wallet holder name, dynamic plans,
      * and instructions configured by Admin in Firestore.
      */
