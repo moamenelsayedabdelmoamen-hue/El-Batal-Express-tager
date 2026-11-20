@@ -614,6 +614,26 @@ class MerchantSubscriptionRepository {
         }
     }
 
+    /** Merchant cancellation is authorized and performed by the Dashboard server only. */
+    suspend fun cancelMerchantOrder(
+        orderId: String,
+        reason: String = "إلغاء من قبل التاجر"
+    ): Result<Unit> {
+        return runCatching {
+            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
+            functionsClient()
+                .getHttpsCallable("merchantCancelOrder")
+                .call(
+                    hashMapOf(
+                        "orderId" to orderId,
+                        "reason" to reason.trim().take(500)
+                    )
+                )
+                .await()
+            Unit
+        }
+    }
+
     /**
      * Updates delivery information and merchant-entered service fee only while
      * an order remains unassigned and no captain offer has been sent.
