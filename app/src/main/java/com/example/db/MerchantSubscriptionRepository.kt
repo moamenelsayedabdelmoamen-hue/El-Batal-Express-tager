@@ -166,8 +166,7 @@ class MerchantSubscriptionRepository {
     companion object {
         private const val TAG = "MerchantSubRepo"
         const val FUNCTIONS_REGION = "us-central1"
-        const val PRIMARY_ORDER_FUNCTION = "requestCaptains"
-        const val LEGACY_SERVER_ORDER_FUNCTION = "createOrderWithCode"
+        const val PRIMARY_ORDER_FUNCTION = "merchantCreateOrder"
         const val MANUAL_SUBSCRIPTION_FUNCTION = "submitManualSubscriptionRequest"
 
         fun normalizeEgyptianMobile(rawPhone: String?): String? {
@@ -549,11 +548,10 @@ class MerchantSubscriptionRepository {
     }
 
     /**
-     * Authoritative Cloud Function order creation & captain dispatch request (`requestCaptains`).
-     * Enforces auth, verified email, active server subscription, non-expired date, and captain limit atomically.
-     * If `requestCaptains` returns HTTP 404 (not yet deployed on the project), seamlessly falls back ONLY to
-     * the server-enforced callable `createOrderWithCode` with the exact same `idempotencyKey` — NEVER writes
-     * directly to Firestore from the client.
+     * Creates a delivery order through the single Dashboard Cloud Function.
+     * Delivery fee is sent only from the merchant's input; the server reads the
+     * merchant name, registered phone, and logo from the trusted merchants/{uid} document.
+     * No legacy client-side or alternate-dispatch fallback is allowed.
      */
     suspend fun requestCaptains(payload: Map<String, Any?>): Result<CaptainRequestResult> {
         val merchantUid = Firebase.auth.currentUser?.uid.orEmpty()
@@ -563,60 +561,24 @@ class MerchantSubscriptionRepository {
 
         return try {
             Result.success(invokeServerOrderCallable(PRIMARY_ORDER_FUNCTION, payload))
-        } catch (primaryErr: FirebaseFunctionsException) {
-            if (isEndpointNotFoundError(primaryErr.code, primaryErr.message, primaryErr.details)) {
-                Log.w(
-                    TAG,
-                    "Cloud Function endpoint NOT_FOUND | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${primaryErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()} -> attempting server callable $LEGACY_SERVER_ORDER_FUNCTION"
-                )
-                return try {
-                    Result.success(invokeServerOrderCallable(LEGACY_SERVER_ORDER_FUNCTION, payload))
-                } catch (fallbackErr: FirebaseFunctionsException) {
-                    val bothMissing = isEndpointNotFoundError(
-                        fallbackErr.code,
-                        fallbackErr.message,
-                        fallbackErr.details
-                    )
-                    Log.e(
-                        TAG,
-                        "Server order callable failed | functionName=$LEGACY_SERVER_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${fallbackErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}"
-                    )
-                    val mapped = mapRequestCaptainsError(
-                        code = fallbackErr.code,
-                        rawMessage = fallbackErr.message,
-                        details = fallbackErr.details,
-                        endpointUnavailableOnServer = bothMissing
-                    )
-                    Result.failure(IllegalStateException(mapped, fallbackErr))
-                } catch (fallbackUnexpected: Exception) {
-                    Log.e(
-                        TAG,
-                        "Unexpected error on $LEGACY_SERVER_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}: ${fallbackUnexpected.message}"
-                    )
-                    Result.failure(
-                        IllegalStateException(
-                            fallbackUnexpected.localizedMessage ?: "تعذر إنشاء الطلب عبر السيرفر، يرجى المحاولة مرة أخرى.",
-                            fallbackUnexpected
-                        )
-                    )
-                }
-            }
-
+        } catch (e: FirebaseFunctionsException) {
             Log.e(
                 TAG,
-                "Server order callable rejected | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${primaryErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}"
+                "Server order callable rejected | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${e.code} merchantId=$merchantUid requestId=$requestId",
+                e
             )
-            val msg = mapRequestCaptainsError(
-                code = primaryErr.code,
-                rawMessage = primaryErr.message,
-                details = primaryErr.details,
-                endpointUnavailableOnServer = false
+            val message = mapRequestCaptainsError(
+                code = e.code,
+                rawMessage = e.message,
+                details = e.details,
+                endpointUnavailableOnServer = isEndpointNotFoundError(e.code, e.message, e.details)
             )
-            Result.failure(IllegalStateException(msg, primaryErr))
+            Result.failure(IllegalStateException(message, e))
         } catch (e: Exception) {
             Log.e(
                 TAG,
-                "Unexpected error calling $PRIMARY_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}: ${e.message}"
+                "Unexpected error calling $PRIMARY_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId: ${e.message}",
+                e
             )
             Result.failure(
                 IllegalStateException(
@@ -628,8 +590,88 @@ class MerchantSubscriptionRepository {
     }
 
     /**
+     * Confirms or rejects the delivery details submitted by the assigned captain.
+     * All order state changes are applied transactionally by the Dashboard Cloud Function.
+     */
+    suspend fun confirmMerchantOrder(
+        orderId: String,
+        confirmed: Boolean,
+        rejectionReason: String = ""
+    ): Result<Unit> {
+        return runCatching {
+            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
+            functionsClient()
+                .getHttpsCallable("merchantConfirmOrder")
+                .call(
+                    hashMapOf(
+                        "orderId" to orderId,
+                        "confirmed" to confirmed,
+                        "rejectionReason" to rejectionReason.trim().take(500)
+                    )
+                )
+                .await()
+            Unit
+        }
+    }
+
+    /** Merchant cancellation is authorized and performed by the Dashboard server only. */
+    suspend fun cancelMerchantOrder(
+        orderId: String,
+        reason: String = "إلغاء من قبل التاجر"
+    ): Result<Unit> {
+        return runCatching {
+            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
+            functionsClient()
+                .getHttpsCallable("merchantCancelOrder")
+                .call(
+                    hashMapOf(
+                        "orderId" to orderId,
+                        "reason" to reason.trim().take(500)
+                    )
+                )
+                .await()
+            Unit
+        }
+    }
+
+    /**
+     * Updates delivery information and merchant-entered service fee only while
+     * an order remains unassigned and no captain offer has been sent.
+     */
+    suspend fun updateMerchantOrderDetails(
+        orderId: String,
+        destinationAddress: String,
+        orderDetails: String,
+        customerName: String,
+        customerPhone: String,
+        deliveryNotes: String,
+        serviceFee: String
+    ): Result<Unit> {
+        return runCatching {
+            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
+            require(destinationAddress.isNotBlank()) { "عنوان التوصيل مطلوب." }
+            require(serviceFee.isNotBlank()) { "خدمة التوصيل مطلوبة." }
+            functionsClient()
+                .getHttpsCallable("merchantUpdateOrderDetails")
+                .call(
+                    hashMapOf(
+                        "orderId" to orderId,
+                        "destinationAddress" to destinationAddress.trim(),
+                        "orderDetails" to orderDetails.trim(),
+                        "customerName" to customerName.trim(),
+                        "customerPhone" to customerPhone.trim(),
+                        "deliveryNotes" to deliveryNotes.trim(),
+                        "serviceFee" to serviceFee.trim()
+                    )
+                )
+                .await()
+            Unit
+        }
+    }
+
+    /**
      * Fetches the official Vodafone Cash wallet number, optional wallet holder name, dynamic plans,
-     * and instructions configured by Admin in Firebase Firestore (`settings/subscription_config`).
+     * and instructions configured by Admin in Firestore.
      */
     suspend fun fetchVodafoneCashSettings(): VodafoneCashSettings {
         return try {

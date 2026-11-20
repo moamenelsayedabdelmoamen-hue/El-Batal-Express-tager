@@ -608,6 +608,16 @@ export const onOrderCreated = functions.firestore
     const orderData = snap.data();
     if (!orderData) return;
 
+    // New merchant orders are created and distributed only by dashboard/functions.
+    // Keep this legacy dispatcher for pre-existing/older order contracts only.
+    if (
+      orderData.dispatchAuthority === "dashboard_functions" ||
+      orderData.createdByServerFunction === "merchantCreateOrder"
+    ) {
+      console.log(`[AutoDispatch] Skipping Dashboard-owned order ${orderId}; central dispatcher owns it.`);
+      return;
+    }
+
     await runAutoDispatch(orderId, orderData, { triggerSource: "onOrderCreated" });
   });
 
@@ -635,10 +645,14 @@ export const onCaptainUpdated = functions.firestore
         .limit(1)
         .get();
 
-      if (!pendingOrdersSnapshot.empty) {
-        const orderDoc = pendingOrdersSnapshot.docs[0];
-        console.log(`[AutoDispatch] Queued order ${orderDoc.id} found. Triggering auto-dispatch.`);
-        await runAutoDispatch(orderDoc.id, orderDoc.data(), { triggerSource: "onCaptainUpdated" });
+      const legacyOrderDoc = pendingOrdersSnapshot.docs.find((doc) => {
+        const data = doc.data();
+        return data.dispatchAuthority !== "dashboard_functions" &&
+          data.createdByServerFunction !== "merchantCreateOrder";
+      });
+      if (legacyOrderDoc) {
+        console.log(`[AutoDispatch] Legacy queued order ${legacyOrderDoc.id} found. Triggering legacy auto-dispatch.`);
+        await runAutoDispatch(legacyOrderDoc.id, legacyOrderDoc.data(), { triggerSource: "onCaptainUpdated" });
       }
     }
   });
@@ -655,6 +669,15 @@ export const onOrderStatusChanged = functions.firestore
     const orderId = context.params.orderId;
     const afterData = change.after.data() || {};
     const beforeData = change.before.data() || {};
+
+    // Do not release capacity or mutate captain availability for orders owned by the
+    // central Dashboard lifecycle. This trigger remains only for legacy-created orders.
+    if (
+      afterData.dispatchAuthority === "dashboard_functions" ||
+      afterData.createdByServerFunction === "merchantCreateOrder"
+    ) {
+      return;
+    }
 
     const newStatus = String(afterData.status || "").toLowerCase().trim();
     const oldStatus = String(beforeData.status || "").toLowerCase().trim();

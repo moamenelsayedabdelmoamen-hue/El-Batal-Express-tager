@@ -63,6 +63,7 @@ class ManualVodafoneSubscriptionTest {
                     settings = VodafoneCashSettings(
                         walletNumber = "01099887766",
                         walletHolderName = "البطل إكسبريس",
+                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
                         isConfiguredOnServer = true,
                         isAcceptingSubscriptions = true
                     ),
@@ -656,6 +657,7 @@ class ManualVodafoneSubscriptionTest {
                 isActive = false,
                 isSubscribed = false,
                 paymentStatus = "resubmission_required",
+                pendingRequestId = "subreq_original_20261120",
                 planId = 2,
                 planName = "الباقة المتوسطة",
                 maxCaptains = 0,

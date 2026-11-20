@@ -634,12 +634,52 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         _trackedCaptainInfo.value = null
     }
 
+    private val merchantOrderCachePreferences by lazy {
+        getApplication<Application>().getSharedPreferences(
+            "merchant_order_cache",
+            android.content.Context.MODE_PRIVATE
+        )
+    }
+
     private val authStateListener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { auth ->
-        val user = auth.currentUser
-        if (user != null && user.isEmailVerified) {
-            listenToFirestore()
-        } else {
+        val verifiedUser = auth.currentUser?.takeIf { it.isEmailVerified }
+        val uid = verifiedUser?.uid
+
+        if (uid == null) {
+            merchantOrderCachePreferences.edit().remove("merchant_uid").apply()
             clearListeners()
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { repository.clearAllOrders() }
+                    .onFailure { error ->
+                        Log.w("OrderViewModel", "Could not clear merchant order cache on sign-out: ${error.message}")
+                    }
+            }
+            return@AuthStateListener
+        }
+
+        val cachedOwnerUid = merchantOrderCachePreferences.getString("merchant_uid", null)
+        if (cachedOwnerUid != uid) {
+            // This also handles app upgrades and direct account switching without an
+            // intermediate signed-out state. Old merchant rows are removed before loading
+            // any data for the newly authenticated merchant.
+            merchantOrderCachePreferences.edit().putString("merchant_uid", uid).apply()
+            clearListeners()
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { repository.clearAllOrders() }
+                    .onFailure { error ->
+                        Log.w("OrderViewModel", "Could not isolate Room cache for new merchant: ${error.message}")
+                    }
+                withContext(Dispatchers.Main) {
+                    if (
+                        Firebase.auth.currentUser?.uid == uid &&
+                        Firebase.auth.currentUser?.isEmailVerified == true
+                    ) {
+                        listenToFirestore()
+                    }
+                }
+            }
+        } else {
+            listenToFirestore()
         }
     }
 
@@ -1312,8 +1352,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             "awaiting_merchant_confirmation", "details_submitted", "data_submitted",
             "customer_details_submitted", "بانتظار تأكيد البيانات", "في انتظار تأكيد البيانات",
             "بانتظار التأكيد", "تأكيد البيانات", "تم إرسال البيانات", "تم ارسال البيانات" -> "بانتظار تأكيد البيانات"
-            "customer_confirmed", "confirmed_by_merchant", "تم تأكيد البيانات" -> "جاري التوصيل"
-            "customer_rejected", "بيانات مرفوضة" -> "بيانات مرفوضة"
+            "customer_confirmed", "confirmed_by_merchant", "en_route", "تم تأكيد البيانات" -> "جاري التوصيل"
+            "customer_rejected", "merchant_rejected", "بيانات مرفوضة" -> "بيانات مرفوضة"
             "in_progress", "out_for_delivery", "جاري التوصيل", "delivering", "في الطريق إلى العميل" -> "جاري التوصيل"
             "completed", "delivered", "تم التسليم", "مكتمل", "مكتملة", "تم التوصيل" -> "تم التسليم"
             "cancelled", "canceled", "ملغي", "ملغية", "تم الإلغاء", "تم الالغاء" -> "ملغي"
@@ -1533,7 +1573,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
             val currentSub = _subscriptionStatus.value
 
-            // Fast client guard (Server Cloud Function `requestCaptains` enforces authoritatively inside transaction)
+            // Fast client guard; Dashboard `merchantCreateOrder` enforces the same limit atomically on the server.
             if (!currentSub.canRequestCaptain()) {
                 val subMsg = when {
                     currentSub.isSuspended || currentSub.status == "suspended" || currentSub.status == "inactive" ->
@@ -1576,17 +1616,41 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
+            val feeInput = serviceFee.trim()
+            val normalizedFeeInput = buildString {
+                feeInput.forEach { character ->
+                    val arabicIndex = "٠١٢٣٤٥٦٧٨٩".indexOf(character)
+                    val persianIndex = "۰۱۲۳۴۵۶۷۸۹".indexOf(character)
+                    append(
+                        when {
+                            arabicIndex >= 0 -> arabicIndex
+                            persianIndex >= 0 -> persianIndex
+                            else -> character
+                        }
+                    )
+                }
+            }
+            val feeNumberText = normalizedFeeInput
+                .replace(",", "")
+                .replace("٬", "")
+                .replace(Regex("""\s*جنيه$"""), "")
+                .trim()
+            val feeDigits = feeNumberText
+                .takeIf { Regex("""^\d+(?:\.\d{1,2})?$""").matches(it) }
+                ?.toDoubleOrNull()
+            if (feeInput.isBlank() || feeDigits == null || !feeDigits.isFinite() || feeDigits <= 0.0 || feeDigits > 100000.0) {
+                val feeMsg = "يرجى إدخال قيمة صحيحة لخدمة التوصيل من تطبيق التاجر."
+                _snackbarMessage.value = feeMsg
+                onError?.invoke(feeMsg)
+                return@launch
+            }
+
             val sdf = SimpleDateFormat("dd MMMM yyyy - hh:mm a", Locale("ar"))
             val currentDate = sdf.format(Date())
-            val formattedFee = if (serviceFee.isBlank()) "30 جنيه" else if (serviceFee.contains("جنيه")) serviceFee.trim() else "${serviceFee.trim()} جنيه"
+            val formattedFee = if (feeInput.contains("جنيه")) feeInput else "$feeInput جنيه"
             val uid = currentUser.uid
             val idempotencyKey = UUID.randomUUID().toString()
             val profile = _restaurantProfile.value
-            val currentRestaurantName = profile.name.ifBlank {
-                currentUser.displayName
-                    ?: currentUser.email?.substringBefore("@")
-                    ?: "مطعم"
-            }
 
             val requestPayload = hashMapOf<String, Any?>(
                 "merchantId" to uid,
@@ -1599,13 +1663,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 "customerPhone" to customerPhone.trim(),
                 "orderDetails" to orderDetails.trim(),
                 "deliveryNotes" to deliveryNotes.trim(),
-                "merchantName" to currentRestaurantName,
-                "merchantPhone" to profile.phone.trim(),
                 "merchantLatitude" to (profile.latitude ?: profile.location?.latitude),
                 "merchantLongitude" to (profile.longitude ?: profile.location?.longitude),
                 "idempotencyKey" to idempotencyKey,
                 "requestId" to idempotencyKey,
-                "requestedCaptains" to 1,
                 "customerLatitude" to customerLatitude,
                 "customerLongitude" to customerLongitude
             )
@@ -1693,88 +1754,17 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * The merchant application must not advance captain delivery stages.
+     * Captains use authenticated Cloud Functions; merchants may only confirm
+     * the receipt/customer details through merchantConfirmOrder.
+     */
     fun advanceOrderStatus(orderId: Int, currentStatus: String) {
-        val nextStatus = when (currentStatus.trim()) {
-            "جاري البحث", "جاري البحث عن كابتن", "في انتظار كابتن", "قيد التحضير", "Preparing", "pending" -> "في الطريق لك"
-            "في الطريق لك", "الكابتن في الطريق لك", "accepted", "في الطريق إلى المطعم" -> "جاري التوصيل"
-            "جاري التوصيل", "قيد التوصيل", "Out for Delivery", "delivering" -> "تم التسليم"
-            else -> "تم التسليم"
-        }
-
-        viewModelScope.launch {
-            val orders = repository.allOrders.firstOrNull() ?: emptyList()
-            val targetOrder = orders.find { it.id == orderId }
-
-            val currentDriverName = _driverProfile.value.name.trim()
-            val currentDriverPhone = _driverProfile.value.phone.trim()
-            val currentDriverPhoto = _driverProfile.value.photoUrl.trim().takeIf {
-                FirebaseStorageManager.isValidDisplayableCaptainPhoto(it)
-            } ?: ""
-
-            if ((nextStatus == "في الطريق لك" || nextStatus == "جاري التوصيل") &&
-                targetOrder != null &&
-                !FirebaseStorageManager.isValidCaptainName(targetOrder.captainName) &&
-                currentDriverName.isNotBlank()
-            ) {
-                repository.updateOrder(
-                    targetOrder.copy(
-                        status = nextStatus,
-                        captainName = currentDriverName,
-                        captainPhone = currentDriverPhone.ifBlank { targetOrder.captainPhone },
-                        captainPhotoUrl = currentDriverPhoto.ifBlank { targetOrder.captainPhotoUrl },
-                        estimatedArrival = targetOrder.estimatedArrival.ifBlank { "20 دقيقة" }
-                    )
-                )
-            } else {
-                repository.updateOrderStatus(orderId, nextStatus)
-            }
-
-            // Sync status with Firestore without ever overwriting real captain fields with placeholders
-            try {
-                val firestoreStatus = when (nextStatus) {
-                    "في الطريق لك" -> "accepted"
-                    "جاري التوصيل" -> "in_progress"
-                    "تم التسليم" -> "delivered"
-                    else -> nextStatus
-                }
-                val matchedDoc = findMerchantOrderDocument(orderId)
-                val updates = hashMapOf<String, Any>("status" to firestoreStatus)
-                if (currentDriverName.isNotBlank()) {
-                    updates["driver_name"] = currentDriverName
-                    updates["captainName"] = currentDriverName
-                }
-                if (currentDriverPhone.isNotBlank()) {
-                    updates["captainPhone"] = currentDriverPhone
-                }
-                matchedDoc?.reference?.update(updates)?.await()
-            } catch (e: Exception) {
-                Log.w("OrderViewModel", "Could not sync advance status to Firestore: ${e.message}")
-            }
-
-            // Trigger simulated push notification if transitioning from 'Preparing' to 'Out for Delivery'
-            if (nextStatus == "جاري التوصيل") {
-                val destination = targetOrder?.destinationAddress?.ifBlank { "العنوان المتردد" } ?: "العنوان المحدد"
-
-                val title = getApplication<Application>().getString(R.string.notification_out_for_delivery_title)
-                val body = getApplication<Application>().getString(R.string.notification_out_for_delivery_body, destination)
-                val timeSdf = SimpleDateFormat("hh:mm a", Locale("ar"))
-                val timeStr = timeSdf.format(Date())
-
-                // 1. Post actual System Notification
-                try {
-                    NotificationHelper.showOutForDeliveryNotification(getApplication(), destination)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-
-                // 2. Emit simulated push notification banner state
-                _pushNotificationState.value = PushNotificationBanner(
-                    title = title,
-                    body = body,
-                    timestamp = timeStr
-                )
-            }
-        }
+        Log.w(
+            "OrderViewModel",
+            "Blocked merchant-side order status mutation for order=$orderId status=$currentStatus"
+        )
+        _snackbarMessage.value = "مراحل التوصيل يتم تحديثها من تطبيق الكابتن والخادم فقط."
     }
 
     private suspend fun findMerchantOrderDocument(orderId: Any): DocumentSnapshot? {
@@ -1825,69 +1815,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         onSuccess: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {
-        viewModelScope.launch {
-            if (!NetworkHelper.isNetworkAvailable(getApplication())) {
-                val noNetMsg = "أنت غير متصل بالإنترنت!"
-                _snackbarMessage.value = noNetMsg
-                onError(noNetMsg)
-                return@launch
-            }
-            try {
-                _isLoading.value = true
-                val matchedDoc = findMerchantOrderDocument(orderId)
-
-                if (matchedDoc != null) {
-                    val updates = hashMapOf<String, Any?>(
-                        "customerDetailsConfirmed" to true,
-                        "merchantConfirmed" to true,
-                        "isConfirmed" to true,
-                        "customerDetailsRejected" to false,
-                        "rejectionReason" to "",
-                        "confirmedAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp(),
-                        "status" to "customer_confirmed",
-                        "orderStatus" to "customer_confirmed",
-                        "status_ar" to "جاري التوصيل"
-                    )
-                    matchedDoc.reference.update(updates).await()
-
-                    // Update in-memory list immediately so UI reflects confirmation right away
-                    val docRealId = matchedDoc.safeString("orderId") ?: matchedDoc.id
-                    _firestoreOrders.value = _firestoreOrders.value.map { item ->
-                        if (item.firestoreOrderId == docRealId || item.id == docRealId.hashCode() || item.id.toString() == orderId.toString()) {
-                            item.copy(
-                                status = "جاري التوصيل",
-                                customerDetailsConfirmed = true,
-                                customerDetailsRejected = false,
-                                rejectionReason = ""
-                            )
-                        } else item
-                    }
-
-                    // Also update local Room database
-                    try {
-                        val intId = orderId.toString().toIntOrNull() ?: docRealId.hashCode()
-                        repository.updateOrderStatus(intId, "جاري التوصيل")
-                    } catch (e: Exception) {
-                        Log.w("OrderViewModel", "Failed to update local status: ${e.message}")
-                    }
-
-                    _snackbarMessage.value = "تم تأكيد البيانات بنجاح ✓ يمكن للكابتن إكمال توصيل الطلب الآن."
-                    onSuccess()
-                } else {
-                    val notFound = "الطلب غير موجود في قاعدة البيانات"
-                    _snackbarMessage.value = notFound
-                    onError(notFound)
-                }
-            } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error confirming customer details: ${e.message}", e)
-                val err = "حدث خطأ أثناء تأكيد البيانات: ${e.localizedMessage}"
-                _snackbarMessage.value = err
-                onError(err)
-            } finally {
-                _isLoading.value = false
-            }
-        }
+        updateMerchantDeliveryConfirmation(
+            orderId = orderId,
+            confirmed = true,
+            rejectionReason = "",
+            onSuccess = onSuccess,
+            onError = onError
+        )
     }
 
     fun rejectCustomerDetails(
@@ -1896,71 +1830,84 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         onSuccess: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {
+        if (reason.isBlank()) {
+            val message = "يرجى كتابة سبب رفض البيانات والإيصال"
+            _snackbarMessage.value = message
+            onError(message)
+            return
+        }
+        updateMerchantDeliveryConfirmation(
+            orderId = orderId,
+            confirmed = false,
+            rejectionReason = reason,
+            onSuccess = onSuccess,
+            onError = onError
+        )
+    }
+
+    private fun updateMerchantDeliveryConfirmation(
+        orderId: Any,
+        confirmed: Boolean,
+        rejectionReason: String,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit
+    ) {
         viewModelScope.launch {
             if (!NetworkHelper.isNetworkAvailable(getApplication())) {
-                val noNetMsg = "أنت غير متصل بالإنترنت!"
-                _snackbarMessage.value = noNetMsg
-                onError(noNetMsg)
+                val message = "أنت غير متصل بالإنترنت!"
+                _snackbarMessage.value = message
+                onError(message)
                 return@launch
             }
-            if (reason.isBlank()) {
-                val prompt = "يرجى كتابة سبب رفض البيانات والإيصال"
-                _snackbarMessage.value = prompt
-                onError(prompt)
-                return@launch
-            }
+
             try {
                 _isLoading.value = true
                 val matchedDoc = findMerchantOrderDocument(orderId)
+                    ?: throw IllegalStateException("الطلب غير موجود في قاعدة البيانات")
 
-                if (matchedDoc != null) {
-                    val updates = hashMapOf<String, Any?>(
-                        "customerDetailsRejected" to true,
-                        "customerDetailsConfirmed" to false,
-                        "merchantConfirmed" to false,
-                        "isConfirmed" to false,
-                        "customerDetailsSubmitted" to false,
-                        "rejectionReason" to reason.trim(),
-                        "rejectedAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp(),
-                        "status" to "customer_rejected",
-                        "orderStatus" to "customer_rejected",
-                        "status_ar" to "بيانات مرفوضة"
-                    )
-                    matchedDoc.reference.update(updates).await()
+                // Never write delivery status or merchant confirmation fields directly from the app.
+                // The Dashboard Cloud Function verifies the merchant owner and current order state.
+                subscriptionRepository.confirmMerchantOrder(
+                    orderId = matchedDoc.id,
+                    confirmed = confirmed,
+                    rejectionReason = rejectionReason
+                ).getOrThrow()
 
-                    val docRealId = matchedDoc.safeString("orderId") ?: matchedDoc.id
-                    _firestoreOrders.value = _firestoreOrders.value.map { item ->
-                        if (item.firestoreOrderId == docRealId || item.id == docRealId.hashCode() || item.id.toString() == orderId.toString()) {
-                            item.copy(
-                                status = "بيانات مرفوضة",
-                                customerDetailsSubmitted = false,
-                                customerDetailsConfirmed = false,
-                                customerDetailsRejected = true,
-                                rejectionReason = reason.trim()
-                            )
-                        } else item
-                    }
-
-                    try {
-                        val intId = orderId.toString().toIntOrNull() ?: docRealId.hashCode()
-                        repository.updateOrderStatus(intId, "بيانات مرفوضة")
-                    } catch (e: Exception) {
-                        Log.w("OrderViewModel", "Failed to update local status: ${e.message}")
-                    }
-
-                    _snackbarMessage.value = "تم رفض بيانات العميل مع إرسال السبب للكابتن لإعادة الرفع."
-                    onSuccess()
-                } else {
-                    val notFound = "الطلب غير موجود في قاعدة البيانات"
-                    _snackbarMessage.value = notFound
-                    onError(notFound)
+                val newStatus = if (confirmed) "جاري التوصيل" else "بيانات مرفوضة"
+                val realOrderId = matchedDoc.id
+                _firestoreOrders.value = _firestoreOrders.value.map { item ->
+                    if (
+                        item.firestoreOrderId == realOrderId ||
+                        item.id == realOrderId.hashCode() ||
+                        item.id.toString() == orderId.toString()
+                    ) {
+                        item.copy(
+                            status = newStatus,
+                            customerDetailsConfirmed = confirmed,
+                            customerDetailsRejected = !confirmed,
+                            rejectionReason = if (confirmed) "" else rejectionReason.trim()
+                        )
+                    } else item
                 }
+
+                runCatching {
+                    repository.updateOrderStatus(realOrderId.hashCode(), newStatus)
+                }.onFailure { error ->
+                    Log.w("OrderViewModel", "Could not update local order after server confirmation: ${error.message}")
+                }
+
+                val message = if (confirmed) {
+                    "تم تأكيد البيانات بنجاح ✓ يمكن للكابتن إكمال توصيل الطلب الآن."
+                } else {
+                    "تم رفض البيانات وإرسال سبب الرفض للكابتن."
+                }
+                _snackbarMessage.value = message
+                onSuccess()
             } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error rejecting customer details: ${e.message}", e)
-                val err = "حدث خطأ أثناء رفض البيانات: ${e.localizedMessage}"
-                _snackbarMessage.value = err
-                onError(err)
+                Log.e("OrderViewModel", "Server merchant confirmation failed: ${e.message}", e)
+                val message = e.localizedMessage ?: "تعذر تحديث حالة الطلب من الخادم."
+                _snackbarMessage.value = message
+                onError(message)
             } finally {
                 _isLoading.value = false
             }
@@ -1975,42 +1922,40 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         viewModelScope.launch {
             if (!NetworkHelper.isNetworkAvailable(getApplication())) {
-                val noNetMsg = "لا يمكن إلغاء الطلب: أنت غير متصل بالإنترنت!"
-                _snackbarMessage.value = noNetMsg
-                onError?.invoke(noNetMsg)
+                val message = "لا يمكن إلغاء الطلب: أنت غير متصل بالإنترنت!"
+                _snackbarMessage.value = message
+                onError?.invoke(message)
                 return@launch
             }
+
             try {
-                val intId = orderId.toString().toIntOrNull() ?: 0
-                if (intId != 0) {
-                    repository.updateOrderStatus(intId, "ملغي")
+                val matchedDoc = findMerchantOrderDocument(orderId)
+                    ?: throw IllegalStateException("الطلب غير موجود في قاعدة البيانات")
+
+                // Server validates ownership and whether the captain already picked up the order.
+                subscriptionRepository.cancelMerchantOrder(matchedDoc.id, reason).getOrThrow()
+
+                val realOrderId = matchedDoc.id
+                _firestoreOrders.value = _firestoreOrders.value.map { item ->
+                    if (
+                        item.firestoreOrderId == realOrderId ||
+                        item.id == realOrderId.hashCode() ||
+                        item.id.toString() == orderId.toString()
+                    ) item.copy(status = "ملغي") else item
                 }
-                val uid = Firebase.auth.currentUser?.uid ?: ""
-                if (uid.isNotEmpty()) {
-                    val snapshot = Firebase.firestore.collection("orders")
-                        .whereEqualTo("userId", uid)
-                        .get().await()
-                    for (doc in snapshot.documents) {
-                        val idHash = doc.safeString("orderId")?.hashCode() ?: doc.id.hashCode()
-                        if (idHash == intId || doc.id == orderId.toString() || doc.safeString("orderId") == orderId.toString()) {
-                            doc.reference.update(
-                                mapOf(
-                                    "status" to "cancelled",
-                                    "status_ar" to "ملغي",
-                                    "cancelReason" to reason,
-                                    "cancelledAt" to FieldValue.serverTimestamp()
-                                )
-                            ).await()
-                            break
-                        }
-                    }
+                runCatching {
+                    repository.updateOrderStatus(realOrderId.hashCode(), "ملغي")
+                }.onFailure { error ->
+                    Log.w("OrderViewModel", "Could not update local cancelled order: ${error.message}")
                 }
-                _snackbarMessage.value = "تم إلغاء الطلب بنجاح"
+
+                _snackbarMessage.value = "تم إرسال إلغاء الطلب إلى الخادم بنجاح"
                 onSuccess()
             } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error cancelling order in Firestore", e)
-                _snackbarMessage.value = "تعذر إلغاء الطلب: ${e.localizedMessage}"
-                onError?.invoke(e.localizedMessage ?: "فشل الإلغاء")
+                Log.e("OrderViewModel", "Server merchant cancellation failed: ${e.message}", e)
+                val message = e.localizedMessage ?: "تعذر إلغاء الطلب من الخادم."
+                _snackbarMessage.value = message
+                onError?.invoke(message)
             }
         }
     }
@@ -2047,39 +1992,66 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         orderDetails: String,
         customerPhone: String = "",
         customerName: String = "",
-        serviceFee: String
+        serviceFee: String,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
     ) {
         if (!NetworkHelper.isNetworkAvailable(getApplication())) {
             val noNetMsg = "لا يمكن تعديل بيانات الطلب: أنت غير متصل بالإنترنت!"
             _snackbarMessage.value = noNetMsg
             NetworkHelper.notifyNoInternet(getApplication(), "تعديل بيانات الطلب")
+            onError(noNetMsg)
             return
         }
+
         viewModelScope.launch {
-            repository.updateOrderDetails(
-                orderId = orderId,
-                destinationAddress = destinationAddress,
-                orderDetails = orderDetails,
-                customerPhone = customerPhone,
-                customerName = customerName,
-                serviceFee = serviceFee
-            )
             try {
+                val trimmedAddress = destinationAddress.trim()
+                val feeText = serviceFee.trim()
                 val matchedDoc = findMerchantOrderDocument(orderId)
-                matchedDoc?.reference?.update(
-                    mapOf(
-                        "address" to destinationAddress,
-                        "deliveryAddress" to destinationAddress,
-                        "destinationAddress" to destinationAddress,
-                        "items" to orderDetails,
-                        "orderDetails" to orderDetails,
-                        "price" to serviceFee,
-                        "totalAmount" to serviceFee,
-                        "serviceFee" to serviceFee
-                    )
-                )?.await()
+                    ?: throw IllegalStateException("الطلب غير موجود في قاعدة البيانات")
+
+                // The server verifies ownership and refuses edits once a captain has received an offer.
+                val existingDeliveryNotes = matchedDoc.getString("deliveryNotes")
+                    ?: matchedDoc.getString("notes").orEmpty()
+                subscriptionRepository.updateMerchantOrderDetails(
+                    orderId = matchedDoc.id,
+                    destinationAddress = trimmedAddress,
+                    orderDetails = orderDetails,
+                    customerName = customerName,
+                    customerPhone = customerPhone,
+                    deliveryNotes = existingDeliveryNotes,
+                    serviceFee = feeText
+                ).getOrThrow()
+
+                repository.updateOrderDetails(
+                    orderId = orderId,
+                    destinationAddress = trimmedAddress,
+                    orderDetails = orderDetails,
+                    customerPhone = customerPhone,
+                    customerName = customerName,
+                    serviceFee = feeText
+                )
+
+                _firestoreOrders.value = _firestoreOrders.value.map { item ->
+                    if (item.firestoreOrderId == matchedDoc.id || item.id == orderId) {
+                        item.copy(
+                            destinationAddress = trimmedAddress,
+                            orderDetails = orderDetails,
+                            customerPhone = customerPhone,
+                            customerName = customerName,
+                            serviceFee = feeText
+                        )
+                    } else item
+                }
+
+                _snackbarMessage.value = "تم تحديث بيانات الطلب وخدمة التوصيل بنجاح."
+                onSuccess()
             } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error updating order details in Firestore", e)
+                Log.e("OrderViewModel", "Server merchant order edit failed: ${e.message}", e)
+                val message = e.localizedMessage ?: "تعذر تعديل الطلب من الخادم."
+                _snackbarMessage.value = message
+                onError(message)
             }
         }
     }

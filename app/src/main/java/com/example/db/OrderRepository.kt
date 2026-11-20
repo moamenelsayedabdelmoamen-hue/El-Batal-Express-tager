@@ -57,6 +57,10 @@ class OrderRepository(private val orderDao: OrderDao) {
         )
     }
 
+    suspend fun clearAllOrders() {
+        orderDao.clearAllOrders()
+    }
+
     suspend fun ensureInitialData() {
         // No dummy data added so new accounts start with an empty state
     }

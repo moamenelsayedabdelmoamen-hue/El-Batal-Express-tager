@@ -1,435 +1,518 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
-    // Global helper functions
-    function isSignedIn() {
-      return request.auth != null;
-    }
-    
-    // Check if user has admin privileges via Custom Claims, verified email whitelist, or admins collection
-    function isAdmin() {
-      return isSignedIn() && (
-        ('role' in request.auth.token && request.auth.token.role == 'admin') ||
-        ('admin' in request.auth.token && request.auth.token.admin == true) ||
-        ('email' in request.auth.token &&
-          request.auth.token.email in ['moamen.elsayed.abdelmoamen@gmail.com', 'admin@elbatalexpress.com'] &&
-          'email_verified' in request.auth.token &&
-          request.auth.token.email_verified == true) ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
-    }
-    
-    // Strict role/collection isolation helpers
-    function hasCaptainAccount(uid) {
-      return exists(/databases/$(database)/documents/captains/$(uid));
-    }
 
-    function hasMerchantAccount(uid) {
-      return exists(/databases/$(database)/documents/merchants/$(uid));
-    }
-
-    function isMerchantAccount() {
-      let merch = get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data;
-      return isSignedIn() &&
-        hasMerchantAccount(request.auth.uid) &&
-        !hasCaptainAccount(request.auth.uid) &&
-        (merch.accountType == 'merchant' || (!('accountType' in merch) && merch.role == 'merchant'));
-    }
-
-    function isMerchant(merchantId) {
-      return isSignedIn() && (
-        request.auth.uid == merchantId ||
-        (request.auth.token.role == 'merchant' && request.auth.token.merchantId == merchantId)
-      );
-    }
-
-    function isUnexpiredEndDate(val) {
-      return val == null ||
-        (val is timestamp && val > request.time) ||
-        (val is int && (
-          (val >= 1000000000000 && val > request.time.toMillis()) ||
-          (val > 0 && val < 1000000000000 && (val * 1000) > request.time.toMillis())
-        ));
-    }
-
-    function isActiveStatusValue(val) {
-      return val in ['active', 'activated', 'subscribed', 'enabled', 'نشط', 'نشطة', 'ساري', 'سارية', 'فعال', 'فعّال', 'مفعل', 'مفعّل'];
-    }
-
-    function hasPositiveCaptainLimit(doc) {
-      return ('captainLimit' in doc && doc.captainLimit > 0) ||
-        ('maxCaptains' in doc && doc.maxCaptains > 0) ||
-        (!('captainLimit' in doc) && !('maxCaptains' in doc) && 'planId' in doc && doc.planId > 0);
-    }
-
-    function isNotExplicitlyDeactivated(doc) {
-      return !('isActive' in doc && doc.isActive == false && (!('isSubscribed' in doc) || doc.isSubscribed != true));
-    }
-
-    function isSubscriptionDocActive(subData) {
-      return (
-          ('status' in subData && isActiveStatusValue(subData.status)) ||
-          ('subscriptionStatus' in subData && isActiveStatusValue(subData.subscriptionStatus))
-        ) &&
-        isNotExplicitlyDeactivated(subData) &&
-        hasPositiveCaptainLimit(subData) &&
-        (!('endDate' in subData) || isUnexpiredEndDate(subData.endDate)) &&
-        (!('expiresAt' in subData) || isUnexpiredEndDate(subData.expiresAt));
-    }
-
-    // Server-side authoritative subscription check across BOTH subscriptions/{uid} and merchants/{uid}
-    function hasActiveMerchantSubscription(uid) {
-      let merch = get(/databases/$(database)/documents/merchants/$(uid)).data;
-      let isMerchDoc = merch.accountType == 'merchant' || (!('accountType' in merch) && merch.role == 'merchant');
-      return isMerchDoc &&
-        merch.status in ['approved', 'active'] &&
-        !('subscriptionStatus' in merch && merch.subscriptionStatus in ['suspended', 'inactive', 'cancelled', 'canceled', 'expired', 'pending', 'pending_review', 'rejected', 'resubmission_required', 'pending_payment', 'payment_failed']) &&
-        (
-          exists(/databases/$(database)/documents/subscriptions/$(uid))
-            ? isSubscriptionDocActive(get(/databases/$(database)/documents/subscriptions/$(uid)).data)
-            : (
-                'subscriptionStatus' in merch &&
-                isActiveStatusValue(merch.subscriptionStatus) &&
-                isNotExplicitlyDeactivated(merch) &&
-                hasPositiveCaptainLimit(merch) &&
-                (!('subscriptionEndDate' in merch) || isUnexpiredEndDate(merch.subscriptionEndDate)) &&
-                (!('expiresAt' in merch) || isUnexpiredEndDate(merch.expiresAt))
-              )
-        );
-    }
-    
-    // Check if user is the captain
-    function isCaptain(captainId) {
-      return isSignedIn() && (
-        (request.auth.token.role == 'captain' && request.auth.token.captainId == captainId) ||
-        request.auth.uid == captainId
-      );
-    }
-
-    // Default deny for unmatched documents
+    // 0. Global default-deny safety net
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // Admins collection: only admins can read or manage
-    match /admins/{adminId} {
-      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == adminId);
-      allow list: if isAdmin();
-      allow write: if isAdmin();
+    // --- Core Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
     }
 
-    // Merchants collection:
-    // Strictly isolated to merchant accounts (`accountType == 'merchant'`).
-    // Blocked if UID already belongs to a captain account.
-    match /merchants/{merchantId} {
-      allow get: if isAdmin() || (isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid));
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Administrator access is granted only by server-issued Firebase Auth
+    // custom claims or a verified allowlisted administrator email. Do not read
+    // /admins from this helper: per-request document lookups add evaluation cost
+    // and must never be used as a client-controlled privilege source.
+    function isRegisteredAdmin() {
+      let adminDoc = get(/databases/$(database)/documents/admins/$(request.auth.uid));
+      return isSignedIn()
+        && adminDoc.data != null
+        && adminDoc.data.get('role', '') == 'admin'
+        && adminDoc.data.get('status', 'active') in ['active', 'approved'];
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        (('role' in request.auth.token) && request.auth.token.role == 'admin') ||
+        (('admin' in request.auth.token) && request.auth.token.admin == true) ||
+        (
+          ('email_verified' in request.auth.token) &&
+          request.auth.token.email_verified == true &&
+          ('email' in request.auth.token) &&
+          request.auth.token.email in [
+            'moamen.elsayed.abdelmoamen@gmail.com',
+            'admin@elbatalexpress.com'
+          ]
+        ) ||
+        isRegisteredAdmin()
+      );
+    }
+
+    function isCaptainAccount() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/captains/$(request.auth.uid));
+    }
+
+    function isMerchantAccount() {
+      // Identify the account by its server-owned profile even when its email is
+      // not verified; this prevents an unverified merchant from registering as a captain.
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/merchants/$(request.auth.uid))
+        && get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant';
+    }
+
+    function isOptionalBoundedString(data, key, maxLen) {
+      return !(key in data) || data[key] == null || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    // --- 1. Captains Validation & Rules ---
+    // Protects financial, subscription, approval, accountType, and moderation fields from client tampering.
+    function isValidCaptainProfileShape(data, expectedUid) {
+      return ('uid' in data) && data.uid == expectedUid
+        && (!('accountType' in data) || data.accountType == 'captain')
+        && (!('role' in data) || data.role in ['captain', 'driver'])
+        && isOptionalBoundedString(data, 'accountType', 32)
+        && isOptionalBoundedString(data, 'name', 120)
+        && isOptionalBoundedString(data, 'fullName', 120)
+        && isOptionalBoundedString(data, 'driver_name', 120)
+        && isOptionalBoundedString(data, 'email', 160)
+        && isOptionalBoundedString(data, 'phone', 32)
+        && isOptionalBoundedString(data, 'phoneNumber', 32)
+        && isOptionalBoundedString(data, 'address', 300)
+        && isOptionalBoundedString(data, 'vehicleType', 80)
+        && isOptionalBoundedString(data, 'licensePlate', 40)
+        && isOptionalBoundedString(data, 'avatarUri', 500)
+        && isOptionalBoundedString(data, 'personalImage', 500)
+        && isOptionalBoundedString(data, 'idCardFront', 500)
+        && isOptionalBoundedString(data, 'idCardBack', 500)
+        && isOptionalBoundedString(data, 'profileImagePath', 300)
+        && isOptionalBoundedString(data, 'idFrontImagePath', 300)
+        && isOptionalBoundedString(data, 'idBackImagePath', 300)
+        && isOptionalBoundedString(data, 'licenseImagePath', 300)
+        && isOptionalBoundedString(data, 'presenceStatus', 32)
+        && isOptionalBoundedString(data, 'availabilityStatus', 32)
+        && isOptionalBoundedString(data, 'shiftStatus', 32)
+        && isOptionalBoundedString(data, 'fcmToken', 512)
+        && (!('isOnline' in data) || data.isOnline is bool)
+        && (!('isLoggedIn' in data) || data.isLoggedIn is bool)
+        && (!('emailVerified' in data) || data.emailVerified is bool)
+        && (!('isEmailVerified' in data) || data.isEmailVerified is bool)
+        && (!('idDocumentsComplete' in data) || data.idDocumentsComplete is bool);
+    }
+
+    // On self-registration, financial & administrative privilege fields MUST NOT be elevated
+    function hasSafeInitialCaptainFinancialAndAdminFields(data) {
+      return (!('status' in data) || data.status == 'pending')
+        && (!('walletBalance' in data) || (data.walletBalance is number && data.walletBalance == 0))
+        && (!('totalOrdersCount' in data) || (data.totalOrdersCount is int && data.totalOrdersCount == 0))
+        && (!('rating' in data) || (data.rating is number && data.rating == 5.0))
+        && !('isApproved' in data)
+        && !('isAdmin' in data)
+        && !('subscription' in data)
+        && !('subscriptionStatus' in data)
+        && !('subscriptionPlan' in data)
+        && !('subscriptionExpiresAt' in data)
+        && !('creditLimit' in data)
+        && !('commissionRate' in data)
+        && !('activeMerchantId' in data)
+        && !('currentMerchantId' in data);
+    }
+
+    // Strict allowlist of non-sensitive operational & Storage path fields a captain can update on their own profile.
+    // Explicitly EXCLUDES accountType, walletBalance, totalOrdersCount, rating, role, status, isApproved, subscriptions, and activeMerchantId.
+    function isAllowedCaptainSelfUpdateKeys() {
+      let changed = incoming().diff(existing()).affectedKeys();
+      return changed.hasOnly([
+        'name', 'fullName', 'driver_name', 'phone', 'phoneNumber',
+        'address', 'vehicleType', 'licensePlate', 'avatarUri',
+        'avatarPresetIndex', 'personalImage', 'idCardFront', 'idCardBack',
+        'profileImagePath', 'profileImageUpdatedAt', 'idFrontImagePath',
+        'idFrontUploadedAt', 'idBackImagePath', 'idBackUploadedAt',
+        'licenseImagePath', 'licenseImageUpdatedAt', 'idDocumentsComplete',
+        'location', 'latitude', 'longitude', 'accuracy', 'bearing', 'speed',
+        'lastLocationUpdate', 'lastLocationTimestamp', 'presenceStatus',
+        'availabilityStatus', 'shiftStatus', 'isOnline', 'isLoggedIn',
+        'fcmToken', 'updatedAt'
+      ])
+      && (!changed.hasAny(['isOnline']) || incoming().isOnline is bool)
+      && (!changed.hasAny(['isLoggedIn']) || incoming().isLoggedIn is bool)
+      && (!changed.hasAny(['idDocumentsComplete']) || incoming().idDocumentsComplete is bool);
+    }
+
+    match /captains/{captainId} {
+      // A merchant can read only the currently assigned captain's live profile.
+      allow get: if isSignedIn() && isValidId(captainId) && (
+        request.auth.uid == captainId ||
+        isAdmin() ||
+        (isMerchantAccount()
+          && request.auth.token.get('email_verified', false) == true
+          && (
+            ('activeMerchantId' in existing() && existing().activeMerchantId == request.auth.uid) ||
+            ('currentMerchantId' in existing() && existing().currentMerchantId == request.auth.uid)
+          ))
+      );
+
       allow list: if isAdmin();
-      allow create: if isAdmin() || (
-        isSignedIn() && request.auth.uid == merchantId && !hasCaptainAccount(request.auth.uid)
-        && request.resource.data.uid == merchantId
-        && request.resource.data.accountType == 'merchant'
-        && request.resource.data.role == 'merchant'
-        && request.resource.data.email == request.auth.token.email
-        && request.resource.data.name is string
-        && request.resource.data.name.size() >= 1
-        && request.resource.data.name.size() <= 150
-        && request.resource.data.email is string
-        && request.resource.data.email.size() <= 160
-        && request.resource.data.phone is string
-        && request.resource.data.phone.size() <= 32
-        && request.resource.data.address is string
-        && request.resource.data.address.size() <= 300
-        && request.resource.data.emailVerified == false
-        && request.resource.data.status == 'pending'
-        && request.resource.data.subscriptionStatus == 'unsubscribed'
-        && request.resource.data.isSubscribed == false
-        && request.resource.data.maxCaptains == 0
-        && request.resource.data.planId == 0
-        && !('isApproved' in request.resource.data)
-        && !('isAdmin' in request.resource.data)
-        && !('walletBalance' in request.resource.data)
-        && request.resource.data.keys().hasOnly([
+
+      allow create: if isSignedIn()
+        && isValidId(captainId)
+        && (
+          isAdmin() ||
+          (
+            request.auth.uid == captainId
+            && !isMerchantAccount()
+            && ('accountType' in incoming() && incoming().accountType == 'captain')
+            && (!('role' in incoming()) || incoming().role == 'captain')
+            && (!('emailVerified' in incoming()) || incoming().emailVerified == false || request.auth.token.get('email_verified', false) == true)
+            && (!('isEmailVerified' in incoming()) || incoming().isEmailVerified == false || request.auth.token.get('email_verified', false) == true)
+            && isValidCaptainProfileShape(incoming(), captainId)
+            && hasSafeInitialCaptainFinancialAndAdminFields(incoming())
+          )
+        );
+
+      allow update: if isSignedIn()
+        && isValidId(captainId)
+        && (
+          isAdmin() ||
+          (
+            request.auth.uid == captainId
+            && !exists(/databases/$(database)/documents/merchants/$(request.auth.uid))
+            && isAllowedCaptainSelfUpdateKeys()
+          )
+        );
+
+      allow delete: if isAdmin();
+
+      // Financial & wallet subcollections: strictly read-only for owning captain; written ONLY by Server / Admin
+      match /transactions/{txId} {
+        allow get, list: if isSignedIn() && (request.auth.uid == captainId || isAdmin());
+        allow create, update, delete: if isAdmin();
+      }
+
+      match /daily_wallets/{dayKey} {
+        allow get, list: if isSignedIn() && (request.auth.uid == captainId || isAdmin());
+        allow create, update, delete: if isAdmin();
+      }
+
+      match /subscriptions/{subId} {
+        allow get, list: if isSignedIn() && (request.auth.uid == captainId || isAdmin());
+        allow create, update, delete: if isAdmin();
+      }
+
+      match /shifts/{shiftId} {
+        allow get, list: if isSignedIn() && (request.auth.uid == captainId || isAdmin());
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // Legacy 'drivers' collection is strictly locked down to Admin writes; Captain App uses 'captains' exclusively.
+    match /drivers/{driverId} {
+      allow get: if isSignedIn() && isValidId(driverId) && (
+        request.auth.uid == driverId ||
+        isAdmin()
+      );
+
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // --- 2. Users (Customers) Collection ---
+    // Isolated per user; blocks self-assigned roles, admin flags, wallet tampering, and cross-user PII scraping.
+    function isValidCustomerUserDoc(data) {
+      return isOptionalBoundedString(data, 'name', 120)
+        && isOptionalBoundedString(data, 'fullName', 120)
+        && isOptionalBoundedString(data, 'email', 160)
+        && isOptionalBoundedString(data, 'phone', 32)
+        && isOptionalBoundedString(data, 'address', 300)
+        && (!('role' in data) || data.role == 'customer' || data.role == 'user')
+        && !('isAdmin' in data)
+        && !('walletBalance' in data);
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && (
+          isAdmin() ||
+          (request.auth.uid == userId && isValidCustomerUserDoc(incoming()))
+        );
+
+      allow update: if isSignedIn()
+        && isValidId(userId)
+        && (
+          isAdmin() ||
+          (
+            request.auth.uid == userId
+            && isValidCustomerUserDoc(incoming())
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'fullName', 'phone', 'address', 'fcmToken', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // --- 3. Merchants Collection (canonical account store; restaurants is retired) ---
+    function isValidMerchantDoc(data, merchantId) {
+      return ('uid' in data) && data.uid == merchantId
+        && ('accountType' in data) && data.accountType == 'merchant'
+        && ('role' in data) && data.role == 'merchant'
+        && ('name' in data) && data.name is string && data.name.size() >= 1 && data.name.size() <= 150
+        && ('email' in data) && data.email is string && data.email.size() <= 160
+        && isOptionalBoundedString(data, 'phone', 32)
+        && isOptionalBoundedString(data, 'address', 300)
+        && isOptionalBoundedString(data, 'category', 80)
+        && isOptionalBoundedString(data, 'logo', 1000)
+        && isOptionalBoundedString(data, 'photoUrl', 1000)
+        && isOptionalBoundedString(data, 'logoUrl', 1000)
+        && isOptionalBoundedString(data, 'storagePath', 500);
+    }
+
+    function isSafeInitialMerchantDoc(data, merchantId) {
+      return isValidMerchantDoc(data, merchantId)
+        && data.email == request.auth.token.email
+        && data.status == 'pending'
+        && data.subscriptionStatus == 'unsubscribed'
+        && data.isSubscribed == false
+        && data.maxCaptains == 0
+        && data.planId == 0
+        && data.emailVerified == false
+        && !('isApproved' in data)
+        && !('isAdmin' in data)
+        && !('walletBalance' in data)
+        && !('subscription' in data)
+        && data.keys().hasOnly([
           'uid', 'name', 'email', 'phone', 'address', 'category', 'logo', 'photoUrl',
           'logoUrl', 'storagePath', 'accountType', 'role', 'emailVerified', 'status',
           'isSubscribed', 'subscriptionStatus', 'maxCaptains', 'planId', 'authProvider',
           'createdAt', 'updatedAt'
-        ])
-      );
-      allow update: if isAdmin() || (
-        isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid)
-        && request.resource.data.uid == resource.data.uid
-        && request.resource.data.accountType == 'merchant'
-        && request.resource.data.role == resource.data.role
-        && request.resource.data.status == resource.data.status
-        && (!('isApproved' in resource.data) || request.resource.data.isApproved == resource.data.isApproved)
-        && !('isApproved' in request.resource.data.diff(resource.data).affectedKeys())
-        && !('status' in request.resource.data.diff(resource.data).affectedKeys())
-        && request.resource.data.email == resource.data.email
-        && request.resource.data.name is string
-        && request.resource.data.name.size() >= 1
-        && request.resource.data.name.size() <= 150
-        && request.resource.data.phone is string
-        && request.resource.data.phone.size() <= 32
-        && request.resource.data.address is string
-        && request.resource.data.address.size() <= 300
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'name', 'phone', 'address', 'category', 'description', 'logo', 'logoUrl',
-          'photoUrl', 'imageUrl', 'storagePath', 'location', 'latitude', 'longitude',
-          'locationUrl', 'locationLink', 'mapUrl', 'mapLink', 'mapsUrl', 'mapsLink',
-          'googleMapsUrl', 'googleMapUrl', 'isOpen', 'workingHours', 'fcmToken',
-          'emailVerified', 'lastLoginAt', 'updatedAt'
-        ])
-        && (!('emailVerified' in request.resource.data.diff(resource.data).affectedKeys())
-          || request.resource.data.emailVerified == false
-          || request.auth.token.email_verified == true)
-      );
-      allow delete: if isAdmin();
-      match /{subcollection}/{subDoc=**} {
-        allow read: if isAdmin() || (isMerchant(merchantId) && !hasCaptainAccount(request.auth.uid));
-        allow write: if isAdmin();
-      }
+        ]);
     }
 
-    // Captains: private by default. Merchants can get only the captain currently assigned to them.
-    match /captains/{captainId} {
-      allow get: if isAdmin()
-        || isCaptain(captainId)
-        || (
-          isSignedIn()
-          && hasMerchantAccount(request.auth.uid)
-          && (
-            ('activeMerchantId' in resource.data && resource.data.activeMerchantId == request.auth.uid)
-            || ('currentMerchantId' in resource.data && resource.data.currentMerchantId == request.auth.uid)
-          )
-        );
+    function isAllowedMerchantSelfUpdateKeys() {
+      return incoming().diff(existing()).affectedKeys().hasOnly([
+        'name', 'phone', 'address', 'category', 'description', 'logo', 'logoUrl',
+        'photoUrl', 'imageUrl', 'storagePath', 'location', 'latitude', 'longitude',
+        'locationUrl', 'locationLink', 'mapUrl', 'mapLink', 'mapsUrl', 'mapsLink',
+        'googleMapsUrl', 'googleMapUrl', 'isOpen', 'workingHours', 'fcmToken',
+        'emailVerified', 'lastLoginAt', 'updatedAt'
+      ]);
+    }
+
+    match /merchants/{merchantId} {
+      allow get: if isSignedIn() && isValidId(merchantId)
+        && (request.auth.uid == merchantId || isAdmin());
       allow list: if isAdmin();
 
-      allow create: if isAdmin() || (
-        isSignedIn()
-        && request.auth.uid == captainId
-        && !hasMerchantAccount(request.auth.uid)
-        && request.resource.data.uid == captainId
-        && request.resource.data.role == 'captain'
-        && request.resource.data.status == 'pending'
-        && request.resource.data.walletBalance == 0
-        && !('isAdmin' in request.resource.data)
-        && request.resource.data.keys().hasOnly([
-          'uid', 'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'email',
-          'role', 'status', 'profileImagePath', 'idFrontImagePath', 'idBackImagePath',
-          'licenseImagePath', 'idDocumentsComplete', 'rating', 'walletBalance',
-          'vehicleType', 'licensePlate', 'createdAt', 'updatedAt', 'avatarUri', 'profileImageUrl', 'photoUrl',
-          'idCardImageUrl', 'licenseImageUrl', 'nationalIdUrl', 'licenseUrl',
-          'avatarPresetIndex', 'isOnline', 'isLoggedIn', 'emailVerified', 'isEmailVerified'
-        ])
-      );
+    allow create: if isAdmin() || (
+  isSignedIn()
+  && isValidId(merchantId)
+  && request.auth.uid == merchantId
+  && isSafeInitialMerchantDoc(incoming(), merchantId)
+);
+      allow update: if isSignedIn()
+        && isValidId(merchantId)
+        && (
+          isAdmin() ||
+          (
+            request.auth.uid == merchantId
+            && isMerchantAccount()
+            && isValidMerchantDoc(incoming(), merchantId)
+            && isAllowedMerchantSelfUpdateKeys()
+            && (!('emailVerified' in incoming().diff(existing()).affectedKeys())
+              || incoming().emailVerified == false
+              || request.auth.token.get('email_verified', false) == true)
+          )
+        );
 
-      allow update: if isAdmin() || (
-        isCaptain(captainId)
-        && !hasMerchantAccount(request.auth.uid)
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'name', 'fullName', 'driver_name', 'phone', 'phoneNumber', 'emailVerified',
-          'isEmailVerified', 'isLoggedIn', 'isOnline', 'presenceStatus', 'location',
-          'latitude', 'longitude', 'accuracy', 'bearing', 'speed', 'lastLocationUpdate',
-          'lastLocationTimestamp', 'updatedAt', 'profileImagePath', 'profileImageUpdatedAt', 'profileImageUrl', 'photoUrl', 'avatarUri',
-          'idFrontImagePath', 'idBackImagePath', 'licenseImagePath', 'idDocumentsComplete',
-          'idCardImageUrl', 'licenseImageUrl', 'nationalIdUrl', 'licenseUrl',
-          'vehicleType', 'licensePlate', 'avatarUri', 'avatarPresetIndex', 'fcmToken'
-        ])
-      );
       allow delete: if isAdmin();
-
-      match /transactions/{transactionId} {
-        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
-        allow create, update, delete: if isAdmin();
-      }
-      match /daily_wallets/{dayKey} {
-        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
-        allow create, update, delete: if isAdmin();
-      }
-      match /subscriptions/{subscriptionId} {
-        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
-        allow create, update, delete: if isAdmin();
-      }
-      match /shifts/{shiftId} {
-        allow get, list: if isAdmin() || (isSignedIn() && request.auth.uid == captainId);
-        allow create, update, delete: if isAdmin();
-      }
     }
 
-    // Captain schedules are managed by admins; captains can read only their own schedules.
-    match /captain_schedules/{scheduleId} {
-      allow get: if isAdmin() || (isSignedIn() && (
-        request.auth.uid == scheduleId ||
-        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
-        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
-        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
-      ));
-      allow list: if isAdmin() || (isSignedIn() && (
-        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
-        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
-        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
-      ));
-      allow create, update, delete: if isAdmin();
-
-      match /shifts/{shiftId} {
-        allow read: if isAdmin() || isSignedIn() && request.auth.uid == scheduleId;
-        allow write: if isAdmin();
-      }
+    // --- 4. Admins Collection ---
+    match /admins/{adminId} {
+      // Users can inspect only their own server-provisioned admin record.
+      // isAdmin() resolves registry data with get() above, avoiding recursive checks.
+      allow get: if isSignedIn() && isValidId(adminId) && request.auth.uid == adminId;
+      allow list: if isAdmin();
+      allow write: if false; // Strictly managed via Firebase Admin SDK / Console
     }
 
-    // Legacy shifts are read-only for the assigned captain; all schedule writes go through the admin panel.
-    match /shifts/{shiftId} {
-      allow get, list: if isAdmin() || (isSignedIn() && (
-        ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
-        ('captainUid' in resource.data && resource.data.captainUid == request.auth.uid) ||
-        ('driverId' in resource.data && resource.data.driverId == request.auth.uid)
-      ));
-      allow create, update, delete: if isAdmin();
+    // --- 5. Orders Collection (Server-Authoritative Only) ---
+    // - NO public or blanket authenticated reads.
+    // - Captains read ONLY their own assigned/offered orders OR unassigned 'pending' orders.
+    // - Merchants read ONLY orders belonging to their own store.
+    // - Customers read ONLY their own orders.
+    // - ZERO client writes by captains or regular users; all order mutations go exclusively through Cloud Functions (Admin SDK).
+    function isOrderAssignedOrOfferedToCaptain(data) {
+      return ('captainId' in data && data.captainId == request.auth.uid) ||
+             ('driverId' in data && data.driverId == request.auth.uid) ||
+             ('captainUid' in data && data.captainUid == request.auth.uid) ||
+             ('assignedCaptainId' in data && data.assignedCaptainId == request.auth.uid) ||
+             ('offeredCaptainId' in data && data.offeredCaptainId == request.auth.uid);
     }
 
-    // Orders collection:
-    // 1. Direct client creation is STRICTLY BLOCKED: all new orders MUST go through trusted Cloud Functions
-    //    (`requestCaptains` / `createOrderWithCode`) which enforce subscription, email verification, and atomic captainLimit.
-    // 2. Merchants can read & follow their own orders, confirm/reject customer details, rate, or cancel —
-    //    NEVER modify captain assignment, dispatch lease, capacity fields, or financial/settlement fields once assigned.
-    // 3. Assigned captains retain full read & delivery status update capabilities without touching financial or ownership fields.
+    function isAvailablePendingOrder(data) {
+      return ('status' in data && data.status == 'pending')
+        && (
+          ('offeredCaptainId' in data && data.offeredCaptainId == request.auth.uid) ||
+          ('eligibleCaptainIds' in data && request.auth.uid in data.eligibleCaptainIds)
+        );
+    }
+
+    function isOrderOwnedByMerchant(data) {
+      return isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && (
+        ('merchantId' in data && data.merchantId == request.auth.uid) ||
+        ('restaurantId' in data && data.restaurantId == request.auth.uid) ||
+        ('storeId' in data && data.storeId == request.auth.uid) ||
+        ('vendorId' in data && data.vendorId == request.auth.uid) ||
+        ('ownerId' in data && data.ownerId == request.auth.uid) ||
+        ('userId' in data && data.userId == request.auth.uid)
+      );
+    }
+
+    function isOrderOwnedByCustomer(data) {
+      return ('customerId' in data && data.customerId == request.auth.uid);
+    }
+
+    function canReadOrder(data) {
+      return isAdmin() ||
+             (isCaptainAccount() && (isOrderAssignedOrOfferedToCaptain(data) || isAvailablePendingOrder(data))) ||
+             isOrderOwnedByMerchant(data) ||
+             isOrderOwnedByCustomer(data);
+    }
+
     match /orders/{orderId} {
-      allow read: if isAdmin() ||
-        (isMerchantAccount() && (
-          resource.data.merchantId == request.auth.uid ||
-          resource.data.userId == request.auth.uid ||
-          resource.data.restaurantId == request.auth.uid
-        )) ||
-        (hasCaptainAccount(request.auth.uid) && (
-          ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
-          ('offeredCaptainId' in resource.data && resource.data.offeredCaptainId == request.auth.uid)
-        ));
+      allow get: if isSignedIn() && isValidId(orderId) && canReadOrder(existing());
+      allow list: if isSignedIn() && canReadOrder(existing());
 
-      // Exclusive server-side creation via Cloud Functions (Admin SDK) or Admin only
+      // Order creation, assignment, status changes, and financial transitions are server-only.
+      // Admin SDK Cloud Functions bypass these client rules.
       allow create: if isAdmin();
 
-      // Protected updates: preserve merchant & captain operational workflows while blocking assignment/financial/capacity tampering
-      allow update: if isAdmin() ||
-        (isMerchantAccount() && (
-          resource.data.merchantId == request.auth.uid ||
-          resource.data.userId == request.auth.uid ||
-          resource.data.restaurantId == request.auth.uid
-        ) &&
-          request.resource.data.merchantId == resource.data.merchantId &&
-          request.resource.data.userId == resource.data.userId &&
-          request.resource.data.orderCode == resource.data.orderCode &&
-          request.resource.data.captainId == resource.data.captainId &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-            'merchantId', 'userId', 'restaurantId', 'orderCode', 'code',
-            'captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId',
-            'dispatchStatus', 'dispatchAttemptId', 'dispatchLockedUntilMs', 'dispatchTriggerSource',
-            'dispatchAssignedByAttemptId', 'assignedAt',
-            'createdByServerFunction', 'subscriptionVersionAtCreation',
-            'capacityReserved', 'capacityReleased', 'capacityReservedAt', 'capacityReleasedAt', 'capacityReleasedReason',
-            'captainEarnings', 'driverEarnings', 'commission', 'platformFee',
-            'walletCredited', 'payoutAmount', 'settlementStatus', 'paymentStatus'
-          ]) &&
-          (
-            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['price', 'serviceFee', 'totalAmount']) ||
-            (resource.data.captainId == null && resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن'])
-          )
-        ) ||
-        (hasCaptainAccount(request.auth.uid) && resource.data.captainId == request.auth.uid &&
-          request.resource.data.captainId == resource.data.captainId &&
-          request.resource.data.merchantId == resource.data.merchantId &&
-          request.resource.data.userId == resource.data.userId &&
-          request.resource.data.orderCode == resource.data.orderCode &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-            'merchantId', 'userId', 'restaurantId', 'orderCode', 'code',
-            'captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId',
-            'price', 'serviceFee', 'totalAmount',
-            'captainEarnings', 'driverEarnings', 'commission', 'platformFee',
-            'walletCredited', 'payoutAmount', 'settlementStatus', 'paymentStatus',
-            'capacityReserved', 'capacityReleased', 'capacityReservedAt', 'capacityReleasedAt', 'capacityReleasedReason',
-            'createdByServerFunction', 'subscriptionVersionAtCreation'
-          ])
-        );
-
+      // Merchants may edit only non-financial details before assignment.
+      // They cannot change status or confirm/reject a captain's submitted delivery data here;
+      // those transitions must call merchantConfirmOrder / merchantCancelOrder.
+      // Server-only for lifecycle and merchant data edits. The sole direct
+      // merchant update retained here is bounded feedback rating.
+      allow update: if isAdmin() || (
+        isOrderOwnedByMerchant(existing())
+        && incoming().merchantId == existing().merchantId
+        && incoming().diff(existing()).affectedKeys().hasOnly(['rating', 'ratedAt'])
+        && incoming().rating is int
+        && incoming().rating >= 1
+        && incoming().rating <= 5
+      );
       allow delete: if isAdmin();
     }
 
-    // Subscriptions collection:
-    // Canonical document path: subscriptions/{merchantId}.
-    // Merchant can ONLY read their own subscription document; never list other merchants or self-modify.
+    // Subscription records are read by their owner; only Admin SDK/Admin can mutate them.
     match /subscriptions/{subscriptionId} {
-      allow get: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.token.email_verified == true &&
-        subscriptionId == request.auth.uid &&
-        !hasCaptainAccount(request.auth.uid)
-      );
-      allow list: if isAdmin();
-      // Subscription activation, suspension, cancellation, and extension are strictly server/Admin-only.
-      allow create, update, delete: if isAdmin();
-    }
-
-    // Manual Vodafone Cash Subscription Requests collection:
-    // Created exclusively by trusted Cloud Function `submitManualSubscriptionRequest` (Admin SDK).
-    // Reviewed/approved/rejected exclusively by Admins via `adminReviewManualSubscriptionRequest` / `adminUpdateMerchantSubscription`.
-    match /subscription_requests/{requestId} {
       allow get, list: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.token.email_verified == true &&
-        !hasCaptainAccount(request.auth.uid) &&
-        resource != null &&
-        resource.data.merchantId == request.auth.uid
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && (
+          subscriptionId == request.auth.uid ||
+          ('merchantId' in existing() && existing().merchantId == request.auth.uid)
+        )
       );
       allow create, update, delete: if isAdmin();
     }
 
-    // Order Codes collection:
-    // Exclusively written by trusted Cloud Functions / Admin SDK during atomic order creation.
-    match /order_codes/{code} {
-      allow read: if isAdmin() || (
-        isSignedIn() &&
-        resource != null &&
-        resource.data.merchantId == request.auth.uid
-      );
-      allow create, update, delete: if isAdmin();
-    }
-
-    // Idempotency keys collection:
-    // Exclusively written by trusted Cloud Functions / Admin SDK to prevent duplicate order creation on retries.
-    match /idempotency_keys/{keyId} {
-      allow read: if isAdmin() || (
-        isSignedIn() &&
-        resource != null &&
-        (resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid)
-      );
-      allow create, update, delete: if isAdmin();
-    }
-
-    // Payments collection
     match /payments/{paymentId} {
-      allow read: if isAdmin() || 
-        (isSignedIn() && (resource.data.merchantId == request.auth.uid));
-      allow write: if isAdmin();
+      allow get, list: if isAdmin() || (
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && existing().merchantId == request.auth.uid
+      );
+      allow create, update, delete: if isAdmin();
     }
 
-    // Settings collection
+    match /order_codes/{code} {
+      allow get: if isAdmin() || (
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && existing().merchantId == request.auth.uid
+      );
+      allow list: if isAdmin() || (
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && existing().merchantId == request.auth.uid
+      );
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /idempotency_keys/{keyId} {
+      allow get: if isAdmin() || (isMerchantAccount() && (
+        !exists(/databases/$(database)/documents/idempotency_keys/$(keyId)) ||
+        existing().merchantId == request.auth.uid
+      ));
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
     match /settings/{settingId} {
-      allow read: if isSignedIn();
+      allow read: if isAdmin() || isSignedIn();
       allow write: if isAdmin();
     }
 
-    // Operation logs collection (server-side Cloud Functions audit trail)
     match /operation_logs/{logId} {
+      // Logs are read-only to dashboard admins; creation and mutation stay server-side.
       allow get, list: if isAdmin();
       allow create, update, delete: if false;
     }
 
-    // Users collection (used for user profile synchronization)
-    match /users/{userId} {
-      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
-      allow list: if isAdmin();
-      allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
-      allow delete: if isAdmin();
+    match /webhook_events/{eventId} {
+      // Payment webhook audit events are written only by trusted server code.
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // --- 6. Captain Schedules & Shifts (Read-Only for Owning Captain, Admin-Managed) ---
+    match /captain_schedules/{scheduleId} {
+      allow get: if isSignedIn() && isValidId(scheduleId) && (
+        scheduleId == request.auth.uid ||
+        isAdmin() ||
+        (existing() != null && (
+          ('captainId' in existing() && existing().captainId == request.auth.uid) ||
+          ('captainUid' in existing() && existing().captainUid == request.auth.uid) ||
+          ('driverId' in existing() && existing().driverId == request.auth.uid)
+        ))
+      );
+
+      allow list: if isSignedIn() && (
+        isAdmin() ||
+        ('captainId' in existing() && existing().captainId == request.auth.uid) ||
+        ('captainUid' in existing() && existing().captainUid == request.auth.uid) ||
+        ('driverId' in existing() && existing().driverId == request.auth.uid)
+      );
+
+      allow create, update, delete: if isAdmin();
+
+      match /shifts/{shiftId} {
+        allow get, list: if isSignedIn() && (scheduleId == request.auth.uid || isAdmin());
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    match /shifts/{shiftId} {
+      allow get, list: if isSignedIn() && (
+        isAdmin() ||
+        ('captainId' in existing() && existing().captainId == request.auth.uid) ||
+        ('driverId' in existing() && existing().driverId == request.auth.uid) ||
+        ('captainUid' in existing() && existing().captainUid == request.auth.uid)
+      );
+      allow create, update, delete: if isAdmin();
     }
   }
 }

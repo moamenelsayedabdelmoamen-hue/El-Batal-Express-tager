@@ -7848,10 +7848,15 @@ fun EditOrderScreen(
                                 orderDetails = details,
                                 customerPhone = currentOrder?.customerPhone ?: "",
                                 customerName = currentOrder?.customerName ?: "",
-                                serviceFee = serviceFee
+                                serviceFee = serviceFee,
+                                onSuccess = {
+                                    Toast.makeText(context, context.getString(R.string.order_updated_success), Toast.LENGTH_SHORT).show()
+                                    onBack()
+                                },
+                                onError = { message ->
+                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                }
                             )
-                            Toast.makeText(context, context.getString(R.string.order_updated_success), Toast.LENGTH_SHORT).show()
-                            onBack()
                         },
                         modifier = Modifier
                             .fillMaxWidth()

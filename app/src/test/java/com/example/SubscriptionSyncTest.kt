@@ -835,7 +835,7 @@ class SubscriptionSyncTest {
             endpointUnavailableOnServer = true
         )
         assertFalse(undeployedMsg.equals("NOT_FOUND", ignoreCase = true))
-        assertTrue(undeployedMsg.contains("requestCaptains"))
+        assertTrue(undeployedMsg.contains("merchantCreateOrder"))
         assertTrue(undeployedMsg.contains("us-central1"))
 
         val merchantMissingMsg = com.example.db.MerchantSubscriptionRepository.mapRequestCaptainsError(
