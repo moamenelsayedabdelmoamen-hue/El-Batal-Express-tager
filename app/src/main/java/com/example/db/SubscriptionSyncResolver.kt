@@ -705,6 +705,7 @@ object SubscriptionSyncResolver {
                 senderPhone = senderPhone,
                 transactionReference = transactionReference,
                 receiptStoragePath = receiptStoragePath,
+                pendingRequestId = pendingRequestId,
                 subscriptionVersion = version,
                 updatedBy = updatedBy
             )
