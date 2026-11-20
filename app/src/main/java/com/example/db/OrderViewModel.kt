@@ -2024,7 +2024,9 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 val resolvedCustomerPhone = customerPhone.trim().ifBlank {
                     matchedDoc.safeString("customerPhone").orEmpty()
                 }
-                val existingNotes = matchedDoc.safeString("deliveryNotes", "notes").orEmpty()
+                val existingNotes = matchedDoc.getString("deliveryNotes")
+                    ?: matchedDoc.getString("notes")
+                    ?: ""
 
                 subscriptionRepository.updateMerchantOrderDetails(
                     orderId = matchedDoc.id,
