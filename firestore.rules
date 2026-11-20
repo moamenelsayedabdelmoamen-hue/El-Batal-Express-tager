@@ -43,10 +43,13 @@ service cloud.firestore {
     }
 
     function isMerchant(merchantId) {
-      return isSignedIn() && (
-        request.auth.uid == merchantId ||
-        (request.auth.token.role == 'merchant' && request.auth.token.merchantId == merchantId)
-      );
+      return isSignedIn() &&
+        'email_verified' in request.auth.token &&
+        request.auth.token.email_verified == true &&
+        (
+          request.auth.uid == merchantId ||
+          (request.auth.token.role == 'merchant' && request.auth.token.merchantId == merchantId)
+        );
     }
 
     function isUnexpiredEndDate(val) {
