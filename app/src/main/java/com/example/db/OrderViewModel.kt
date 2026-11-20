@@ -2640,6 +2640,12 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         resolvedOrderStoragePhotoCache.clear()
         _firestoreOrders.value = emptyList()
         _restaurantProfile.value = RestaurantProfile()
+        // One app instance can be used by different merchant accounts on the same device.
+        // Remove previous-account cached orders whenever its authenticated data session ends.
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { repository.clearAllOrders() }
+                .onFailure { error -> Log.w("OrderViewModel", "Could not clear prior merchant order cache: ${error.message}") }
+        }
         _trackedCaptainInfo.value = null
         _subscriptionStatus.value = SubscriptionStatusState(isChecking = false, isExpired = false)
     }
