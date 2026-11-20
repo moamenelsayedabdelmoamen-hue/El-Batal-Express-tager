@@ -43,6 +43,7 @@ import com.example.storage.MigrationStepStatus
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.tasks.await
@@ -1499,6 +1500,44 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun orderRequestFingerprint(
+        merchantUid: String,
+        destinationAddress: String,
+        serviceFee: String,
+        customerName: String,
+        customerPhone: String,
+        orderDetails: String,
+        deliveryNotes: String,
+        customerLatitude: Double?,
+        customerLongitude: Double?
+    ): String {
+        val raw = listOf(
+            merchantUid, destinationAddress, serviceFee, customerName, customerPhone,
+            orderDetails, deliveryNotes, customerLatitude?.toString().orEmpty(),
+            customerLongitude?.toString().orEmpty()
+        ).joinToString("|")
+        return MessageDigest.getInstance("SHA-256")
+            .digest(raw.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun getOrCreateOrderIdempotencyKey(fingerprint: String): String {
+        val preferences = getApplication<Application>()
+            .getSharedPreferences("merchant_order_idempotency", 0)
+        val preferenceKey = "key_$fingerprint"
+        return preferences.getString(preferenceKey, null) ?: UUID.randomUUID().toString().also {
+            preferences.edit().putString(preferenceKey, it).apply()
+        }
+    }
+
+    private fun clearOrderIdempotencyKey(fingerprint: String) {
+        getApplication<Application>()
+            .getSharedPreferences("merchant_order_idempotency", 0)
+            .edit()
+            .remove("key_$fingerprint")
+            .apply()
+    }
+
     fun addOrder(
         destinationAddress: String,
         serviceFee: String,
@@ -1589,8 +1628,19 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             val currentDate = sdf.format(Date())
             val formattedFee = if (enteredFee.contains("جنيه")) enteredFee else "$enteredFee جنيه"
             val uid = currentUser.uid
-            val idempotencyKey = UUID.randomUUID().toString()
             val profile = _restaurantProfile.value
+            val idempotencyFingerprint = orderRequestFingerprint(
+                merchantUid = uid,
+                destinationAddress = trimmedAddress,
+                serviceFee = formattedFee,
+                customerName = customerName.trim(),
+                customerPhone = customerPhone.trim(),
+                orderDetails = orderDetails.trim(),
+                deliveryNotes = deliveryNotes.trim(),
+                customerLatitude = customerLatitude,
+                customerLongitude = customerLongitude
+            )
+            val idempotencyKey = getOrCreateOrderIdempotencyKey(idempotencyFingerprint)
             val currentRestaurantName = profile.name.ifBlank {
                 currentUser.displayName
                     ?: currentUser.email?.substringBefore("@")
@@ -1648,6 +1698,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val created = serverResult.getOrThrow()
+            clearOrderIdempotencyKey(idempotencyFingerprint)
             lastServerActiveCaptainsCount = created.activeCaptainsCount
             recomputeSubscriptionState()
 
