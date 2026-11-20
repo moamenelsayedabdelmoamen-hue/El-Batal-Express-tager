@@ -178,10 +178,12 @@ service cloud.firestore {
       allow get: if isSignedIn() && isValidId(captainId) && (
         request.auth.uid == captainId ||
         isAdmin() ||
-        (isMerchantAccount() && (
-          ('activeMerchantId' in existing() && existing().activeMerchantId == request.auth.uid) ||
-          ('currentMerchantId' in existing() && existing().currentMerchantId == request.auth.uid)
-        ))
+        (isMerchantAccount()
+          && request.auth.token.get('email_verified', false) == true
+          && (
+            ('activeMerchantId' in existing() && existing().activeMerchantId == request.auth.uid) ||
+            ('currentMerchantId' in existing() && existing().currentMerchantId == request.auth.uid)
+          ))
       );
 
       allow list: if isAdmin();
