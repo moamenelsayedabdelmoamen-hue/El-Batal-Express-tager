@@ -28,6 +28,13 @@ service cloud.firestore {
     // custom claims or a verified allowlisted administrator email. Do not read
     // /admins from this helper: per-request document lookups add evaluation cost
     // and must never be used as a client-controlled privilege source.
+    function isRegisteredAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'admin'
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('status', 'active') in ['active', 'approved'];
+    }
+
     function isAdmin() {
       return isSignedIn() && (
         (('role' in request.auth.token) && request.auth.token.role == 'admin') ||
@@ -40,7 +47,8 @@ service cloud.firestore {
             'moamen.elsayed.abdelmoamen@gmail.com',
             'admin@elbatalexpress.com'
           ]
-        )
+        ) ||
+        isRegisteredAdmin()
       );
     }
 
@@ -117,47 +125,24 @@ service cloud.firestore {
     // Strict allowlist of non-sensitive operational & Storage path fields a captain can update on their own profile.
     // Explicitly EXCLUDES accountType, walletBalance, totalOrdersCount, rating, role, status, isApproved, subscriptions, and activeMerchantId.
     function isAllowedCaptainSelfUpdateKeys() {
-      return incoming().diff(existing()).affectedKeys().hasOnly([
-        'name',
-        'fullName',
-        'driver_name',
-        'phone',
-        'phoneNumber',
-        'address',
-        'vehicleType',
-        'licensePlate',
-        'avatarUri',
-        'avatarPresetIndex',
-        'personalImage',
-        'idCardFront',
-        'idCardBack',
-        'profileImagePath',
-        'profileImageUpdatedAt',
-        'idFrontImagePath',
-        'idFrontUploadedAt',
-        'idBackImagePath',
-        'idBackUploadedAt',
-        'licenseImagePath',
-        'licenseImageUpdatedAt',
-        'idDocumentsComplete',
-        'location',
-        'latitude',
-        'longitude',
-        'accuracy',
-        'bearing',
-        'speed',
-        'lastLocationUpdate',
-        'lastLocationTimestamp',
-        'presenceStatus',
-        'availabilityStatus',
-        'shiftStatus',
-        'isOnline',
-        'isLoggedIn',
-        'emailVerified',
-        'isEmailVerified',
-        'fcmToken',
-        'updatedAt'
-      ]);
+      let changed = incoming().diff(existing()).affectedKeys();
+      return changed.hasOnly([
+        'name', 'fullName', 'driver_name', 'phone', 'phoneNumber',
+        'address', 'vehicleType', 'licensePlate', 'avatarUri',
+        'avatarPresetIndex', 'personalImage', 'idCardFront', 'idCardBack',
+        'profileImagePath', 'profileImageUpdatedAt', 'idFrontImagePath',
+        'idFrontUploadedAt', 'idBackImagePath', 'idBackUploadedAt',
+        'licenseImagePath', 'licenseImageUpdatedAt', 'idDocumentsComplete',
+        'location', 'latitude', 'longitude', 'accuracy', 'bearing', 'speed',
+        'lastLocationUpdate', 'lastLocationTimestamp', 'presenceStatus',
+        'availabilityStatus', 'shiftStatus', 'isOnline', 'isLoggedIn',
+        'fcmToken', 'updatedAt'
+      ])
+      && incoming().get('uid', '') == request.auth.uid
+      && incoming().get('accountType', 'captain') == 'captain'
+      && incoming().get('isOnline', false) is bool
+      && incoming().get('isLoggedIn', false) is bool
+      && incoming().get('idDocumentsComplete', false) is bool;
     }
 
     match /captains/{captainId} {
@@ -197,65 +182,8 @@ service cloud.firestore {
           isAdmin() ||
           (
             request.auth.uid == captainId
-            // A UID with an existing merchant profile may never update captain data.
             && !exists(/databases/$(database)/documents/merchants/$(request.auth.uid))
-            && existing().get('accountType', 'captain') == 'captain'
-            && incoming().get('uid', '') == existing().get('uid', captainId)
             && isAllowedCaptainSelfUpdateKeys()
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['emailVerified']) ||
-              incoming().emailVerified == false ||
-              (('email_verified' in request.auth.token) && request.auth.token.email_verified == true)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['isEmailVerified']) ||
-              incoming().isEmailVerified == false ||
-              (('email_verified' in request.auth.token) && request.auth.token.email_verified == true)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['isOnline']) ||
-              incoming().isOnline is bool
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['isLoggedIn']) ||
-              incoming().isLoggedIn is bool
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['idDocumentsComplete']) ||
-              incoming().idDocumentsComplete is bool
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['name']) ||
-              isOptionalBoundedString(incoming(), 'name', 120)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['fullName']) ||
-              isOptionalBoundedString(incoming(), 'fullName', 120)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['phone']) ||
-              isOptionalBoundedString(incoming(), 'phone', 32)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['phoneNumber']) ||
-              isOptionalBoundedString(incoming(), 'phoneNumber', 32)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['profileImagePath']) ||
-              isOptionalBoundedString(incoming(), 'profileImagePath', 300)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['idFrontImagePath']) ||
-              isOptionalBoundedString(incoming(), 'idFrontImagePath', 300)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['idBackImagePath']) ||
-              isOptionalBoundedString(incoming(), 'idBackImagePath', 300)
-            )
-            && (
-              !incoming().diff(existing()).affectedKeys().hasAny(['licenseImagePath']) ||
-              isOptionalBoundedString(incoming(), 'licenseImagePath', 300)
-            )
           )
         );
 
