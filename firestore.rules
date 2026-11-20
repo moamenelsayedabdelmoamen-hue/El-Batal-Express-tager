@@ -28,16 +28,18 @@ service cloud.firestore {
     // below is owner-read-only, so the authorization helper cannot recurse through
     // that match when a captain or merchant rule asks whether a caller is an admin.
     function isRegisteredAdmin() {
-      // get() for a missing document can evaluate to null in the rules emulator.
-      // Guard it with exists() before reading .data to avoid a Null value error
-      // for normal merchants, captains and customers.
-      return exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
-        (
-          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'admin' ||
-          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('isAdmin', false) == true ||
-          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('isSuperAdmin', false) == true
-        ) &&
-        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('status', 'active') in ['active', 'approved'];
+      let adminPath = /databases/$(database)/documents/admins/$(request.auth.uid);
+      let adminExists = exists(adminPath);
+      let adminRecord = get(adminPath);
+      // Read the registry document once. Do not access .data unless it exists.
+      return adminExists
+        && adminRecord.data != null
+        && (
+          adminRecord.data.get('role', '') == 'admin' ||
+          adminRecord.data.get('isAdmin', false) == true ||
+          adminRecord.data.get('isSuperAdmin', false) == true
+        )
+        && adminRecord.data.get('status', 'active') in ['active', 'approved'];
     }
 
     function isAdmin() {
@@ -61,8 +63,9 @@ service cloud.firestore {
     }
 
     function isMerchantAccount() {
+      // Identify the account by its server-owned profile even when its email is
+      // not verified; this prevents an unverified merchant from registering as a captain.
       return isSignedIn()
-        && request.auth.token.get('email_verified', false) == true
         && exists(/databases/$(database)/documents/merchants/$(request.auth.uid))
         && get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant';
     }
@@ -398,7 +401,9 @@ service cloud.firestore {
     }
 
     function isOrderOwnedByMerchant(data) {
-      return isMerchantAccount() && (
+      return isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && (
         ('merchantId' in data && data.merchantId == request.auth.uid) ||
         ('restaurantId' in data && data.restaurantId == request.auth.uid) ||
         ('storeId' in data && data.storeId == request.auth.uid) ||
@@ -445,24 +450,36 @@ service cloud.firestore {
 
     // Subscription records are read by their owner; only Admin SDK/Admin can mutate them.
     match /subscriptions/{subscriptionId} {
-      allow get, list: if isAdmin() || (isMerchantAccount() && (
-        subscriptionId == request.auth.uid ||
-        ('merchantId' in existing() && existing().merchantId == request.auth.uid)
-      ));
+      allow get, list: if isAdmin() || (
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && (
+          subscriptionId == request.auth.uid ||
+          ('merchantId' in existing() && existing().merchantId == request.auth.uid)
+        )
+      );
       allow create, update, delete: if isAdmin();
     }
 
     match /payments/{paymentId} {
-      allow get, list: if isAdmin() || (isMerchantAccount() && existing().merchantId == request.auth.uid);
+      allow get, list: if isAdmin() || (
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && existing().merchantId == request.auth.uid
+      );
       allow create, update, delete: if isAdmin();
     }
 
     match /order_codes/{code} {
       allow get: if isAdmin() || (
-        isMerchantAccount() && existing().merchantId == request.auth.uid
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && existing().merchantId == request.auth.uid
       );
       allow list: if isAdmin() || (
-        isMerchantAccount() && existing().merchantId == request.auth.uid
+        isMerchantAccount()
+        && request.auth.token.get('email_verified', false) == true
+        && existing().merchantId == request.auth.uid
       );
       allow create, update, delete: if isAdmin();
     }
