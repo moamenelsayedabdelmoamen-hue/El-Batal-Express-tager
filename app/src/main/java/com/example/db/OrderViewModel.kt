@@ -2474,6 +2474,24 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             receiptLocalUri = receiptLocalUri,
             currentSubscription = _subscriptionStatus.value
         )
+        val paymentSettings = _vodafoneCashSettings.value
+        if (!paymentSettings.isConfiguredOnServer) {
+            val configError = paymentSettings.loadError
+                ?: "إعدادات الاشتراك غير جاهزة على السيرفر. يرجى التواصل مع الإدارة."
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(configError)
+            _snackbarMessage.value = configError
+            onError(configError)
+            return
+        }
+        if (!paymentSettings.isAcceptingSubscriptions) {
+            val pausedError = paymentSettings.pauseMessage
+                ?: paymentSettings.loadError
+                ?: "استقبال طلبات الاشتراك متوقف مؤقتاً من الإدارة."
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(pausedError)
+            _snackbarMessage.value = pausedError
+            onError(pausedError)
+            return
+        }
         if (validationError != null) {
             _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(validationError)
             _snackbarMessage.value = validationError
@@ -2483,7 +2501,12 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
         val normalizedPhone = MerchantSubscriptionRepository.normalizeEgyptianMobile(senderPhone)!!
         val uid = currentUser.uid
-        val requestId = "subreq_${System.currentTimeMillis()}_${UUID.randomUUID().toString().replace("-", "").take(10)}"
+        val currentSubscription = _subscriptionStatus.value
+        val requestId = if (currentSubscription.isResubmissionRequired) {
+            currentSubscription.pendingRequestId!!.trim()
+        } else {
+            "subreq_${System.currentTimeMillis()}_${UUID.randomUUID().toString().replace("-", "").take(10)}"
+        }
 
         viewModelScope.launch {
             _manualSubscriptionUiState.value = ManualSubscriptionUiState.Submitting("جاري رفع صورة إيصال التحويل إلى Firebase Storage...")
