@@ -62,6 +62,7 @@ service cloud.firestore {
 
     function isMerchantAccount() {
       return isSignedIn()
+        && request.auth.token.get('email_verified', false) == true
         && exists(/databases/$(database)/documents/merchants/$(request.auth.uid))
         && get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant';
     }
