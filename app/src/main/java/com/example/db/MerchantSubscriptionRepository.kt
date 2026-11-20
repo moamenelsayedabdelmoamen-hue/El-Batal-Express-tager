@@ -610,6 +610,7 @@ class MerchantSubscriptionRepository {
                     )
                 )
                 .await()
+            Unit
         }
     }
 
@@ -632,6 +633,7 @@ class MerchantSubscriptionRepository {
                     )
                 )
                 .await()
+            Unit
         }
     }
 
