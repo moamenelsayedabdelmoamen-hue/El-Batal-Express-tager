@@ -1578,9 +1578,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val enteredFee = serviceFee.trim()
-            if (enteredFee.isBlank() || enteredFee.replace(",", "").toDoubleOrNull() == null ||
-                enteredFee.replace(",", "").toDoubleOrNull()!! < 0
-            ) {
+            val feeNumber = Regex("""\\d+(?:\\.\\d+)?""").find(enteredFee.replace(",", ""))?.value?.toDoubleOrNull()
+            if (enteredFee.isBlank() || feeNumber == null || feeNumber < 0) {
                 val feeMsg = "يرجى إدخال قيمة خدمة التوصيل من تطبيق التاجر قبل طلب الكابتن."
                 _snackbarMessage.value = feeMsg
                 onError?.invoke(feeMsg)
