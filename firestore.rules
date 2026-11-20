@@ -30,10 +30,11 @@ service cloud.firestore {
     }
 
     function isMerchantAccount() {
+      let merch = get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data;
       return isSignedIn() &&
         hasMerchantAccount(request.auth.uid) &&
         !hasCaptainAccount(request.auth.uid) &&
-        get(/databases/$(database)/documents/merchants/$(request.auth.uid)).data.accountType == 'merchant';
+        (merch.accountType == 'merchant' || (!('accountType' in merch) && merch.role == 'merchant'));
     }
 
     function isMerchant(merchantId) {
@@ -46,31 +47,54 @@ service cloud.firestore {
     function isUnexpiredEndDate(val) {
       return val == null ||
         (val is timestamp && val > request.time) ||
-        (val is int && val > request.time.toMillis());
+        (val is int && (
+          (val >= 1000000000000 && val > request.time.toMillis()) ||
+          (val > 0 && val < 1000000000000 && (val * 1000) > request.time.toMillis())
+        ));
+    }
+
+    function isActiveStatusValue(val) {
+      return val in ['active', 'activated', 'subscribed', 'enabled', 'نشط', 'نشطة', 'ساري', 'سارية', 'فعال', 'فعّال', 'مفعل', 'مفعّل'];
+    }
+
+    function hasPositiveCaptainLimit(doc) {
+      return ('captainLimit' in doc && doc.captainLimit > 0) ||
+        ('maxCaptains' in doc && doc.maxCaptains > 0) ||
+        (!('captainLimit' in doc) && !('maxCaptains' in doc) && 'planId' in doc && doc.planId > 0);
+    }
+
+    function isNotExplicitlyDeactivated(doc) {
+      return !('isActive' in doc && doc.isActive == false && (!('isSubscribed' in doc) || doc.isSubscribed != true));
     }
 
     function isSubscriptionDocActive(subData) {
-      return subData.status == 'active' &&
-        (!('isSubscribed' in subData) || subData.isSubscribed == true) &&
-        (!('paymentStatus' in subData) || subData.paymentStatus == 'paid') &&
-        (!('maxCaptains' in subData) || subData.maxCaptains > 0) &&
-        (!('endDate' in subData) || isUnexpiredEndDate(subData.endDate));
+      return (
+          ('status' in subData && isActiveStatusValue(subData.status)) ||
+          ('subscriptionStatus' in subData && isActiveStatusValue(subData.subscriptionStatus))
+        ) &&
+        isNotExplicitlyDeactivated(subData) &&
+        hasPositiveCaptainLimit(subData) &&
+        (!('endDate' in subData) || isUnexpiredEndDate(subData.endDate)) &&
+        (!('expiresAt' in subData) || isUnexpiredEndDate(subData.expiresAt));
     }
 
     // Server-side authoritative subscription check across BOTH subscriptions/{uid} and merchants/{uid}
     function hasActiveMerchantSubscription(uid) {
       let merch = get(/databases/$(database)/documents/merchants/$(uid)).data;
-      return merch.accountType == 'merchant' &&
+      let isMerchDoc = merch.accountType == 'merchant' || (!('accountType' in merch) && merch.role == 'merchant');
+      return isMerchDoc &&
         merch.status in ['approved', 'active'] &&
-        !('subscriptionStatus' in merch && merch.subscriptionStatus in ['suspended', 'cancelled', 'canceled', 'expired', 'payment_failed']) &&
+        !('subscriptionStatus' in merch && merch.subscriptionStatus in ['suspended', 'inactive', 'cancelled', 'canceled', 'expired', 'pending', 'pending_payment', 'payment_failed']) &&
         (
           exists(/databases/$(database)/documents/subscriptions/$(uid))
             ? isSubscriptionDocActive(get(/databases/$(database)/documents/subscriptions/$(uid)).data)
             : (
-                merch.subscriptionStatus == 'active' &&
-                merch.isSubscribed == true &&
-                (!('maxCaptains' in merch) || merch.maxCaptains > 0) &&
-                (!('subscriptionEndDate' in merch) || isUnexpiredEndDate(merch.subscriptionEndDate))
+                'subscriptionStatus' in merch &&
+                isActiveStatusValue(merch.subscriptionStatus) &&
+                isNotExplicitlyDeactivated(merch) &&
+                hasPositiveCaptainLimit(merch) &&
+                (!('subscriptionEndDate' in merch) || isUnexpiredEndDate(merch.subscriptionEndDate)) &&
+                (!('expiresAt' in merch) || isUnexpiredEndDate(merch.expiresAt))
               )
         );
     }
@@ -139,6 +163,8 @@ service cloud.firestore {
         && request.resource.data.role == resource.data.role
         && request.resource.data.status == resource.data.status
         && (!('isApproved' in resource.data) || request.resource.data.isApproved == resource.data.isApproved)
+        && !('isApproved' in request.resource.data.diff(resource.data).affectedKeys())
+        && !('status' in request.resource.data.diff(resource.data).affectedKeys())
         && request.resource.data.email == resource.data.email
         && request.resource.data.name is string
         && request.resource.data.name.size() >= 1
@@ -263,47 +289,66 @@ service cloud.firestore {
     }
 
     // Orders collection:
-    // 1. Merchant can NEVER choose or modify captainId.
-    // 2. Merchant MUST have verified email and an active, non-suspended, non-cancelled, unexpired subscription.
-    // 3. Initial order creation must have captainId == null, dispatchStatus == 'searching', status == 'pending'.
+    // 1. Direct client creation is STRICTLY BLOCKED: all new orders MUST go through trusted Cloud Functions
+    //    (`requestCaptains` / `createOrderWithCode`) which enforce subscription, email verification, and atomic captainLimit.
+    // 2. Merchants can read & follow their own orders, confirm/reject customer details, rate, or cancel —
+    //    NEVER modify captain assignment, dispatch lease, capacity fields, or financial/settlement fields once assigned.
+    // 3. Assigned captains retain full read & delivery status update capabilities without touching financial or ownership fields.
     match /orders/{orderId} {
       allow read: if isAdmin() ||
         (isMerchantAccount() && (
           resource.data.merchantId == request.auth.uid ||
-          resource.data.userId == request.auth.uid
+          resource.data.userId == request.auth.uid ||
+          resource.data.restaurantId == request.auth.uid
         )) ||
         (hasCaptainAccount(request.auth.uid) && (
           ('captainId' in resource.data && resource.data.captainId == request.auth.uid) ||
           ('offeredCaptainId' in resource.data && resource.data.offeredCaptainId == request.auth.uid)
         ));
-      
-      // Merchant creates order only when email verified AND subscription active on server
-      allow create: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.token.email_verified == true &&
-        request.resource.data.merchantId == request.auth.uid &&
-        request.resource.data.userId == request.auth.uid &&
-        hasActiveMerchantSubscription(request.auth.uid) &&
-        request.resource.data.captainId == null &&
-        request.resource.data.dispatchStatus == 'searching' &&
-        request.resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن']
-      );
 
-      // Merchant can update order details or cancel prior to assignment, but CANNOT set captainId or dispatchStatus
-      // Captain can update delivery progress once assigned
-      allow update: if isAdmin() || 
-        (isMerchantAccount() && resource.data.merchantId == request.auth.uid &&
+      // Exclusive server-side creation via Cloud Functions (Admin SDK) or Admin only
+      allow create: if isAdmin();
+
+      // Protected updates: preserve merchant & captain operational workflows while blocking assignment/financial/capacity tampering
+      allow update: if isAdmin() ||
+        (isMerchantAccount() && (
+          resource.data.merchantId == request.auth.uid ||
+          resource.data.userId == request.auth.uid ||
+          resource.data.restaurantId == request.auth.uid
+        ) &&
           request.resource.data.merchantId == resource.data.merchantId &&
           request.resource.data.userId == resource.data.userId &&
           request.resource.data.orderCode == resource.data.orderCode &&
           request.resource.data.captainId == resource.data.captainId &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId', 'dispatchStatus', 'assignedAt'])
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'merchantId', 'userId', 'restaurantId', 'orderCode', 'code',
+            'captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId',
+            'dispatchStatus', 'dispatchAttemptId', 'dispatchLockedUntilMs', 'dispatchTriggerSource',
+            'dispatchAssignedByAttemptId', 'assignedAt',
+            'createdByServerFunction', 'subscriptionVersionAtCreation',
+            'capacityReserved', 'capacityReleased', 'capacityReservedAt', 'capacityReleasedAt', 'capacityReleasedReason',
+            'captainEarnings', 'driverEarnings', 'commission', 'platformFee',
+            'walletCredited', 'payoutAmount', 'settlementStatus', 'paymentStatus'
+          ]) &&
+          (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['price', 'serviceFee', 'totalAmount']) ||
+            (resource.data.captainId == null && resource.data.status in ['pending', 'جاري البحث', 'جاري البحث عن كابتن'])
+          )
         ) ||
         (hasCaptainAccount(request.auth.uid) && resource.data.captainId == request.auth.uid &&
           request.resource.data.captainId == resource.data.captainId &&
           request.resource.data.merchantId == resource.data.merchantId &&
           request.resource.data.userId == resource.data.userId &&
-          request.resource.data.orderCode == resource.data.orderCode
+          request.resource.data.orderCode == resource.data.orderCode &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'merchantId', 'userId', 'restaurantId', 'orderCode', 'code',
+            'captainId', 'captainUid', 'driverId', 'assignedCaptainId', 'offeredCaptainId',
+            'price', 'serviceFee', 'totalAmount',
+            'captainEarnings', 'driverEarnings', 'commission', 'platformFee',
+            'walletCredited', 'payoutAmount', 'settlementStatus', 'paymentStatus',
+            'capacityReserved', 'capacityReleased', 'capacityReservedAt', 'capacityReleasedAt', 'capacityReleasedReason',
+            'createdByServerFunction', 'subscriptionVersionAtCreation'
+          ])
         );
 
       allow delete: if isAdmin();
@@ -315,6 +360,7 @@ service cloud.firestore {
     match /subscriptions/{subscriptionId} {
       allow get: if isAdmin() || (
         isSignedIn() &&
+        request.auth.token.email_verified == true &&
         subscriptionId == request.auth.uid &&
         !hasCaptainAccount(request.auth.uid)
       );
@@ -324,34 +370,25 @@ service cloud.firestore {
     }
 
     // Order Codes collection:
-    // Tracks unique 6-digit codes. Allows active merchants to atomically reserve codes during order creation.
+    // Exclusively written by trusted Cloud Functions / Admin SDK during atomic order creation.
     match /order_codes/{code} {
-      allow read: if isSignedIn();
-      allow create: if isAdmin() || (
-        isMerchantAccount() &&
-        request.auth.token.email_verified == true &&
-        hasActiveMerchantSubscription(request.auth.uid) &&
-        request.resource.data.merchantId == request.auth.uid
+      allow read: if isAdmin() || (
+        isSignedIn() &&
+        resource != null &&
+        resource.data.merchantId == request.auth.uid
       );
-      allow update, delete: if isAdmin();
+      allow create, update, delete: if isAdmin();
     }
 
     // Idempotency keys collection:
-    // Prevents duplicate order creation on network retries.
+    // Exclusively written by trusted Cloud Functions / Admin SDK to prevent duplicate order creation on retries.
     match /idempotency_keys/{keyId} {
-      allow read: if isSignedIn() && (
-        resource == null ||
-        resource.data.merchantId == request.auth.uid ||
-        resource.data.userId == request.auth.uid ||
-        isAdmin()
+      allow read: if isAdmin() || (
+        isSignedIn() &&
+        resource != null &&
+        (resource.data.merchantId == request.auth.uid || resource.data.userId == request.auth.uid)
       );
-      allow create: if isAdmin() || (
-        isMerchantAccount() &&
-        request.auth.token.email_verified == true &&
-        hasActiveMerchantSubscription(request.auth.uid) &&
-        request.resource.data.merchantId == request.auth.uid
-      );
-      allow update, delete: if isAdmin();
+      allow create, update, delete: if isAdmin();
     }
 
     // Payments collection
@@ -365,6 +402,12 @@ service cloud.firestore {
     match /settings/{settingId} {
       allow read: if isSignedIn();
       allow write: if isAdmin();
+    }
+
+    // Operation logs collection (server-side Cloud Functions audit trail)
+    match /operation_logs/{logId} {
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
     }
 
     // Users collection (used for user profile synchronization)

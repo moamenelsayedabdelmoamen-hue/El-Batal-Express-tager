@@ -1,7 +1,9 @@
 import * as functions from "firebase-functions";
 import * as admin from "firebase-admin";
 
-admin.initializeApp();
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
 const db = admin.firestore();
 
 /**
@@ -105,29 +107,236 @@ function isCaptainCurrentlyInShift(schedule: FirebaseFirestore.DocumentData | un
 }
 
 /**
- * Main auto-dispatch engine function.
- * Given an order ID and data, verifies merchant subscription, searches for eligible captains,
- * sorts by proximity, and attempts an atomic transaction assignment.
+ * Checks whether an order status is a terminal status that frees captain capacity.
+ * Rejection/re-dispatch states (pending, searching, offered, reassigned) are NOT terminal.
  */
-export async function runAutoDispatch(orderId: string, orderData: FirebaseFirestore.DocumentData): Promise<boolean> {
-  console.log(`[AutoDispatch] Starting dispatch evaluation for order: ${orderId}`);
+export function isTerminalOrderStatusForCapacity(rawStatus: unknown): boolean {
+  const raw = String(rawStatus || "").trim().toLowerCase();
+  if (!raw) return false;
+  return (
+    [
+      "completed",
+      "delivered",
+      "cancelled",
+      "canceled",
+      "ملغي",
+      "ملغية",
+      "تم الإلغاء",
+      "تم الالغاء",
+      "تم التسليم",
+      "تم التوصيل",
+      "مكتمل",
+      "مكتملة"
+    ].includes(raw) ||
+    raw.includes("مكتمل") ||
+    raw.includes("تم التسليم") ||
+    raw.includes("تم التوصيل") ||
+    raw.includes("delivered") ||
+    raw.includes("ملغ") ||
+    raw.includes("cancel")
+  );
+}
 
-  // 1. Ensure order is eligible for dispatch
-  const currentStatus = (orderData.status || "").toLowerCase();
-  const dispatchStatus = (orderData.dispatchStatus || "").toLowerCase();
-  const existingCaptainId = orderData.captainId;
+/**
+ * Releases a reserved capacity slot for a terminal order atomically and idempotently (at most once).
+ * Never releases capacity if the order is still active / being re-dispatched after captain rejection.
+ */
+export async function releaseOrderCapacitySlot(
+  targetDb: FirebaseFirestore.Firestore,
+  orderId: string,
+  merchantIdHint?: string,
+  releaseReason?: string
+): Promise<{ released: boolean; reason: string; remainingReservedCount?: number }> {
+  if (!orderId) {
+    return { released: false, reason: "invalid_order_id" };
+  }
 
-  if (existingCaptainId || (currentStatus !== "pending" && dispatchStatus !== "searching")) {
-    console.log(`[AutoDispatch] Order ${orderId} is not in pending/searching state. Skipping.`);
+  return targetDb.runTransaction(async (transaction) => {
+    const orderRef = targetDb.collection("orders").doc(orderId);
+    const orderSnap = await transaction.get(orderRef);
+    if (!orderSnap.exists) {
+      return { released: false, reason: "order_not_found" };
+    }
+    const orderData = orderSnap.data() || {};
+    if (orderData.capacityReleased === true) {
+      return { released: false, reason: "already_released" };
+    }
+    if (!isTerminalOrderStatusForCapacity(orderData.status)) {
+      return { released: false, reason: "order_not_terminal" };
+    }
+
+    const merchantId = String(
+      merchantIdHint || orderData.merchantId || orderData.userId || orderData.restaurantId || ""
+    ).trim();
+    if (!merchantId) {
+      transaction.set(
+        orderRef,
+        {
+          capacityReleased: true,
+          capacityReleasedAt: admin.firestore.FieldValue.serverTimestamp(),
+          capacityReleasedReason: String(releaseReason || orderData.status || "terminal")
+        },
+        { merge: true }
+      );
+      return { released: true, reason: "released_without_merchant", remainingReservedCount: 0 };
+    }
+
+    const capRef = targetDb
+      .collection("merchants")
+      .doc(merchantId)
+      .collection("capacity")
+      .doc("current");
+    const capSnap = await transaction.get(capRef);
+    const capData = capSnap.exists ? (capSnap.data() || {}) : {};
+    const prevIds: string[] = Array.isArray(capData.reservedOrderIds)
+      ? capData.reservedOrderIds.map((x: unknown) => String(x)).filter(Boolean)
+      : [];
+    const nextIds = prevIds.filter((id) => id !== orderId);
+
+    transaction.set(
+      capRef,
+      {
+        merchantId,
+        reservedOrderIds: nextIds,
+        activeReservationsCount: nextIds.length,
+        capacityVersion: admin.firestore.FieldValue.increment(1),
+        lastReleasedOrderId: orderId,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    transaction.set(
+      orderRef,
+      {
+        capacityReleased: true,
+        capacityReleasedAt: admin.firestore.FieldValue.serverTimestamp(),
+        capacityReleasedReason: String(releaseReason || orderData.status || "terminal")
+      },
+      { merge: true }
+    );
+
+    return {
+      released: true,
+      reason: "released",
+      remainingReservedCount: nextIds.length
+    };
+  });
+}
+
+const DISPATCH_LEASE_MS = 30_000;
+
+async function releaseDispatchLeaseIfOwned(
+  targetDb: FirebaseFirestore.Firestore,
+  orderId: string,
+  dispatchAttemptId: string,
+  extraFields: Record<string, any> = {}
+): Promise<void> {
+  try {
+    await targetDb.runTransaction(async (transaction) => {
+      const orderRef = targetDb.collection("orders").doc(orderId);
+      const snap = await transaction.get(orderRef);
+      if (!snap.exists) return;
+      const data = snap.data() || {};
+      if (data.dispatchAttemptId !== dispatchAttemptId) return;
+      if (data.captainId || data.dispatchStatus === "assigned") return;
+      transaction.update(orderRef, {
+        dispatchStatus: extraFields.dispatchStatus || "searching",
+        dispatchLockedUntilMs: admin.firestore.FieldValue.delete(),
+        lastSearchAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...extraFields
+      });
+    });
+  } catch (err: any) {
+    console.warn(`[AutoDispatch] Lease release warning for order ${orderId}: ${err?.message || err}`);
+  }
+}
+
+/**
+ * Main auto-dispatch engine function.
+ * Protected by an atomic per-order dispatch lease (`dispatchStatus: "dispatching"` + `dispatchAttemptId`)
+ * so retried triggers or concurrent triggers can NEVER double-dispatch or send duplicate offers to captains.
+ */
+export async function runAutoDispatch(
+  orderId: string,
+  orderData: FirebaseFirestore.DocumentData,
+  options: {
+    triggerSource?: string;
+    targetDb?: FirebaseFirestore.Firestore;
+    sendFcm?: (payload: admin.messaging.Message) => Promise<any>;
+    nowMs?: number;
+  } = {}
+): Promise<boolean> {
+  const targetDb = options.targetDb || db;
+  const triggerSource = options.triggerSource || "onOrderCreated";
+  const nowMs = options.nowMs ?? Date.now();
+  const sendFcm = options.sendFcm || ((payload: admin.messaging.Message) => admin.messaging().send(payload));
+
+  console.log(`[AutoDispatch] Starting dispatch evaluation for order: ${orderId} (source=${triggerSource})`);
+
+  // 1. Atomic Dispatch Claim / Lease Lock to prevent duplicate concurrent executions
+  const dispatchAttemptId = `${nowMs}_${crypto.randomBytes(6).toString("hex")}`;
+  let claimedOrderData: FirebaseFirestore.DocumentData | null = null;
+
+  try {
+    claimedOrderData = await targetDb.runTransaction(async (transaction) => {
+      const orderRef = targetDb.collection("orders").doc(orderId);
+      const snap = await transaction.get(orderRef);
+      if (!snap.exists) {
+        return null;
+      }
+      const fresh = snap.data() || {};
+      const currentStatus = String(fresh.status || "").toLowerCase();
+      const dispatchStatus = String(fresh.dispatchStatus || "").toLowerCase();
+      const existingCaptainId = fresh.captainId;
+
+      if (existingCaptainId || currentStatus !== "pending") {
+        return null;
+      }
+      if (dispatchStatus === "assigned" || dispatchStatus === "failed") {
+        return null;
+      }
+      if (dispatchStatus === "dispatching") {
+        const lockedUntil = Number(fresh.dispatchLockedUntilMs || 0);
+        if (lockedUntil > nowMs) {
+          console.log(`[AutoDispatch] Order ${orderId} already locked by attempt ${fresh.dispatchAttemptId}. Skipping duplicate dispatch.`);
+          return null;
+        }
+      }
+
+      transaction.update(orderRef, {
+        dispatchStatus: "dispatching",
+        dispatchAttemptId,
+        dispatchLockedUntilMs: nowMs + DISPATCH_LEASE_MS,
+        dispatchTriggerSource: triggerSource,
+        lastDispatchAttemptAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      return fresh;
+    });
+  } catch (claimErr: any) {
+    console.warn(`[AutoDispatch] Failed to claim dispatch lease for ${orderId}: ${claimErr?.message || claimErr}`);
     return false;
   }
 
+  if (!claimedOrderData) {
+    console.log(`[AutoDispatch] Order ${orderId} not eligible or already claimed. Skipping.`);
+    return false;
+  }
+
+  const effectiveOrderData = { ...orderData, ...claimedOrderData };
+
   // 2. Verify the canonical merchant account and subscription.
-  const merchantId = orderData.merchantId || orderData.userId;
-  if (!merchantId) return false;
-  const merchantDoc = await db.collection("merchants").doc(merchantId).get();
-  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
-    await db.collection("orders").doc(orderId).update({
+  const merchantId = effectiveOrderData.merchantId || effectiveOrderData.userId;
+  if (!merchantId) {
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
+      dispatchStatus: "failed",
+      dispatchError: "معرف التاجر مفقود"
+    });
+    return false;
+  }
+  const merchantDoc = await targetDb.collection("merchants").doc(merchantId).get();
+  if (!merchantDoc.exists || !isMerchantAccountDoc(merchantDoc.data())) {
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
       dispatchStatus: "failed",
       dispatchError: "التاجر غير موجود في merchants",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -136,16 +345,16 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   }
   const restData = merchantDoc.data() || {};
   if (restData.status !== "approved" && restData.status !== "active") {
-    await db.collection("orders").doc(orderId).update({
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
       dispatchStatus: "failed",
       dispatchError: "حساب التاجر في انتظار موافقة الإدارة",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
     return false;
   }
-  const subCheck = await verifyMerchantSubscription(merchantId);
-  if (!subCheck.isValid) {
-    await db.collection("orders").doc(orderId).update({
+  const subCheck = await verifyMerchantSubscription(merchantId, 1, targetDb, nowMs);
+  if (!subCheck.isActive) {
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
       status: "cancelled",
       dispatchStatus: "failed",
       cancelReason: subCheck.errorMessage || "اشتراك التاجر غير فعال",
@@ -158,12 +367,12 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   let pickupLat: number | null = null;
   let pickupLng: number | null = null;
 
-  if (orderData.pickupLocation && typeof orderData.pickupLocation.latitude === "number") {
-    pickupLat = orderData.pickupLocation.latitude;
-    pickupLng = orderData.pickupLocation.longitude;
-  } else if (typeof orderData.merchantLatitude === "number" && typeof orderData.merchantLongitude === "number") {
-    pickupLat = orderData.merchantLatitude;
-    pickupLng = orderData.merchantLongitude;
+  if (effectiveOrderData.pickupLocation && typeof effectiveOrderData.pickupLocation.latitude === "number") {
+    pickupLat = effectiveOrderData.pickupLocation.latitude;
+    pickupLng = effectiveOrderData.pickupLocation.longitude;
+  } else if (typeof effectiveOrderData.merchantLatitude === "number" && typeof effectiveOrderData.merchantLongitude === "number") {
+    pickupLat = effectiveOrderData.merchantLatitude;
+    pickupLng = effectiveOrderData.merchantLongitude;
   } else if (restData.location && typeof restData.location.latitude === "number") {
     pickupLat = restData.location.latitude;
     pickupLng = restData.location.longitude;
@@ -174,42 +383,36 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
 
   if (pickupLat === null || pickupLng === null) {
     console.warn(`[AutoDispatch] No valid location found for merchant ${merchantId}. Order ${orderId} remains in searching.`);
-    await db.collection("orders").doc(orderId).update({
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
       dispatchStatus: "searching",
-      dispatchNote: "في انتظار تحديد إحداثيات التاجر",
-      lastSearchAt: admin.firestore.FieldValue.serverTimestamp()
+      dispatchNote: "في انتظار تحديد إحداثيات التاجر"
     });
     return false;
   }
 
   // 4. Query eligible captains from 'captains' collection
-  // isOnline is the stable shared field across the captain app and admin dashboard.
-  // A shared readiness predicate handles status, presence, reception toggles, and current order.
-  // Older/current clients may use presenceStatus/canReceiveOrders instead of availabilityStatus.
-  const captainsSnapshot = await db.collection("captains")
+  const captainsSnapshot = await targetDb.collection("captains")
     .where("isOnline", "==", true)
     .get();
 
   if (captainsSnapshot.empty) {
     console.log(`[AutoDispatch] No online, available, approved captains currently available.`);
-    await db.collection("orders").doc(orderId).update({
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
       dispatchStatus: "searching",
-      lastSearchAt: admin.firestore.FieldValue.serverTimestamp(),
       searchAttempts: admin.firestore.FieldValue.increment(1)
     });
     return false;
   }
 
-  const nowMs = Date.now();
   const maxLocationStaleMs = 3 * 60 * 1000; // 3 minutes maximum for fresh location
   const candidates: CandidateCaptain[] = [];
   const scheduleSnapshots = await Promise.all(captainsSnapshot.docs.map((captainDoc) =>
-    db.collection("captain_schedules").doc(captainDoc.id).get()
+    targetDb.collection("captain_schedules").doc(captainDoc.id).get()
   ));
 
   for (let captainIndex = 0; captainIndex < captainsSnapshot.docs.length; captainIndex++) {
     const doc = captainsSnapshot.docs[captainIndex];
-    if (!isCaptainCurrentlyInShift(scheduleSnapshots[captainIndex].data())) continue;
+    if (!isCaptainCurrentlyInShift(scheduleSnapshots[captainIndex].data(), new Date(nowMs))) continue;
     const data = doc.data();
     if (!isCaptainReadyForDispatch(data)) continue;
 
@@ -229,7 +432,6 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         continue;
       }
     } else {
-      // If never updated location timestamp, skip to maintain accuracy
       console.log(`[AutoDispatch] Captain ${doc.id} skipped: lastLocationUpdate missing.`);
       continue;
     }
@@ -254,9 +456,8 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
 
   if (candidates.length === 0) {
     console.log(`[AutoDispatch] No captains passed the fresh-location and active status filters.`);
-    await db.collection("orders").doc(orderId).update({
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
       dispatchStatus: "searching",
-      lastSearchAt: admin.firestore.FieldValue.serverTimestamp(),
       searchAttempts: admin.firestore.FieldValue.increment(1)
     });
     return false;
@@ -267,16 +468,14 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
   console.log(`[AutoDispatch] Found ${candidates.length} candidate captains for order ${orderId}. Closest is ${candidates[0].id} (${candidates[0].distanceKm.toFixed(2)} km).`);
 
   // 5. Atomic Reservation using Firestore Transactions
-  // Try candidates in order. If race condition occurs (candidate taken by another order),
-  // the transaction fails and we try the next closest captain.
   let assignedCaptain: CandidateCaptain | null = null;
 
   for (const candidate of candidates) {
     try {
-      await db.runTransaction(async (transaction) => {
-        const orderRef = db.collection("orders").doc(orderId);
-        const captainRef = db.collection("captains").doc(candidate.id);
-        const scheduleRef = db.collection("captain_schedules").doc(candidate.id);
+      await targetDb.runTransaction(async (transaction) => {
+        const orderRef = targetDb.collection("orders").doc(orderId);
+        const captainRef = targetDb.collection("captains").doc(candidate.id);
+        const scheduleRef = targetDb.collection("captain_schedules").doc(candidate.id);
 
         const [currentOrderDoc, currentCaptainDoc, scheduleDoc] = await Promise.all([
           transaction.get(orderRef),
@@ -289,8 +488,13 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         }
 
         const freshOrder = currentOrderDoc.data() || {};
-        // Re-verify order is still unassigned
-        if (freshOrder.captainId || (freshOrder.status !== "pending" && freshOrder.dispatchStatus !== "searching")) {
+        // Re-verify order is still unassigned AND owned by this dispatch attempt lease
+        if (
+          freshOrder.captainId ||
+          freshOrder.status !== "pending" ||
+          freshOrder.dispatchStatus !== "dispatching" ||
+          freshOrder.dispatchAttemptId !== dispatchAttemptId
+        ) {
           throw new Error("ORDER_ALREADY_ASSIGNED");
         }
 
@@ -302,7 +506,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
         // Re-verify readiness and shift membership inside the assignment transaction.
         if (
           !isCaptainReadyForDispatch(freshCaptain) ||
-          !isCaptainCurrentlyInShift(scheduleDoc.data())
+          !isCaptainCurrentlyInShift(scheduleDoc.data(), new Date(nowMs))
         ) {
           throw new Error("CAPTAIN_BUSY_OR_OFFLINE");
         }
@@ -318,7 +522,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Atomically update Order: assign captain
+        // Atomically update Order: assign captain & seal dispatch attempt idempotently
         transaction.update(orderRef, {
           captainId: candidate.id,
           captainName: candidate.name,
@@ -328,6 +532,8 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           driverPhone: candidate.phone,
           status: "accepted",
           dispatchStatus: "assigned",
+          dispatchLockedUntilMs: admin.firestore.FieldValue.delete(),
+          dispatchAssignedByAttemptId: dispatchAttemptId,
           assignedAt: admin.firestore.FieldValue.serverTimestamp(),
           distanceToMerchantKm: Math.round(candidate.distanceKm * 100) / 100,
           estimatedArrival: `${estimatedMins} دقيقة`,
@@ -344,11 +550,10 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
       if (err.message === "ORDER_ALREADY_ASSIGNED" || err.message === "ORDER_NOT_FOUND") {
         return false;
       }
-      // Otherwise candidate was busy or taken -> continue to next candidate
     }
   }
 
-  // 6. Post-Assignment: Push Notification via FCM
+  // 6. Post-Assignment: Push Notification via FCM (only sent by the winning dispatchAttemptId)
   if (assignedCaptain) {
     if (assignedCaptain.fcmToken) {
       try {
@@ -356,14 +561,15 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           token: assignedCaptain.fcmToken,
           notification: {
             title: "طلب توصيل جديد 🛵",
-            body: `طلب جديد من مطعم ${orderData.merchantName || "البطل"} على بعد ${assignedCaptain.distanceKm.toFixed(1)} كم!`
+            body: `طلب جديد من مطعم ${effectiveOrderData.merchantName || "البطل"} على بعد ${assignedCaptain.distanceKm.toFixed(1)} كم!`
           },
           data: {
             orderId: orderId,
-            merchantName: String(orderData.merchantName || ""),
+            merchantName: String(effectiveOrderData.merchantName || ""),
             distance: `${assignedCaptain.distanceKm.toFixed(1)} km`,
-            fee: String(orderData.serviceFee || orderData.price || "30 جنيه"),
-            type: "NEW_ORDER_ASSIGNED"
+            fee: String(effectiveOrderData.serviceFee || effectiveOrderData.price || "30 جنيه"),
+            type: "NEW_ORDER_ASSIGNED",
+            dispatchAttemptId
           },
           android: {
             priority: "high",
@@ -374,7 +580,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
           }
         };
 
-        await admin.messaging().send(messagePayload);
+        await sendFcm(messagePayload);
         console.log(`[AutoDispatch] FCM notification successfully sent to captain ${assignedCaptain.id}`);
       } catch (fcmError: any) {
         console.error(`[AutoDispatch] Failed to send FCM notification: ${fcmError.message}`);
@@ -383,9 +589,8 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
     return true;
   } else {
     console.log(`[AutoDispatch] Could not reserve any candidate for order ${orderId}. Remains in searching.`);
-    await db.collection("orders").doc(orderId).update({
+    await releaseDispatchLeaseIfOwned(targetDb, orderId, dispatchAttemptId, {
       dispatchStatus: "searching",
-      lastSearchAt: admin.firestore.FieldValue.serverTimestamp(),
       searchAttempts: admin.firestore.FieldValue.increment(1)
     });
     return false;
@@ -394,7 +599,7 @@ export async function runAutoDispatch(orderId: string, orderData: FirebaseFirest
 
 /**
  * Trigger: On New Order Created in Firestore.
- * Automatically runs the auto-dispatch matching algorithm.
+ * Single authoritative entry point for initial auto-dispatch of new orders.
  */
 export const onOrderCreated = functions.firestore
   .document("orders/{orderId}")
@@ -403,7 +608,7 @@ export const onOrderCreated = functions.firestore
     const orderData = snap.data();
     if (!orderData) return;
 
-    await runAutoDispatch(orderId, orderData);
+    await runAutoDispatch(orderId, orderData, { triggerSource: "onOrderCreated" });
   });
 
 /**
@@ -433,35 +638,45 @@ export const onCaptainUpdated = functions.firestore
       if (!pendingOrdersSnapshot.empty) {
         const orderDoc = pendingOrdersSnapshot.docs[0];
         console.log(`[AutoDispatch] Queued order ${orderDoc.id} found. Triggering auto-dispatch.`);
-        await runAutoDispatch(orderDoc.id, orderDoc.data());
+        await runAutoDispatch(orderDoc.id, orderDoc.data(), { triggerSource: "onCaptainUpdated" });
       }
     }
   });
 
 /**
  * Trigger: When an Order Status Changes.
- * If order is delivered, completed, or cancelled, automatically frees the captain
- * so they are immediately available for subsequent orders!
+ * 1. Idempotently releases the merchant's reserved captainLimit slot when transitioning to a terminal state
+ *    (even if cancelled before captain assignment). Never releases on captain rejection / re-dispatch.
+ * 2. Frees the assigned captain cleanly without touching captain earnings or ongoing orders.
  */
 export const onOrderStatusChanged = functions.firestore
   .document("orders/{orderId}")
   .onUpdate(async (change, context) => {
-    const afterData = change.after.data();
-    const beforeData = change.before.data();
+    const orderId = context.params.orderId;
+    const afterData = change.after.data() || {};
+    const beforeData = change.before.data() || {};
 
-    const newStatus = (afterData.status || "").toLowerCase();
-    const oldStatus = (beforeData.status || "").toLowerCase();
+    const newStatus = String(afterData.status || "").toLowerCase().trim();
+    const oldStatus = String(beforeData.status || "").toLowerCase().trim();
     const captainId = afterData.captainId;
+    const merchantId = String(afterData.merchantId || afterData.userId || afterData.restaurantId || "").trim();
 
-    if (!captainId) return;
+    const isTerminalNow = isTerminalOrderStatusForCapacity(newStatus);
+    const wasAlreadyFinished = isTerminalOrderStatusForCapacity(oldStatus);
 
-    const isCompletedOrCancelled =
-      ["delivered", "completed", "cancelled", "ملغي", "تم التسليم"].includes(newStatus);
-    const wasAlreadyFinished =
-      ["delivered", "completed", "cancelled", "ملغي", "تم التسليم"].includes(oldStatus);
+    // 1. Idempotent capacity slot release (protected by transaction + order.capacityReleased flag)
+    if (isTerminalNow && afterData.capacityReleased !== true) {
+      try {
+        const rel = await releaseOrderCapacitySlot(db, orderId, merchantId, newStatus);
+        console.log(`[CapacityRelease] Order ${orderId} (${newStatus}): ${rel.reason}`);
+      } catch (err: any) {
+        console.error(`[CapacityRelease] Error releasing capacity for order ${orderId}: ${err?.message || err}`);
+      }
+    }
 
-    if (isCompletedOrCancelled && !wasAlreadyFinished) {
-      console.log(`[AutoDispatch] Order ${context.params.orderId} concluded (${newStatus}). Freeing captain ${captainId}...`);
+    // 2. Free assigned captain when order reaches terminal state (never modifies earnings/wallet/transactions)
+    if (captainId && isTerminalNow && !wasAlreadyFinished) {
+      console.log(`[AutoDispatch] Order ${orderId} concluded (${newStatus}). Freeing captain ${captainId}...`);
       try {
         await db.collection("captains").doc(captainId).update({
           availabilityStatus: "available",
@@ -510,15 +725,26 @@ export function generateDistinct6DigitCode(): string {
 
 export interface VerifySubscriptionResult {
   isValid: boolean;
-  status: string; // active, expired, suspended, cancelled, payment_failed, unsubscribed, merchant_pending, not_found
+  isActive: boolean;
+  isSubscribed: boolean;
+  status: string; // active, inactive, suspended, cancelled, expired, pending, pending_payment, payment_failed, unsubscribed, merchant_pending, not_found
   errorMessage?: string;
-  planId?: number;
-  planName?: string;
-  maxCaptains?: number;
-  price?: number;
-  startDate?: any;
-  endDate?: any;
-  activeCaptainsCount?: number;
+  planId: number;
+  planName: string;
+  maxCaptains: number;
+  captainLimit: number;
+  price: number;
+  startDate?: number | null;
+  activatedAt?: number | null;
+  endDate?: number | null;
+  expiresAt?: number | null;
+  remainingMillis?: number;
+  remainingDays?: number;
+  remainingHours?: number;
+  activeCaptainsCount: number;
+  remainingCaptains: number;
+  subscriptionVersion: number;
+  updatedBy?: string;
   reason?: string;
 }
 
@@ -527,33 +753,91 @@ const ADMIN_EMAIL_ALLOWLIST = [
   "admin@elbatalexpress.com"
 ];
 
-function parseMillis(rawDate: any): number | null {
-  if (!rawDate) return null;
+export const ACTIVE_ORDER_STATUSES_FOR_LIMIT = [
+  "pending",
+  "searching",
+  "accepted",
+  "in_progress",
+  "out_for_delivery",
+  "captain_reached_store",
+  "order_picked_up",
+  "waiting_merchant_confirmation",
+  "customer_confirmed",
+  "customer_rejected",
+  "جاري البحث",
+  "جاري البحث عن كابتن",
+  "في انتظار كابتن",
+  "في الطريق لك",
+  "جاري التوصيل",
+  "وصل المتجر",
+  "تم الاستلام",
+  "بانتظار تأكيد البيانات",
+  "بيانات مرفوضة"
+];
+
+export function parseMillis(rawDate: any): number | null {
+  if (rawDate === null || rawDate === undefined) return null;
   if (typeof rawDate.toMillis === "function") return rawDate.toMillis();
   if (rawDate instanceof Date) return rawDate.getTime();
-  if (typeof rawDate === "number" && Number.isFinite(rawDate)) return rawDate;
+  if (typeof rawDate === "number" && Number.isFinite(rawDate)) {
+    if (rawDate <= 0) return null;
+    // Normalize Unix timestamps provided in seconds (< 1e12) into milliseconds
+    return rawDate < 1_000_000_000_000 ? Math.round(rawDate * 1000) : Math.round(rawDate);
+  }
+  if (typeof rawDate === "object") {
+    if (typeof rawDate._seconds === "number") return rawDate._seconds * 1000;
+    if (typeof rawDate.seconds === "number") return rawDate.seconds * 1000;
+  }
   if (typeof rawDate === "string") {
-    const asNum = Number(rawDate);
-    if (!isNaN(asNum) && asNum > 1000000000) return asNum;
-    const parsed = Date.parse(rawDate);
+    const trimmed = rawDate.trim();
+    if (!trimmed) return null;
+    const asNum = Number(trimmed);
+    if (!isNaN(asNum) && asNum > 1_000_000_000) {
+      return asNum < 1_000_000_000_000 ? Math.round(asNum * 1000) : Math.round(asNum);
+    }
+    const parsed = Date.parse(trimmed);
     if (!isNaN(parsed)) return parsed;
   }
   return null;
 }
 
-function normalizeSubscriptionStatus(raw: unknown): string {
+export function isMerchantAccountDoc(merchantData: Record<string, any> | null | undefined): boolean {
+  if (!merchantData) return false;
+  const accountType = String(merchantData.accountType || "").toLowerCase().trim();
+  const role = String(merchantData.role || "").toLowerCase().trim();
+  if (accountType === "merchant") return true;
+  if (!accountType && role === "merchant") return true;
+  return false;
+}
+
+export function normalizeSubscriptionStatus(raw: unknown): string {
   const s = String(raw || "").toLowerCase().trim();
-  if (["active", "نشط", "نشطة", "سارية"].includes(s)) return "active";
-  if (["suspended", "suspend", "paused", "موقوف", "موقوفة", "متوقف", "متوقفة", "inactive"].includes(s)) return "suspended";
-  if (["cancelled", "canceled", "cancel", "ملغي", "ملغى", "ملغاة"].includes(s)) return "cancelled";
-  if (["expired", "منتهي", "منتهية"].includes(s)) return "expired";
+  if ([
+    "active", "activated", "subscribed", "enabled", "valid", "approved", "paid",
+    "نشط", "نشطة", "ساري", "سارية", "فعال", "فعّال", "فعالة", "فعّالة",
+    "مفعل", "مفعّل", "مفعلة", "مفعّلة", "مشترك", "مشتركة"
+  ].includes(s)) return "active";
+  if ([
+    "inactive", "disabled", "not_active", "deactivated",
+    "غير نشط", "غير نشطة", "غير فعال", "غير فعّال", "غير مفعل", "غير مفعّل"
+  ].includes(s)) return "inactive";
+  if ([
+    "suspended", "suspend", "paused", "blocked", "frozen",
+    "موقوف", "موقوفة", "متوقف", "متوقفة"
+  ].includes(s)) return "suspended";
+  if ([
+    "cancelled", "canceled", "cancel", "revoked", "terminated",
+    "ملغي", "ملغى", "ملغاة"
+  ].includes(s)) return "cancelled";
+  if (["expired", "منتهي", "منتهية", "منتهي الصلاحية"].includes(s)) return "expired";
+  if (["pending", "under_review", "in_review", "قيد المراجعة", "معلق", "معلقة", "بانتظار التفعيل"].includes(s)) return "pending";
+  if (["pending_payment", "awaiting_payment", "في انتظار الدفع"].includes(s)) return "pending_payment";
   if (["payment_failed", "failed", "declined"].includes(s)) return "payment_failed";
-  if (["pending_payment", "pending", "في انتظار الدفع"].includes(s)) return "pending_payment";
   if (["unsubscribed", "none", ""].includes(s)) return "unsubscribed";
   return s;
 }
 
-function resolvePlanMetadata(rawPlanId: any, rawPlanName: any, rawMaxCaptains: any, rawPrice: any) {
+export function resolvePlanMetadata(rawPlanId: any, rawPlanName: any, rawMaxCaptains: any, rawPrice: any) {
   const planId = Number(rawPlanId || 0) || (
     String(rawPlanName || "").includes("المتقدمة") || String(rawPlanName || "").includes("8") ? 4 :
     String(rawPlanName || "").includes("المميزة") || String(rawPlanName || "").includes("6") ? 3 :
@@ -569,7 +853,17 @@ function resolvePlanMetadata(rawPlanId: any, rawPlanName: any, rawMaxCaptains: a
   const planName = String(rawPlanName || "").trim() || def.planName;
   const maxCaptains = Number(rawMaxCaptains) > 0 ? Number(rawMaxCaptains) : def.maxCaptains;
   const price = Number(rawPrice) > 0 ? Number(rawPrice) : def.price;
-  return { planId, planName, maxCaptains, price };
+  return { planId, planName, maxCaptains, captainLimit: maxCaptains, price };
+}
+
+export function computeRemainingDuration(endDateMs: number | null, nowMs = Date.now()) {
+  if (!endDateMs || !Number.isFinite(endDateMs) || endDateMs <= nowMs) {
+    return { remainingMillis: 0, remainingDays: 0, remainingHours: 0 };
+  }
+  const remainingMillis = Math.max(0, endDateMs - nowMs);
+  const remainingHours = Math.floor(remainingMillis / (60 * 60 * 1000));
+  const remainingDays = Math.floor(remainingMillis / (24 * 60 * 60 * 1000));
+  return { remainingMillis, remainingDays, remainingHours };
 }
 
 async function isAdminCaller(context: functions.https.CallableContext): Promise<boolean> {
@@ -587,67 +881,210 @@ async function isAdminCaller(context: functions.https.CallableContext): Promise<
   return adminDoc.exists;
 }
 
-/**
- * Server-side subscription validation against BOTH subscriptions/{merchantId} and merchants/{merchantId}.
- * Guarantees suspended / cancelled / expired / failed states are never bypassed by stale mirror docs.
- */
-export async function verifyMerchantSubscription(merchantId: string): Promise<VerifySubscriptionResult> {
-  const now = Date.now();
-  const [subById, merchantDoc] = await Promise.all([
-    db.collection("subscriptions").doc(merchantId).get(),
-    db.collection("merchants").doc(merchantId).get()
-  ]);
-  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
-    return { isValid: false, status: "not_found", errorMessage: "حساب التاجر غير موجود في merchants." };
+async function writeOperationLog(entry: Record<string, any>): Promise<void> {
+  try {
+    await db.collection("operation_logs").add({
+      ...entry,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (err: any) {
+    console.warn(`[OperationLog] Failed to write log: ${err?.message || err}`);
   }
-  const merchantData = merchantDoc.data() || {};
-  if (merchantData.status !== "approved" && merchantData.status !== "active") {
-    return { isValid: false, status: "merchant_pending", errorMessage: "حساب التاجر في انتظار موافقة الإدارة." };
-  }
+}
 
-  const subData = subById.exists ? (subById.data() || {}) : {};
-  const subStatus = subById.exists
-    ? normalizeSubscriptionStatus(subData.status || subData.subscriptionStatus || subData.planStatus)
-    : "unsubscribed";
-  const merchSubStatus = normalizeSubscriptionStatus(merchantData.subscriptionStatus);
-
-  const subUpdatedMs = parseMillis(subData.updatedAt) || 0;
-  const merchUpdatedMs = parseMillis(merchantData.updatedAt) || 0;
-
-  let effectiveDoc: FirebaseFirestore.DocumentData = subById.exists ? subData : merchantData;
-  let effectiveStatus = subById.exists ? subStatus : merchSubStatus;
-
-  if (subById.exists && merchSubStatus !== "unsubscribed" && merchSubStatus !== subStatus) {
-    if (merchUpdatedMs > subUpdatedMs) {
-      effectiveDoc = { ...subData, ...merchantData };
-      effectiveStatus = merchSubStatus;
-    } else if (subUpdatedMs === 0 && ["suspended", "cancelled", "expired"].includes(merchSubStatus)) {
-      effectiveDoc = { ...subData, ...merchantData };
-      effectiveStatus = merchSubStatus;
+async function sendMerchantSubscriptionNotification(
+  merchantId: string,
+  title: string,
+  body: string,
+  type: string,
+  extraData: Record<string, string> = {}
+): Promise<boolean> {
+  try {
+    const merchDoc = await db.collection("merchants").doc(merchantId).get();
+    const merchData = merchDoc.data() || {};
+    const fcmToken = String(merchData.fcmToken || "").trim();
+    if (!fcmToken) {
+      return false;
     }
+
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: {
+        title,
+        body
+      },
+      data: {
+        type,
+        merchantId,
+        ...extraData
+      },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "subscription_sync_channel",
+          sound: "default"
+        }
+      }
+    });
+    return true;
+  } catch (err: any) {
+    console.warn(`[FCM] Subscription push failed for ${merchantId}: ${err?.message || err}`);
+    return false;
   }
+}
 
-  const meta = resolvePlanMetadata(
-    effectiveDoc.planId ?? merchantData.planId,
-    effectiveDoc.planName ?? merchantData.planName,
-    effectiveDoc.maxCaptains ?? merchantData.maxCaptains,
-    effectiveDoc.price ?? merchantData.price
-  );
-  const startDateMs = parseMillis(effectiveDoc.startDate || effectiveDoc.subscriptionStartDate || subData.startDate || merchantData.subscriptionStartDate);
-  const endDateMs = parseMillis(effectiveDoc.endDate || effectiveDoc.subscriptionEndDate || effectiveDoc.expiryDate || subData.endDate || merchantData.subscriptionEndDate);
-  const reason = String(effectiveDoc.suspensionReason || effectiveDoc.cancellationReason || merchantData.suspensionReason || "").trim();
-  const paymentStatus = String(effectiveDoc.paymentStatus || merchantData.paymentStatus || "paid").toLowerCase().trim();
-
-  if (effectiveStatus === "suspended") {
+export function evaluateDualDocSubscription(
+  subDataInput: Record<string, any> | null | undefined,
+  merchantDataInput: Record<string, any> | null | undefined,
+  activeCaptainsCount = 0,
+  now = Date.now(),
+  requestedCaptains = 1
+): VerifySubscriptionResult {
+  const merchantData = merchantDataInput || null;
+  if (!isMerchantAccountDoc(merchantData)) {
     return {
       isValid: false,
-      status: "suspended",
+      isActive: false,
+      isSubscribed: false,
+      status: "not_found",
+      planId: 0,
+      planName: "غير مشترك",
+      maxCaptains: 0,
+      captainLimit: 0,
+      price: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: 0,
+      errorMessage: "تعذر العثور على بيانات حساب التاجر."
+    };
+  }
+  const merchantAccountStatus = String(merchantData!.status || "").toLowerCase().trim();
+  const isLegacyExplicitlyApproved = merchantAccountStatus === "" && merchantData!.isApproved === true;
+  if (
+    merchantAccountStatus !== "approved" &&
+    merchantAccountStatus !== "active" &&
+    !isLegacyExplicitlyApproved
+  ) {
+    return {
+      isValid: false,
+      isActive: false,
+      isSubscribed: false,
+      status: "merchant_pending",
+      planId: 0,
+      planName: "بانتظار الاعتماد",
+      maxCaptains: 0,
+      captainLimit: 0,
+      price: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: Number(merchantData!.subscriptionVersion || 0),
+      errorMessage: "حساب التاجر في انتظار موافقة الإدارة."
+    };
+  }
+
+  const hasSubDoc = Boolean(subDataInput && Object.keys(subDataInput).length > 0);
+  const subData = subDataInput || {};
+  const subStatus = hasSubDoc
+    ? normalizeSubscriptionStatus(subData.status || subData.subscriptionStatus || subData.planStatus)
+    : "unsubscribed";
+  const merchSubStatus = normalizeSubscriptionStatus(merchantData!.subscriptionStatus || merchantData!.planStatus);
+
+  // Use dedicated subscriptionUpdatedAt whenever present so profile/login/FCM updatedAt writes on
+  // merchants/{uid} NEVER override an active subscriptions/{uid} document.
+  const subUpdatedMs = parseMillis(subData.subscriptionUpdatedAt || subData.updatedAt || subData.activatedAt) || 0;
+  const merchLastLoginMs = parseMillis(merchantData!.lastLoginAt) || 0;
+  const merchRawUpdatedMs = parseMillis(merchantData!.updatedAt) || 0;
+  const merchSubUpdatedExplicit = parseMillis(merchantData!.subscriptionUpdatedAt);
+  const isLoginOnlyBump = merchSubUpdatedExplicit === null && merchLastLoginMs > 0 && Math.abs(merchRawUpdatedMs - merchLastLoginMs) <= 10_000;
+  const merchUpdatedMs = merchSubUpdatedExplicit ?? (isLoginOnlyBump ? 0 : merchRawUpdatedMs);
+
+  const subVer = Number(subData.subscriptionVersion || 0);
+  const merchVer = Number(merchantData!.subscriptionVersion || 0);
+  const subVersion = Math.max(subVer, merchVer, 1);
+
+  let effectiveDoc: Record<string, any> = hasSubDoc ? subData : merchantData!;
+  let effectiveStatus = hasSubDoc ? subStatus : merchSubStatus;
+
+  if (hasSubDoc && merchSubStatus !== "unsubscribed" && merchSubStatus !== subStatus) {
+    if (merchVer > subVer || (merchVer === subVer && merchUpdatedMs > subUpdatedMs)) {
+      effectiveDoc = { ...subData, ...merchantData! };
+      effectiveStatus = merchSubStatus;
+    } else if (
+      merchVer === subVer &&
+      subUpdatedMs === 0 &&
+      merchUpdatedMs > 0 &&
+      ["suspended", "inactive", "cancelled", "expired", "pending"].includes(merchSubStatus)
+    ) {
+      effectiveDoc = { ...subData, ...merchantData! };
+      effectiveStatus = merchSubStatus;
+    }
+  } else if (hasSubDoc && subStatus === "unsubscribed" && merchSubStatus !== "unsubscribed") {
+    effectiveDoc = { ...subData, ...merchantData! };
+    effectiveStatus = merchSubStatus;
+  }
+
+  const rawLimitCandidate =
+    Number(effectiveDoc.captainLimit || 0) ||
+    Number(effectiveDoc.maxCaptains || 0) ||
+    Number(subData.captainLimit || 0) ||
+    Number(subData.maxCaptains || 0) ||
+    Number(merchantData!.captainLimit || 0) ||
+    Number(merchantData!.maxCaptains || 0);
+  const rawPlanId = effectiveDoc.planId ?? subData.planId ?? merchantData!.planId;
+  const rawPlanName = effectiveDoc.planName ?? subData.planName ?? merchantData!.planName;
+  const rawPrice = effectiveDoc.price ?? subData.price ?? merchantData!.price;
+  const meta = resolvePlanMetadata(rawPlanId, rawPlanName, rawLimitCandidate, rawPrice);
+
+  const startDateMs = parseMillis(
+    effectiveDoc.activatedAt ||
+      effectiveDoc.startDate ||
+      effectiveDoc.subscriptionStartDate ||
+      subData.activatedAt ||
+      subData.startDate ||
+      merchantData!.subscriptionStartDate
+  );
+  const endDateMs = parseMillis(
+    effectiveDoc.expiresAt ||
+      effectiveDoc.endDate ||
+      effectiveDoc.subscriptionEndDate ||
+      effectiveDoc.expiryDate ||
+      subData.expiresAt ||
+      subData.endDate ||
+      merchantData!.subscriptionEndDate
+  );
+  const remaining = computeRemainingDuration(endDateMs, now);
+  const reason = String(effectiveDoc.suspensionReason || effectiveDoc.cancellationReason || merchantData!.suspensionReason || "").trim();
+  const updatedBy = String(effectiveDoc.updatedBy || effectiveDoc.updatedByAdminUid || merchantData!.updatedBy || "").trim() || undefined;
+  const paymentStatus = String(effectiveDoc.paymentStatus || merchantData!.paymentStatus || "paid").toLowerCase().trim();
+
+  // Only treat boolean flags as disabling an "active" doc when Admin explicitly turned BOTH flags off
+  // or explicitly set isActive === false without isSubscribed === true. Stale signup isSubscribed:false
+  // alone must NOT invalidate an Admin-activated status:"active" subscription.
+  const explicitDeactivatedFlag =
+    effectiveDoc.isActive === false && effectiveDoc.isSubscribed !== true;
+
+  if (effectiveStatus === "suspended" || effectiveStatus === "inactive") {
+    return {
+      isValid: false,
+      isActive: false,
+      isSubscribed: false,
+      status: effectiveStatus,
       planId: meta.planId,
       planName: meta.planName,
       maxCaptains: 0,
+      captainLimit: 0,
       price: meta.price,
       startDate: startDateMs,
+      activatedAt: startDateMs,
       endDate: endDateMs,
+      expiresAt: endDateMs,
+      remainingMillis: 0,
+      remainingDays: 0,
+      remainingHours: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
       reason,
       errorMessage: reason
         ? `تم إيقاف اشتراكك من قبل الإدارة (${reason}). يرجى التواصل مع الإدارة أو تجديد الاشتراك.`
@@ -657,204 +1094,503 @@ export async function verifyMerchantSubscription(merchantId: string): Promise<Ve
   if (effectiveStatus === "cancelled") {
     return {
       isValid: false,
+      isActive: false,
+      isSubscribed: false,
       status: "cancelled",
       planId: meta.planId,
       planName: meta.planName,
       maxCaptains: 0,
+      captainLimit: 0,
       price: meta.price,
       startDate: startDateMs,
+      activatedAt: startDateMs,
       endDate: endDateMs,
+      expiresAt: endDateMs,
+      remainingMillis: 0,
+      remainingDays: 0,
+      remainingHours: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
       reason,
       errorMessage: reason
         ? `تم إلغاء اشتراكك (${reason}). يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة.`
         : "تم إلغاء اشتراكك. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة."
     };
   }
-  if (effectiveStatus === "payment_failed" || effectiveStatus === "pending_payment" || ["failed", "unpaid", "pending"].includes(paymentStatus)) {
+  if (effectiveStatus === "pending") {
     return {
       isValid: false,
+      isActive: false,
+      isSubscribed: false,
+      status: "pending",
+      planId: meta.planId,
+      planName: meta.planName,
+      maxCaptains: 0,
+      captainLimit: 0,
+      price: meta.price,
+      startDate: startDateMs,
+      activatedAt: startDateMs,
+      endDate: endDateMs,
+      expiresAt: endDateMs,
+      remainingMillis: 0,
+      remainingDays: 0,
+      remainingHours: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
+      errorMessage: "اشتراكك قيد المراجعة من الإدارة ولم يتم تفعيله بعد."
+    };
+  }
+  if (
+    effectiveStatus === "payment_failed" ||
+    effectiveStatus === "pending_payment" ||
+    (effectiveStatus !== "active" && ["failed", "unpaid", "pending"].includes(paymentStatus))
+  ) {
+    return {
+      isValid: false,
+      isActive: false,
+      isSubscribed: false,
       status: effectiveStatus === "pending_payment" ? "pending_payment" : "payment_failed",
       planId: meta.planId,
       planName: meta.planName,
       maxCaptains: 0,
+      captainLimit: 0,
       price: meta.price,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
       errorMessage: "لم يتم تأكيد الدفع لهذا الاشتراك."
     };
   }
   if (effectiveStatus === "expired" || (endDateMs !== null && now >= endDateMs)) {
     return {
       isValid: false,
+      isActive: false,
+      isSubscribed: false,
       status: "expired",
       planId: meta.planId,
       planName: meta.planName,
       maxCaptains: meta.maxCaptains,
+      captainLimit: meta.captainLimit,
       price: meta.price,
       startDate: startDateMs,
+      activatedAt: startDateMs,
       endDate: endDateMs,
+      expiresAt: endDateMs,
+      remainingMillis: 0,
+      remainingDays: 0,
+      remainingHours: 0,
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
       errorMessage: "انتهت فترة اشتراكك، يرجى تجديد الاشتراك."
     };
   }
-  if (effectiveStatus !== "active" || effectiveDoc.isSubscribed === false || Number(effectiveDoc.maxCaptains) <= 0) {
+  if (effectiveStatus !== "active" || explicitDeactivatedFlag || meta.captainLimit <= 0) {
     return {
       isValid: false,
+      isActive: false,
+      isSubscribed: false,
       status: effectiveStatus || "unsubscribed",
       planId: 0,
       planName: "غير مشترك",
       maxCaptains: 0,
+      captainLimit: 0,
       price: 0,
-      errorMessage: "لا يوجد اشتراك نشط لهذا التاجر."
+      activeCaptainsCount,
+      remainingCaptains: 0,
+      subscriptionVersion: subVersion,
+      updatedBy,
+      errorMessage:
+        !hasSubDoc && merchSubStatus === "unsubscribed"
+          ? "لم يتم العثور على اشتراك التاجر."
+          : "لا يوجد اشتراك نشط لهذا التاجر."
     };
   }
 
-  const activeStatuses = ["accepted", "in_progress", "out_for_delivery", "captain_reached_store", "order_picked_up", "waiting_merchant_confirmation", "customer_confirmed", "customer_rejected", "في الطريق لك", "جاري التوصيل", "وصل المتجر", "تم الاستلام", "بانتظار تأكيد البيانات"];
-  const [activeByMerchant, activeLegacy] = await Promise.all([
-    db.collection("orders").where("merchantId", "==", merchantId).where("status", "in", activeStatuses).get(),
-    db.collection("orders").where("restaurantId", "==", merchantId).where("status", "in", activeStatuses).get()
-  ]);
-  const activeOrders = new Map<string, FirebaseFirestore.QueryDocumentSnapshot>();
-  activeByMerchant.docs.forEach((doc) => activeOrders.set(doc.id, doc));
-  activeLegacy.docs.forEach((doc) => activeOrders.set(doc.id, doc));
-  const activeCaptainIds = new Set<string>();
-  activeOrders.forEach((doc) => {
-    const captainId = doc.data().captainId;
-    if (typeof captainId === "string" && captainId.trim()) activeCaptainIds.add(captainId.trim());
-  });
-  const activeCaptainsCount = activeCaptainIds.size;
-  if (activeCaptainsCount >= meta.maxCaptains && meta.maxCaptains > 0) {
+  const remainingCaptains = Math.max(0, meta.captainLimit - activeCaptainsCount);
+  const safeRequested = Math.max(1, Number(requestedCaptains) || 1);
+  if (activeCaptainsCount + safeRequested > meta.captainLimit && meta.captainLimit > 0) {
     return {
       isValid: false,
+      isActive: true,
+      isSubscribed: true,
       status: "active",
       planId: meta.planId,
       planName: meta.planName,
       maxCaptains: meta.maxCaptains,
+      captainLimit: meta.captainLimit,
       price: meta.price,
       startDate: startDateMs,
+      activatedAt: startDateMs,
       endDate: endDateMs,
+      expiresAt: endDateMs,
+      remainingMillis: remaining.remainingMillis,
+      remainingDays: remaining.remainingDays,
+      remainingHours: remaining.remainingHours,
       activeCaptainsCount,
-      errorMessage: `وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك (${meta.maxCaptains}).`
+      remainingCaptains,
+      subscriptionVersion: subVersion,
+      updatedBy,
+      errorMessage: activeCaptainsCount >= meta.captainLimit
+        ? `وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك (${meta.captainLimit}).`
+        : `المتبقي لك ${remainingCaptains} كابتن فقط من أصل ${meta.captainLimit} في باقتك الحالية.`
     };
   }
+
   return {
     isValid: true,
+    isActive: true,
+    isSubscribed: true,
     status: "active",
     planId: meta.planId,
     planName: meta.planName,
     maxCaptains: meta.maxCaptains,
+    captainLimit: meta.captainLimit,
     price: meta.price,
     startDate: startDateMs,
+    activatedAt: startDateMs,
     endDate: endDateMs,
-    activeCaptainsCount
+    expiresAt: endDateMs,
+    remainingMillis: remaining.remainingMillis,
+    remainingDays: remaining.remainingDays,
+    remainingHours: remaining.remainingHours,
+    activeCaptainsCount,
+    remainingCaptains,
+    subscriptionVersion: subVersion,
+    updatedBy
   };
 }
 
+function isOrderDocActiveForCaptainLimit(orderData: Record<string, any> | undefined): boolean {
+  if (!orderData) return false;
+  const raw = String(orderData.status || "").trim().toLowerCase();
+  if (!raw) return false;
+  return !isTerminalOrderStatusForCapacity(raw);
+}
+
 /**
- * Trusted Admin Callable: Atomically activates, reactivates, suspends, or cancels a merchant's subscription.
- * Writes ONLY to canonical `subscriptions/{merchantId}` + mirrors summary fields onto `merchants/{merchantId}`.
+ * Resolves the authoritative subscription document for a merchant:
+ * 1. Canonical path: `subscriptions/{merchantId}`
+ * 2. Fallback: query `subscriptions` where `merchantId` / `restaurantId` / `userId` == merchantId
+ *    (in case Admin Dashboard created a doc under an auto-generated ID).
  */
-export const adminUpdateMerchantSubscription = functions.https.onCall(async (data, context) => {
-  const authorizedAdmin = await isAdminCaller(context);
-  if (!authorizedAdmin || !context.auth) {
-    throw new functions.https.HttpsError("permission-denied", "هذه العملية مسموحة لمسؤولي الإدارة فقط.");
+async function findAuthoritativeSubscriptionDoc(
+  merchantId: string,
+  targetDb: FirebaseFirestore.Firestore = db
+): Promise<Record<string, any> | null> {
+  const canonicalDoc = await targetDb.collection("subscriptions").doc(merchantId).get();
+  if (canonicalDoc.exists) {
+    return canonicalDoc.data() || {};
   }
 
+  const [byMerchantId, byRestaurantId, byUserId] = await Promise.all([
+    targetDb.collection("subscriptions").where("merchantId", "==", merchantId).get(),
+    targetDb.collection("subscriptions").where("restaurantId", "==", merchantId).get(),
+    targetDb.collection("subscriptions").where("userId", "==", merchantId).get()
+  ]);
+
+  const candidates = new Map<string, Record<string, any>>();
+  [byMerchantId, byRestaurantId, byUserId].forEach((snap) => {
+    snap.docs.forEach((doc) => {
+      candidates.set(doc.id, doc.data() || {});
+    });
+  });
+
+  if (candidates.size === 0) return null;
+
+  let best: Record<string, any> | null = null;
+  let bestScore = -1;
+  candidates.forEach((docData) => {
+    const ver = Number(docData.subscriptionVersion || 0);
+    const ts = parseMillis(docData.subscriptionUpdatedAt || docData.updatedAt || docData.activatedAt || docData.createdAt) || 0;
+    const score = ver * 1_000_000_000_000 + ts;
+    if (score > bestScore) {
+      bestScore = score;
+      best = docData;
+    }
+  });
+  return best;
+}
+
+/**
+ * Server-side subscription validation against BOTH subscriptions/{merchantId} and merchants/{merchantId}.
+ * Guarantees suspended / inactive / cancelled / expired / pending / failed states are never bypassed.
+ */
+export async function verifyMerchantSubscription(
+  merchantId: string,
+  requestedCaptains = 1,
+  targetDb: FirebaseFirestore.Firestore = db,
+  now = Date.now()
+): Promise<VerifySubscriptionResult> {
+  const [subData, merchantDoc, ordersByMerchant, ordersByLegacy, ordersByUser] = await Promise.all([
+    findAuthoritativeSubscriptionDoc(merchantId, targetDb),
+    targetDb.collection("merchants").doc(merchantId).get(),
+    targetDb.collection("orders").where("merchantId", "==", merchantId).get(),
+    targetDb.collection("orders").where("restaurantId", "==", merchantId).get(),
+    targetDb.collection("orders").where("userId", "==", merchantId).get()
+  ]);
+
+  const activeOrders = new Map<string, FirebaseFirestore.DocumentData>();
+  [ordersByMerchant, ordersByLegacy, ordersByUser].forEach((snap) => {
+    snap.docs.forEach((doc) => {
+      const data = doc.data();
+      if (isOrderDocActiveForCaptainLimit(data)) {
+        activeOrders.set(doc.id, data);
+      }
+    });
+  });
+
+  return evaluateDualDocSubscription(
+    subData,
+    merchantDoc.exists ? (merchantDoc.data() || {}) : null,
+    activeOrders.size,
+    now,
+    requestedCaptains
+  );
+}
+
+/**
+ * Shared atomic transactional core for `adminUpdateMerchantSubscription`.
+ * Keeps merchant account approval (`merchants/{uid}.status`) strictly separate from subscription
+ * activation unless the Admin explicitly passes `approveMerchant: true`.
+ */
+export async function applyAdminSubscriptionUpdate(
+  targetDb: FirebaseFirestore.Firestore,
+  adminUid: string,
+  data: Record<string, any>
+) {
   const merchantId = String(data?.merchantId || "").trim();
   const action = String(data?.action || "").toLowerCase().trim();
   if (!merchantId) {
     throw new functions.https.HttpsError("invalid-argument", "معرف التاجر merchantId مطلوب.");
   }
-  if (!["activate", "reactivate", "suspend", "cancel"].includes(action)) {
-    throw new functions.https.HttpsError("invalid-argument", "الإجراء غير مدعوم. الإجراءات المتاحة: activate, reactivate, suspend, cancel.");
+  const supportedActions = ["activate", "reactivate", "suspend", "deactivate", "cancel", "change_plan", "extend", "set_pending"];
+  if (!supportedActions.includes(action)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `الإجراء غير مدعوم. الإجراءات المتاحة: ${supportedActions.join(", ")}`
+    );
   }
 
-  const adminUid = context.auth.uid;
   const reason = String(data?.reason || "").trim();
-  const durationDays = Math.max(1, Math.min(365, Number(data?.durationDays || 30)));
+  const durationDays = Math.max(1, Math.min(3650, Number(data?.durationDays || 30)));
+  // Merchant approval is strictly independent from subscription activation unless explicitly requested by Admin.
+  const explicitApproveMerchant = data?.approveMerchant === true;
 
-  const result = await db.runTransaction(async (transaction) => {
-    const merchantRef = db.collection("merchants").doc(merchantId);
-    const subRef = db.collection("subscriptions").doc(merchantId);
+  const result = await targetDb.runTransaction(async (transaction) => {
+    const merchantRef = targetDb.collection("merchants").doc(merchantId);
+    const subRef = targetDb.collection("subscriptions").doc(merchantId);
     const [merchantDoc, subDoc] = await Promise.all([
       transaction.get(merchantRef),
       transaction.get(subRef)
     ]);
 
-    if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
+    if (!merchantDoc.exists || !isMerchantAccountDoc(merchantDoc.data())) {
       throw new functions.https.HttpsError("not-found", "حساب التاجر غير موجود في مجموعة merchants.");
     }
 
     const existingSub = subDoc.data() || {};
     const existingMerch = merchantDoc.data() || {};
+    const previousStatus = normalizeSubscriptionStatus(existingSub.status || existingMerch.subscriptionStatus);
+    const prevVersion = Math.max(
+      Number(existingSub.subscriptionVersion || 0),
+      Number(existingMerch.subscriptionVersion || 0)
+    );
+    const nextVersion = prevVersion + 1;
+    const existingMerchantStatus = String(existingMerch.status || "pending").toLowerCase().trim() || "pending";
+
     const meta = resolvePlanMetadata(
       data?.planId ?? existingSub.planId ?? existingMerch.planId,
       data?.planName ?? existingSub.planName ?? existingMerch.planName,
-      data?.maxCaptains ?? existingSub.maxCaptains ?? existingMerch.maxCaptains,
+      data?.captainLimit ?? data?.maxCaptains ?? existingSub.captainLimit ?? existingSub.maxCaptains ?? existingMerch.maxCaptains,
       data?.price ?? existingSub.price ?? existingMerch.price
     );
 
-    if (action === "activate" || action === "reactivate") {
-      const startMs = typeof data?.startDateMs === "number" ? data.startDateMs : Date.now();
-      const endMs = typeof data?.endDateMs === "number"
-        ? data.endDateMs
+    if (action === "activate" || action === "reactivate" || action === "change_plan" || action === "extend") {
+      const nowMs = Date.now();
+      const existingStartMs = parseMillis(existingSub.activatedAt || existingSub.startDate || existingMerch.subscriptionStartDate);
+      const existingEndMs = parseMillis(existingSub.expiresAt || existingSub.endDate || existingMerch.subscriptionEndDate);
+
+      let startMs = typeof data?.startDateMs === "number" ? (parseMillis(data.startDateMs) || nowMs) : nowMs;
+      let endMs = typeof data?.endDateMs === "number"
+        ? (parseMillis(data.endDateMs) || (startMs + durationDays * 24 * 60 * 60 * 1000))
         : startMs + durationDays * 24 * 60 * 60 * 1000;
+
+      if (action === "extend") {
+        const baseEnd = existingEndMs && existingEndMs > nowMs ? existingEndMs : nowMs;
+        startMs = existingStartMs || nowMs;
+        endMs = typeof data?.endDateMs === "number" ? (parseMillis(data.endDateMs) || (baseEnd + durationDays * 24 * 60 * 60 * 1000)) : baseEnd + durationDays * 24 * 60 * 60 * 1000;
+      } else if (action === "change_plan" && typeof data?.endDateMs !== "number" && existingEndMs && existingEndMs > nowMs) {
+        startMs = existingStartMs || nowMs;
+        endMs = data?.durationDays ? nowMs + durationDays * 24 * 60 * 60 * 1000 : existingEndMs;
+      }
+
       const startTs = admin.firestore.Timestamp.fromMillis(startMs);
       const endTs = admin.firestore.Timestamp.fromMillis(endMs);
+      const willApproveMerchant = explicitApproveMerchant && existingMerchantStatus !== "approved" && existingMerchantStatus !== "active";
+      const resultingMerchantStatus = willApproveMerchant ? "approved" : existingMerchantStatus;
 
       transaction.set(subRef, {
         merchantId,
         status: "active",
         subscriptionStatus: "active",
+        isActive: true,
         isSubscribed: true,
         paymentStatus: "paid",
         planId: meta.planId,
         planName: meta.planName,
         maxCaptains: meta.maxCaptains,
+        captainLimit: meta.captainLimit,
         price: meta.price,
         startDate: startTs,
+        activatedAt: startTs,
         endDate: endTs,
+        expiresAt: endTs,
         suspensionReason: admin.firestore.FieldValue.delete(),
         cancellationReason: admin.firestore.FieldValue.delete(),
+        expiryNotifiedAt: admin.firestore.FieldValue.delete(),
+        updatedBy: adminUid,
         updatedByAdminUid: adminUid,
+        subscriptionVersion: nextVersion,
+        lastAuditLoggedVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
 
-      transaction.set(merchantRef, {
+      const merchantUpdate: Record<string, any> = {
+        accountType: existingMerch.accountType || "merchant",
+        role: existingMerch.role || "merchant",
         subscriptionStatus: "active",
+        isActive: true,
         isSubscribed: true,
         paymentStatus: "paid",
         planId: meta.planId,
         planName: meta.planName,
         maxCaptains: meta.maxCaptains,
+        captainLimit: meta.captainLimit,
         price: meta.price,
         subscriptionStartDate: startTs,
+        activatedAt: startTs,
         subscriptionEndDate: endTs,
+        expiresAt: endTs,
         suspensionReason: admin.firestore.FieldValue.delete(),
+        updatedBy: adminUid,
+        subscriptionVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
+      };
+      if (willApproveMerchant) {
+        merchantUpdate.status = "approved";
+        merchantUpdate.isApproved = true;
+        merchantUpdate.approvedBy = adminUid;
+        merchantUpdate.approvedAt = admin.firestore.FieldValue.serverTimestamp();
+      }
+      transaction.set(merchantRef, merchantUpdate, { merge: true });
 
-      return { status: "active", startDateMs: startMs, endDateMs: endMs, ...meta };
+      return {
+        previousStatus,
+        status: "active",
+        subscriptionVersion: nextVersion,
+        startDateMs: startMs,
+        endDateMs: endMs,
+        merchantStatus: resultingMerchantStatus,
+        merchantApproved: resultingMerchantStatus === "approved" || resultingMerchantStatus === "active",
+        merchantApprovedExplicitly: willApproveMerchant,
+        ...meta
+      };
     }
 
-    if (action === "suspend") {
-      const finalReason = reason || "تم إيقاف الاشتراك مؤقتاً من قبل الإدارة";
+    if (action === "suspend" || action === "deactivate") {
+      const targetStatus = action === "deactivate" ? "inactive" : "suspended";
+      const finalReason = reason || "تم إيقاف الاشتراك من قبل الإدارة";
       transaction.set(subRef, {
         merchantId,
-        status: "suspended",
-        subscriptionStatus: "suspended",
+        status: targetStatus,
+        subscriptionStatus: targetStatus,
+        isActive: false,
         isSubscribed: false,
         suspensionReason: finalReason,
         suspendedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedBy: adminUid,
         updatedByAdminUid: adminUid,
+        subscriptionVersion: nextVersion,
+        lastAuditLoggedVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
 
       transaction.set(merchantRef, {
-        subscriptionStatus: "suspended",
+        subscriptionStatus: targetStatus,
+        isActive: false,
         isSubscribed: false,
         suspensionReason: finalReason,
+        updatedBy: adminUid,
+        subscriptionVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
 
-      return { status: "suspended", reason: finalReason, ...meta };
+      return {
+        previousStatus,
+        status: targetStatus,
+        subscriptionVersion: nextVersion,
+        reason: finalReason,
+        merchantStatus: existingMerchantStatus,
+        merchantApproved: existingMerchantStatus === "approved" || existingMerchantStatus === "active",
+        merchantApprovedExplicitly: false,
+        ...meta
+      };
+    }
+
+    if (action === "set_pending") {
+      transaction.set(subRef, {
+        merchantId,
+        status: "pending",
+        subscriptionStatus: "pending",
+        isActive: false,
+        isSubscribed: false,
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        price: meta.price,
+        updatedBy: adminUid,
+        updatedByAdminUid: adminUid,
+        subscriptionVersion: nextVersion,
+        lastAuditLoggedVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      transaction.set(merchantRef, {
+        subscriptionStatus: "pending",
+        isActive: false,
+        isSubscribed: false,
+        planId: meta.planId,
+        planName: meta.planName,
+        maxCaptains: 0,
+        captainLimit: 0,
+        updatedBy: adminUid,
+        subscriptionVersion: nextVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return {
+        previousStatus,
+        status: "pending",
+        subscriptionVersion: nextVersion,
+        merchantStatus: existingMerchantStatus,
+        merchantApproved: existingMerchantStatus === "approved" || existingMerchantStatus === "active",
+        merchantApprovedExplicitly: false,
+        ...meta
+      };
     }
 
     // action === "cancel"
@@ -863,189 +1599,819 @@ export const adminUpdateMerchantSubscription = functions.https.onCall(async (dat
       merchantId,
       status: "cancelled",
       subscriptionStatus: "cancelled",
+      isActive: false,
       isSubscribed: false,
       maxCaptains: 0,
+      captainLimit: 0,
       cancellationReason: cancelReason,
       suspensionReason: cancelReason,
       cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: adminUid,
       updatedByAdminUid: adminUid,
+      subscriptionVersion: nextVersion,
+      lastAuditLoggedVersion: nextVersion,
+      subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
 
     transaction.set(merchantRef, {
       subscriptionStatus: "cancelled",
+      isActive: false,
       isSubscribed: false,
       maxCaptains: 0,
+      captainLimit: 0,
       suspensionReason: cancelReason,
+      updatedBy: adminUid,
+      subscriptionVersion: nextVersion,
+      subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
 
-    return { status: "cancelled", reason: cancelReason, ...meta };
+    return {
+      previousStatus,
+      status: "cancelled",
+      subscriptionVersion: nextVersion,
+      reason: cancelReason,
+      merchantStatus: existingMerchantStatus,
+      merchantApproved: existingMerchantStatus === "approved" || existingMerchantStatus === "active",
+      merchantApprovedExplicitly: false,
+      ...meta
+    };
   });
 
-  return { success: true, merchantId, ...result };
-});
+  return { success: true, merchantId, action, reason: reason || null, ...result };
+}
 
 /**
- * Callable endpoint allowing an authenticated merchant to query server-authoritative subscription status.
+ * Trusted Admin Callable: Atomically activates, reactivates, suspends, deactivates, cancels, changes plan, or extends a merchant's subscription.
+ * Writes canonical `subscriptions/{merchantId}` + mirrors summary fields onto `merchants/{merchantId}` + logs to `operation_logs`.
+ * Merchant account approval (`merchants/{uid}.status`) remains independent unless `approveMerchant: true` is explicitly supplied.
  */
-export const getMySubscriptionStatus = functions.https.onCall(async (_data, context) => {
+export const adminUpdateMerchantSubscription = functions.https.onCall(async (data, context) => {
+  const authorizedAdmin = await isAdminCaller(context);
+  if (!authorizedAdmin || !context.auth) {
+    throw new functions.https.HttpsError("permission-denied", "هذه العملية مسموحة لمسؤولي الإدارة فقط.");
+  }
+
+  const adminUid = context.auth.uid;
+  const result = await applyAdminSubscriptionUpdate(db, adminUid, data || {});
+
+  await writeOperationLog({
+    type: "admin_subscription_update",
+    action: result.action,
+    merchantId: result.merchantId,
+    actorUid: adminUid,
+    actorRole: "admin",
+    previousStatus: result.previousStatus,
+    newStatus: result.status,
+    planId: result.planId,
+    planName: result.planName,
+    captainLimit: result.captainLimit,
+    reason: result.reason || null,
+    subscriptionVersion: result.subscriptionVersion,
+    merchantStatus: result.merchantStatus,
+    merchantApprovedExplicitly: result.merchantApprovedExplicitly,
+    success: true
+  });
+
+  return result;
+});
+
+async function buildMerchantSubscriptionResponse(merchantId: string, requestedCaptains = 1) {
+  const verification = await verifyMerchantSubscription(merchantId, requestedCaptains);
+  return {
+    ...verification,
+    merchantId,
+    serverTimeMs: Date.now()
+  };
+}
+
+/**
+ * Primary Callable Endpoint: Returns the authoritative subscription state for the authenticated merchant.
+ */
+export const getMerchantSubscription = functions.https.onCall(async (data, context) => {
   if (!context.auth || !context.auth.uid) {
     throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً.");
   }
-  const verification = await verifyMerchantSubscription(context.auth.uid);
+  if (context.auth.token.email_verified !== true) {
+    throw new functions.https.HttpsError("failed-precondition", "يجب تأكيد البريد الإلكتروني أولاً قبل استخدام خدمات التاجر.");
+  }
+
+  let targetMerchantId = context.auth.uid;
+  const requestedId = String(data?.merchantId || "").trim();
+  if (requestedId && requestedId !== context.auth.uid) {
+    const adminAllowed = await isAdminCaller(context);
+    if (!adminAllowed) {
+      throw new functions.https.HttpsError("permission-denied", "غير مسموح بالوصول لاشتراك تاجر آخر.");
+    }
+    targetMerchantId = requestedId;
+  }
+
+  return buildMerchantSubscriptionResponse(targetMerchantId);
+});
+
+/**
+ * Backward-compatible alias for getMerchantSubscription.
+ */
+export const getMySubscriptionStatus = functions.https.onCall(async (data, context) => {
+  if (!context.auth || !context.auth.uid) {
+    throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً.");
+  }
+  if (context.auth.token.email_verified !== true) {
+    throw new functions.https.HttpsError("failed-precondition", "يجب تأكيد البريد الإلكتروني أولاً.");
+  }
+  return buildMerchantSubscriptionResponse(context.auth.uid);
+});
+
+/**
+ * Server-Side Subscription & Capacity Validation Endpoint.
+ * Checks Auth, verified email, merchant status, subscription status, server expiration time,
+ * plan permissions, and concurrent active captains limit.
+ */
+export const validateMerchantSubscription = functions.https.onCall(async (data, context) => {
+  if (!context.auth || !context.auth.uid) {
+    throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً.");
+  }
+  if (context.auth.token.email_verified !== true) {
+    throw new functions.https.HttpsError("failed-precondition", "يجب تأكيد البريد الإلكتروني أولاً.");
+  }
+  const requestedCaptains = Math.max(1, Math.min(8, Number(data?.requestedCaptains || 1)));
+  const response = await buildMerchantSubscriptionResponse(context.auth.uid, requestedCaptains);
   return {
-    ...verification,
-    merchantId: context.auth.uid,
-    serverTimeMs: Date.now()
+    allowed: response.isValid,
+    requestedCaptains,
+    ...response
   };
 });
 
 /**
- * Bidirectional Loop-Safe Sync Trigger 1:
- * When Admin Dashboard writes directly to `subscriptions/{subscriptionId}`, sync summary fields onto `merchants/{merchantId}`.
+ * Scheduled Cloud Function: Automatically expires subscriptions whose endDate/expiresAt has passed,
+ * mirrors the expired state onto `merchants/{merchantId}` inside a version-checked transaction,
+ * writes an audit log, and sends FCM alert once.
+ */
+export const onMerchantSubscriptionExpired = functions.pubsub
+  .schedule("every 15 minutes")
+  .timeZone("Africa/Cairo")
+  .onRun(async () => {
+    const now = Date.now();
+    const activeSubsSnapshot = await db.collection("subscriptions").where("status", "==", "active").get();
+    let expiredCount = 0;
+    let warnedCount = 0;
+
+    for (const docSnap of activeSubsSnapshot.docs) {
+      const data = docSnap.data() || {};
+      const merchantId = String(data.merchantId || docSnap.id).trim();
+      if (!merchantId) continue;
+
+      const endMs = parseMillis(data.expiresAt || data.endDate || data.subscriptionEndDate || data.expiryDate);
+      if (endMs === null) continue;
+
+      if (endMs <= now) {
+        const txRes = await db.runTransaction(async (transaction) => {
+          const subRef = db.collection("subscriptions").doc(docSnap.id);
+          const merchRef = db.collection("merchants").doc(merchantId);
+          const [freshSub, freshMerch] = await Promise.all([
+            transaction.get(subRef),
+            transaction.get(merchRef)
+          ]);
+          if (!freshSub.exists) return { expired: false, nextVersion: 0 };
+          const freshData = freshSub.data() || {};
+          const freshMerchData = freshMerch.exists ? (freshMerch.data() || {}) : {};
+          if (normalizeSubscriptionStatus(freshData.status || freshData.subscriptionStatus) !== "active") {
+            return { expired: false, nextVersion: 0 };
+          }
+          const freshEndMs = parseMillis(
+            freshData.expiresAt || freshData.endDate || freshData.subscriptionEndDate || freshData.expiryDate
+          );
+          if (freshEndMs === null || freshEndMs > now) {
+            return { expired: false, nextVersion: 0 };
+          }
+
+          const nextVersion =
+            Math.max(
+              Number(freshData.subscriptionVersion || 0),
+              Number(freshMerchData.subscriptionVersion || 0)
+            ) + 1;
+
+          transaction.set(subRef, {
+            status: "expired",
+            subscriptionStatus: "expired",
+            isActive: false,
+            isSubscribed: false,
+            expiredAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedBy: "system_expiry_scheduler",
+            subscriptionVersion: nextVersion,
+            lastAuditLoggedVersion: nextVersion,
+            lastNotifiedVersion: nextVersion,
+            subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          }, { merge: true });
+
+          if (freshMerch.exists && isMerchantAccountDoc(freshMerchData)) {
+            transaction.set(merchRef, {
+              subscriptionStatus: "expired",
+              isActive: false,
+              isSubscribed: false,
+              updatedBy: "system_expiry_scheduler",
+              subscriptionVersion: nextVersion,
+              subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+          }
+          return { expired: true, nextVersion };
+        });
+
+        if (!txRes.expired) continue;
+
+        await writeOperationLog({
+          type: "subscription_auto_expired",
+          action: "auto_expire",
+          merchantId,
+          actorUid: "system_expiry_scheduler",
+          actorRole: "system",
+          previousStatus: "active",
+          newStatus: "expired",
+          planId: Number(data.planId || 0),
+          planName: String(data.planName || ""),
+          captainLimit: Number(data.captainLimit || data.maxCaptains || 0),
+          subscriptionVersion: txRes.nextVersion,
+          success: true
+        });
+
+        await sendMerchantSubscriptionNotification(
+          merchantId,
+          "انتهت صلاحية اشتراكك ⌛",
+          "انتهت مدة باقتك الحالية وتم إيقاف طلب الكباتن تلقائياً. يرجى تجديد الاشتراك للمتابعة.",
+          "SUBSCRIPTION_EXPIRED",
+          { subscriptionVersion: String(txRes.nextVersion) }
+        );
+        expiredCount++;
+      } else if (endMs - now <= 3 * 24 * 60 * 60 * 1000 && data.expiringSoonNotifiedEndMs !== endMs) {
+        const remaining = computeRemainingDuration(endMs, now);
+        await db.collection("subscriptions").doc(docSnap.id).set({
+          expiringSoonNotifiedEndMs: endMs
+        }, { merge: true });
+        await sendMerchantSubscriptionNotification(
+          merchantId,
+          "تنبيه قرب انتهاء الاشتراك ⏳",
+          `متبقي ${Math.max(1, remaining.remainingDays)} يوم على انتهاء باقة ${data.planName || "البطل"}. يرجى التجديد قبل الانتهاء لتفادي توقف الخدمة.`,
+          "SUBSCRIPTION_EXPIRING_SOON",
+          { remainingDays: String(remaining.remainingDays) }
+        );
+        warnedCount++;
+      }
+    }
+
+    console.log(`[SubscriptionExpiry] Processed ${activeSubsSnapshot.size} active subscriptions: expired=${expiredCount}, warned=${warnedCount}`);
+    return null;
+  });
+
+export interface SubscriptionSyncResult {
+  synced: boolean;
+  skippedReason?: string;
+  resolvedVersion?: number;
+  auditEntry?: Record<string, any>;
+  pushSpec?: {
+    merchantId: string;
+    title: string;
+    body: string;
+    type: string;
+    data: Record<string, string>;
+  };
+}
+
+/**
+ * Transactional, monotonic-version-guarded sync from `subscriptions/{subId}` -> `subscriptions/{uid}` & `merchants/{uid}`.
+ * Guarantees:
+ * - Delayed / out-of-order triggers with lower `subscriptionVersion` can NEVER overwrite a newer subscription state.
+ * - Auto-ID subscription writes can NEVER overwrite a newer canonical `subscriptions/{uid}` version.
+ * - Re-executing triggers is strictly idempotent (zero duplicate writes, zero version bumps, zero duplicate notifications).
+ * - Merchant account approval (`merchants/{uid}.status`) is NEVER silently flipped by subscription triggers.
+ */
+export async function applySubscriptionWriteSync(
+  targetDb: FirebaseFirestore.Firestore,
+  subId: string,
+  beforeData: Record<string, any> | null,
+  afterData: Record<string, any> | null
+): Promise<SubscriptionSyncResult> {
+  // Handle document deletion safely inside a transaction
+  if (!afterData) {
+    const before = beforeData || {};
+    const targetId = String(before.merchantId || before.restaurantId || before.userId || subId).trim();
+    if (!targetId) return { synced: false, skippedReason: "missing_merchant_id" };
+
+    return targetDb.runTransaction(async (transaction) => {
+      const merchRef = targetDb.collection("merchants").doc(targetId);
+      const canonicalSubRef = targetDb.collection("subscriptions").doc(targetId);
+      const [merchSnap, canonicalSubSnap] = await Promise.all([
+        transaction.get(merchRef),
+        transaction.get(canonicalSubRef)
+      ]);
+      if (!merchSnap.exists || !isMerchantAccountDoc(merchSnap.data())) {
+        return { synced: false, skippedReason: "not_merchant" };
+      }
+      // Deleting an auto-ID duplicate must never wipe a live canonical subscription
+      if (subId !== targetId && canonicalSubSnap.exists) {
+        return { synced: false, skippedReason: "canonical_still_exists" };
+      }
+      const mData = merchSnap.data() || {};
+      const incomingVer = Number(before.subscriptionVersion || 0);
+      const currentMerchVer = Number(mData.subscriptionVersion || 0);
+      if (incomingVer > 0 && incomingVer < currentMerchVer) {
+        return { synced: false, skippedReason: "stale_version" };
+      }
+      const nextVer = Math.max(incomingVer, currentMerchVer) + 1;
+      transaction.set(
+        merchRef,
+        {
+          subscriptionStatus: "unsubscribed",
+          isActive: false,
+          isSubscribed: false,
+          maxCaptains: 0,
+          captainLimit: 0,
+          subscriptionVersion: nextVer,
+          subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+      return { synced: true, resolvedVersion: nextVer };
+    });
+  }
+
+  const before = beforeData || {};
+  const data = afterData;
+  const targetMerchantId = String(data.merchantId || data.restaurantId || data.userId || subId).trim();
+  if (!targetMerchantId) return { synced: false, skippedReason: "missing_merchant_id" };
+
+  const hadBefore = beforeData !== null;
+  const prevStatus = hadBefore
+    ? normalizeSubscriptionStatus(before.status || before.subscriptionStatus || before.planStatus)
+    : "unsubscribed";
+  const normalizedStatus = normalizeSubscriptionStatus(data.status || data.subscriptionStatus || data.planStatus);
+  const transitionedToActive = (!hadBefore || prevStatus !== "active") && normalizedStatus === "active";
+  const isActive =
+    normalizedStatus === "active" &&
+    (transitionedToActive || !(data.isActive === false && data.isSubscribed !== true));
+
+  const incomingVer = Number(data.subscriptionVersion || 0);
+  const beforeVer = hadBefore ? Number(before.subscriptionVersion || 0) : 0;
+  const incomingStartVal = data.activatedAt || data.startDate || data.subscriptionStartDate;
+  const incomingEndVal = data.expiresAt || data.endDate || data.subscriptionEndDate || data.expiryDate;
+  const incomingEndMs = parseMillis(incomingEndVal);
+  const incomingReason = String(data.suspensionReason || data.cancellationReason || "").trim();
+
+  return targetDb.runTransaction(async (transaction) => {
+    const merchRef = targetDb.collection("merchants").doc(targetMerchantId);
+    const canonicalSubRef = targetDb.collection("subscriptions").doc(targetMerchantId);
+    const sourceSubRef = targetDb.collection("subscriptions").doc(subId);
+
+    const reads: Promise<FirebaseFirestore.DocumentSnapshot>[] = [
+      transaction.get(merchRef),
+      transaction.get(canonicalSubRef)
+    ];
+    if (subId !== targetMerchantId) {
+      reads.push(transaction.get(sourceSubRef));
+    }
+    const [merchSnap, canonicalSubSnap, sourceSubSnap] = await Promise.all(reads);
+
+    if (!merchSnap.exists || !isMerchantAccountDoc(merchSnap.data())) {
+      return { synced: false, skippedReason: "not_merchant" };
+    }
+
+    const mData = merchSnap.data() || {};
+    const cData = canonicalSubSnap.exists ? (canonicalSubSnap.data() || {}) : {};
+    const liveMerchVer = Number(mData.subscriptionVersion || 0);
+    const liveCanonicalVer = canonicalSubSnap.exists ? Number(cData.subscriptionVersion || 0) : 0;
+    const liveMaxVer = Math.max(liveMerchVer, liveCanonicalVer);
+
+    // 1. STRICT MONOTONIC VERSION GUARD: reject delayed / stale triggers immediately
+    if (incomingVer > 0 && incomingVer < liveMaxVer) {
+      return { synced: false, skippedReason: "stale_version" };
+    }
+    if (incomingVer === 0 && liveMaxVer > 0) {
+      // Unversioned write cannot overwrite an already-versioned canonical subscription
+      if (subId !== targetMerchantId || liveCanonicalVer > beforeVer || liveMerchVer > beforeVer) {
+        return { synced: false, skippedReason: "stale_unversioned_write" };
+      }
+    }
+    // Auto-ID mirroring must NEVER overwrite an equal-or-newer canonical subscriptions/{uid}
+    if (subId !== targetMerchantId && canonicalSubSnap.exists && liveCanonicalVer > 0) {
+      if (incomingVer <= liveCanonicalVer) {
+        return { synced: false, skippedReason: "stale_auto_id_write" };
+      }
+    }
+
+    const resolvedMeta = resolvePlanMetadata(
+      data.planId ?? mData.planId,
+      data.planName ?? mData.planName,
+      Number(data.captainLimit || data.maxCaptains || 0) || Number(mData.captainLimit || mData.maxCaptains || 0),
+      data.price ?? mData.price
+    );
+    const rawLimit = isActive
+      ? resolvedMeta.captainLimit
+      : Number(data.captainLimit || data.maxCaptains || 0);
+    const maxCaptains = normalizedStatus === "cancelled" || normalizedStatus === "pending" ? 0 : rawLimit;
+    const resolvedPlanId = isActive ? resolvedMeta.planId : Number(data.planId || mData.planId || 0);
+    const resolvedPlanName = String(data.planName || (isActive ? resolvedMeta.planName : mData.planName || "")).trim();
+    const resolvedPrice = Number(data.price || (isActive ? resolvedMeta.price : mData.price || 0));
+    const resolvedPaymentStatus = isActive
+      ? "paid"
+      : String(data.paymentStatus || mData.paymentStatus || "unpaid").toLowerCase().trim();
+
+    const prevLimit = Number(before.captainLimit || before.maxCaptains || 0);
+    const prevEndMs = parseMillis(before.expiresAt || before.endDate || before.subscriptionEndDate);
+    const statusChanged = !hadBefore || prevStatus !== normalizedStatus;
+    const planChanged = hadBefore && isActive && (Number(before.planId || 0) !== resolvedPlanId || prevLimit !== rawLimit);
+    const expiryExtended = hadBefore && isActive && incomingEndMs !== null && prevEndMs !== incomingEndMs;
+    const meaningfulTransition = statusChanged || planChanged || expiryExtended;
+
+    // Only increment subscriptionVersion if a direct Admin write changed state WITHOUT bumping version,
+    // and ONLY when live DB is NOT ahead of incomingVer. Never bump randomly on retries or Callable writes!
+    const isDirectUnbumpedWrite =
+      meaningfulTransition &&
+      (incomingVer === 0 || (incomingVer === beforeVer && Number(data.lastAuditLoggedVersion || 0) !== incomingVer));
+    const resolvedVersion = isDirectUnbumpedWrite
+      ? liveMaxVer + 1
+      : Math.max(incomingVer, 1);
+
+    const currentMerchStatus = normalizeSubscriptionStatus(mData.subscriptionStatus);
+    const currentMerchSubFlag = Boolean(mData.isSubscribed && mData.isActive !== false);
+    const currentMerchPlan = Number(mData.planId || 0);
+    const currentMerchMax = Number(mData.captainLimit || mData.maxCaptains || 0);
+    const currentMerchEndMs = parseMillis(mData.expiresAt || mData.subscriptionEndDate);
+    const currentReason = String(mData.suspensionReason || "").trim();
+
+    const needsMerchMirror = !(
+      currentMerchStatus === normalizedStatus &&
+      currentMerchSubFlag === isActive &&
+      currentMerchPlan === resolvedPlanId &&
+      currentMerchMax === maxCaptains &&
+      liveMerchVer === resolvedVersion &&
+      currentMerchEndMs === incomingEndMs &&
+      currentReason === incomingReason &&
+      String(mData.paymentStatus || "").toLowerCase().trim() === resolvedPaymentStatus
+    );
+
+    const needsCanonicalMirror =
+      subId !== targetMerchantId && (!canonicalSubSnap.exists || liveCanonicalVer < resolvedVersion);
+
+    const liveSourceData = subId === targetMerchantId ? cData : (sourceSubSnap?.data() || data);
+    const needsSubRepair =
+      liveSourceData.status !== normalizedStatus ||
+      liveSourceData.subscriptionStatus !== normalizedStatus ||
+      liveSourceData.isActive !== isActive ||
+      liveSourceData.isSubscribed !== isActive ||
+      Number(liveSourceData.captainLimit || 0) !== maxCaptains ||
+      Number(liveSourceData.maxCaptains || 0) !== maxCaptains ||
+      Number(liveSourceData.subscriptionVersion || 0) < resolvedVersion ||
+      (isActive && String(liveSourceData.paymentStatus || "").toLowerCase().trim() !== "paid");
+
+    // Determine notification spec (claimed idempotently inside the SAME transaction)
+    const transitionFingerprint = `${normalizedStatus}:${resolvedPlanId}:${rawLimit}:${incomingEndMs || 0}:${resolvedVersion}`;
+    let pushTitle = "";
+    let pushBody = "";
+    let pushType = "";
+    if (statusChanged && normalizedStatus === "active") {
+      pushType = "SUBSCRIPTION_ACTIVATED";
+      pushTitle = "تم تفعيل اشتراكك بنجاح ✓";
+      pushBody = `تم تفعيل ${resolvedPlanName || "الباقة"} (${rawLimit} كابتن) ويمكنك الآن طلب الكباتن فوراً.`;
+    } else if (planChanged) {
+      pushType = "SUBSCRIPTION_PLAN_CHANGED";
+      pushTitle = "تم تحديث باقة اشتراكك 🔄";
+      pushBody = `تم تعديل باقتك إلى ${resolvedPlanName || "الباقة"} بحد أقصى ${rawLimit} كابتن.`;
+    } else if (statusChanged && (normalizedStatus === "suspended" || normalizedStatus === "inactive")) {
+      pushType = "SUBSCRIPTION_SUSPENDED";
+      pushTitle = "تم إيقاف الاشتراك مؤقتاً ⚠️";
+      pushBody = incomingReason
+        ? `تم إيقاف اشتراكك (${incomingReason}). يرجى التواصل مع الإدارة أو تجديد الاشتراك.`
+        : "تم إيقاف اشتراكك من الإدارة. يرجى التواصل مع الإدارة أو تجديد الاشتراك.";
+    } else if (statusChanged && normalizedStatus === "cancelled") {
+      pushType = "SUBSCRIPTION_SUSPENDED";
+      pushTitle = "تم إلغاء الاشتراك ❌";
+      pushBody = incomingReason
+        ? `تم إلغاء اشتراكك (${incomingReason}). يرجى التواصل مع الإدارة.`
+        : "تم إلغاء اشتراكك من الإدارة. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة.";
+    } else if (statusChanged && normalizedStatus === "expired" && data.updatedBy !== "system_expiry_scheduler") {
+      pushType = "SUBSCRIPTION_EXPIRED";
+      pushTitle = "انتهى اشتراكك ⌛";
+      pushBody = "انتهت مدة باقتك الحالية، يرجى تجديد الاشتراك للاستمرار في طلب الكباتن.";
+    } else if (expiryExtended) {
+      pushType = "SUBSCRIPTION_ACTIVATED";
+      pushTitle = "تم تمديد صلاحية اشتراكك ✓";
+      pushBody = `تم تحديث مدة اشتراكك في ${resolvedPlanName || "الباقة"} بنجاح.`;
+    }
+
+    const alreadyNotified =
+      cData.lastNotifiedFingerprint === transitionFingerprint ||
+      Number(cData.lastNotifiedVersion || 0) >= resolvedVersion;
+    const shouldClaimNotification = Boolean(pushType) && !alreadyNotified;
+
+    const alreadyAudited =
+      Number(cData.lastAuditLoggedVersion || 0) >= resolvedVersion ||
+      Number(data.lastAuditLoggedVersion || 0) >= resolvedVersion;
+    const shouldAuditLog = meaningfulTransition && !alreadyAudited;
+
+    if (!needsMerchMirror && !needsCanonicalMirror && !needsSubRepair && !shouldClaimNotification && !shouldAuditLog) {
+      return { synced: false, skippedReason: "already_in_sync", resolvedVersion };
+    }
+
+    const buildNormalizedSubPatch = (): Record<string, any> => {
+      const patch: Record<string, any> = {
+        merchantId: targetMerchantId,
+        status: normalizedStatus,
+        subscriptionStatus: normalizedStatus,
+        isActive,
+        isSubscribed: isActive,
+        planId: resolvedPlanId,
+        planName: resolvedPlanName,
+        maxCaptains,
+        captainLimit: maxCaptains,
+        price: resolvedPrice,
+        paymentStatus: resolvedPaymentStatus,
+        subscriptionVersion: resolvedVersion,
+        updatedBy: data.updatedBy || data.updatedByAdminUid || "admin_dashboard",
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      if (incomingStartVal) {
+        patch.startDate = incomingStartVal;
+        patch.activatedAt = incomingStartVal;
+      }
+      if (incomingEndVal) {
+        patch.endDate = incomingEndVal;
+        patch.expiresAt = incomingEndVal;
+      }
+      if (incomingReason) {
+        patch.suspensionReason = incomingReason;
+      } else if (isActive) {
+        patch.suspensionReason = admin.firestore.FieldValue.delete();
+        patch.cancellationReason = admin.firestore.FieldValue.delete();
+      }
+      if (shouldAuditLog) {
+        patch.lastAuditLoggedVersion = resolvedVersion;
+      }
+      if (shouldClaimNotification) {
+        patch.lastNotifiedFingerprint = transitionFingerprint;
+        patch.lastNotifiedVersion = resolvedVersion;
+      }
+      return patch;
+    };
+
+    if (needsCanonicalMirror || (subId === targetMerchantId && (needsSubRepair || shouldClaimNotification || shouldAuditLog))) {
+      transaction.set(canonicalSubRef, buildNormalizedSubPatch(), { merge: true });
+    }
+    if (subId !== targetMerchantId && (needsSubRepair || shouldAuditLog)) {
+      transaction.set(sourceSubRef, buildNormalizedSubPatch(), { merge: true });
+    }
+
+    // Mirror onto merchants/{targetMerchantId} WITHOUT ever touching merchant account approval (`status` / `isApproved`)
+    if (needsMerchMirror) {
+      const mirrorPayload: Record<string, any> = {
+        accountType: mData.accountType || "merchant",
+        role: mData.role || "merchant",
+        subscriptionStatus: normalizedStatus,
+        isActive,
+        isSubscribed: isActive,
+        planId: resolvedPlanId,
+        planName: resolvedPlanName,
+        maxCaptains,
+        captainLimit: maxCaptains,
+        price: resolvedPrice,
+        paymentStatus: resolvedPaymentStatus,
+        subscriptionVersion: resolvedVersion,
+        subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      if (data.updatedBy || data.updatedByAdminUid) {
+        mirrorPayload.updatedBy = data.updatedBy || data.updatedByAdminUid;
+      }
+      if (incomingStartVal) {
+        mirrorPayload.subscriptionStartDate = incomingStartVal;
+        mirrorPayload.activatedAt = incomingStartVal;
+      }
+      if (incomingEndVal) {
+        mirrorPayload.subscriptionEndDate = incomingEndVal;
+        mirrorPayload.expiresAt = incomingEndVal;
+      }
+      if (incomingReason) {
+        mirrorPayload.suspensionReason = incomingReason;
+      } else if (isActive) {
+        mirrorPayload.suspensionReason = admin.firestore.FieldValue.delete();
+      }
+      transaction.set(merchRef, mirrorPayload, { merge: true });
+    }
+
+    const resultObj: SubscriptionSyncResult = {
+      synced: true,
+      resolvedVersion
+    };
+    if (shouldAuditLog) {
+      resultObj.auditEntry = {
+        type: "subscription_direct_write_sync",
+        action: statusChanged ? `status_${normalizedStatus}` : planChanged ? "plan_changed" : "expiry_updated",
+        merchantId: targetMerchantId,
+        actorUid: String(data.updatedBy || data.updatedByAdminUid || "admin_dashboard"),
+        actorRole: "admin",
+        previousStatus: prevStatus,
+        newStatus: normalizedStatus,
+        planId: resolvedPlanId,
+        planName: resolvedPlanName,
+        captainLimit: maxCaptains,
+        reason: incomingReason || null,
+        subscriptionVersion: resolvedVersion,
+        success: true
+      };
+    }
+    if (shouldClaimNotification) {
+      resultObj.pushSpec = {
+        merchantId: targetMerchantId,
+        title: pushTitle,
+        body: pushBody,
+        type: pushType,
+        data: {
+          status: normalizedStatus,
+          planId: String(resolvedPlanId),
+          captainLimit: String(rawLimit),
+          subscriptionVersion: String(resolvedVersion)
+        }
+      };
+    }
+    return resultObj;
+  });
+}
+
+/**
+ * Bidirectional Loop-Safe, Race-Free Sync Trigger 1:
+ * When Admin Dashboard or Callable writes to `subscriptions/{subscriptionId}`, atomically sync summary fields
+ * onto `merchants/{merchantId}` using monotonic `subscriptionVersion` inside a Firestore Transaction.
  */
 export const onSubscriptionWriteSyncMerchant = functions.firestore
   .document("subscriptions/{subscriptionId}")
   .onWrite(async (change, context) => {
     const subId = context.params.subscriptionId;
-    if (!change.after.exists) {
-      const targetId = String(change.before.data()?.merchantId || subId).trim();
-      if (!targetId) return;
-      const merchRef = db.collection("merchants").doc(targetId);
-      const merchSnap = await merchRef.get();
-      if (!merchSnap.exists || merchSnap.data()?.accountType !== "merchant") return;
-      await merchRef.set({
-        subscriptionStatus: "unsubscribed",
-        isSubscribed: false,
-        maxCaptains: 0,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
-      return;
+    const beforeData = change.before.exists ? (change.before.data() || {}) : null;
+    const afterData = change.after.exists ? (change.after.data() || {}) : null;
+
+    const syncResult = await applySubscriptionWriteSync(db, subId, beforeData, afterData);
+    if (syncResult.auditEntry) {
+      await writeOperationLog(syncResult.auditEntry);
     }
-
-    const data = change.after.data() || {};
-    const targetMerchantId = String(data.merchantId || subId).trim();
-    if (!targetMerchantId) return;
-
-    const normalizedStatus = normalizeSubscriptionStatus(data.status || data.subscriptionStatus);
-    const isActive = normalizedStatus === "active" && data.isSubscribed !== false;
-    const maxCaptains = isActive ? Number(data.maxCaptains || 0) : (normalizedStatus === "cancelled" ? 0 : Number(data.maxCaptains || 0));
-
-    const merchRef = db.collection("merchants").doc(targetMerchantId);
-    const merchSnap = await merchRef.get();
-    if (!merchSnap.exists || merchSnap.data()?.accountType !== "merchant") return;
-
-    const mData = merchSnap.data() || {};
-    const currentMerchStatus = normalizeSubscriptionStatus(mData.subscriptionStatus);
-    const currentMerchSubFlag = Boolean(mData.isSubscribed);
-    const currentMerchPlan = Number(mData.planId || 0);
-    const currentMerchMax = Number(mData.maxCaptains || 0);
-    const currentMerchEndMs = parseMillis(mData.subscriptionEndDate);
-    const incomingEndMs = parseMillis(data.endDate || data.subscriptionEndDate);
-    const incomingReason = String(data.suspensionReason || data.cancellationReason || "").trim();
-    const currentReason = String(mData.suspensionReason || "").trim();
-
-    if (
-      currentMerchStatus === normalizedStatus &&
-      currentMerchSubFlag === isActive &&
-      currentMerchPlan === Number(data.planId || 0) &&
-      currentMerchMax === maxCaptains &&
-      currentMerchEndMs === incomingEndMs &&
-      currentReason === incomingReason
-    ) {
-      return; // Loop guard: already in sync
+    if (syncResult.pushSpec) {
+      await sendMerchantSubscriptionNotification(
+        syncResult.pushSpec.merchantId,
+        syncResult.pushSpec.title,
+        syncResult.pushSpec.body,
+        syncResult.pushSpec.type,
+        syncResult.pushSpec.data
+      );
     }
-
-    const mirrorPayload: Record<string, any> = {
-      subscriptionStatus: normalizedStatus,
-      isSubscribed: isActive,
-      planId: Number(data.planId || 0),
-      planName: data.planName || mData.planName || "",
-      maxCaptains,
-      price: Number(data.price || mData.price || 0),
-      paymentStatus: data.paymentStatus || mData.paymentStatus || (isActive ? "paid" : "unpaid"),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    };
-    if (data.startDate) mirrorPayload.subscriptionStartDate = data.startDate;
-    if (data.endDate) mirrorPayload.subscriptionEndDate = data.endDate;
-    if (incomingReason) {
-      mirrorPayload.suspensionReason = incomingReason;
-    } else if (isActive) {
-      mirrorPayload.suspensionReason = admin.firestore.FieldValue.delete();
-    }
-
-    await merchRef.set(mirrorPayload, { merge: true });
   });
 
 /**
- * Bidirectional Loop-Safe Sync Trigger 2:
- * When Admin Dashboard writes subscription fields directly onto `merchants/{merchantId}`, mirror them onto canonical `subscriptions/{merchantId}`.
+ * Transactional, monotonic-version-guarded sync from `merchants/{merchantId}` -> `subscriptions/{merchantId}`.
+ * Guarantees that a delayed trigger carrying an older `subscriptionVersion` NEVER bumps version above
+ * or overwrites a newer `subscriptions/{merchantId}` document.
  */
-export const onMerchantSubscriptionWriteSync = functions.firestore
-  .document("merchants/{merchantId}")
-  .onUpdate(async (change, context) => {
-    const merchantId = context.params.merchantId;
-    const before = change.before.data() || {};
-    const after = change.after.data() || {};
-    if (after.accountType !== "merchant") return;
+export async function applyMerchantSubscriptionWriteSync(
+  targetDb: FirebaseFirestore.Firestore,
+  merchantId: string,
+  before: Record<string, any>,
+  after: Record<string, any>
+): Promise<SubscriptionSyncResult> {
+  if (!isMerchantAccountDoc(after)) {
+    return { synced: false, skippedReason: "not_merchant" };
+  }
 
-    const trackedFields = [
-      "subscriptionStatus",
-      "isSubscribed",
-      "planId",
-      "planName",
-      "maxCaptains",
-      "price",
-      "subscriptionStartDate",
-      "subscriptionEndDate",
-      "suspensionReason",
-      "paymentStatus"
-    ];
-    const hasSubDiff = trackedFields.some((f) => JSON.stringify(before[f]) !== JSON.stringify(after[f]));
-    if (!hasSubDiff) return;
+  const trackedFields = [
+    "subscriptionStatus",
+    "isSubscribed",
+    "isActive",
+    "planId",
+    "planName",
+    "maxCaptains",
+    "captainLimit",
+    "price",
+    "subscriptionStartDate",
+    "activatedAt",
+    "subscriptionEndDate",
+    "expiresAt",
+    "suspensionReason",
+    "paymentStatus",
+    "subscriptionVersion"
+  ];
+  const hasSubDiff = trackedFields.some((f) => JSON.stringify(before[f]) !== JSON.stringify(after[f]));
+  if (!hasSubDiff) {
+    return { synced: false, skippedReason: "no_subscription_diff" };
+  }
 
-    const merchStatus = normalizeSubscriptionStatus(after.subscriptionStatus);
-    const isActive = merchStatus === "active" && after.isSubscribed !== false;
-    const subRef = db.collection("subscriptions").doc(merchantId);
-    const subSnap = await subRef.get();
-    const sData = subSnap.data() || {};
+  const prevMerchStatus = normalizeSubscriptionStatus(before.subscriptionStatus || before.planStatus);
+  const merchStatus = normalizeSubscriptionStatus(after.subscriptionStatus || after.planStatus);
+  const transitionedToActive = prevMerchStatus !== "active" && merchStatus === "active";
+  const isActive =
+    merchStatus === "active" &&
+    (transitionedToActive || !(after.isActive === false && after.isSubscribed !== true));
+
+  const incomingVer = Number(after.subscriptionVersion || 0);
+  const beforeVer = Number(before.subscriptionVersion || 0);
+  const afterEndVal = after.expiresAt || after.subscriptionEndDate;
+  const afterStartVal = after.activatedAt || after.subscriptionStartDate;
+  const afterEndMs = parseMillis(afterEndVal);
+  const afterReason = String(after.suspensionReason || "").trim();
+
+  return targetDb.runTransaction(async (transaction) => {
+    const merchRef = targetDb.collection("merchants").doc(merchantId);
+    const subRef = targetDb.collection("subscriptions").doc(merchantId);
+    const [liveMerchSnap, subSnap] = await Promise.all([
+      transaction.get(merchRef),
+      transaction.get(subRef)
+    ]);
+
+    if (!liveMerchSnap.exists || !isMerchantAccountDoc(liveMerchSnap.data())) {
+      return { synced: false, skippedReason: "not_merchant" };
+    }
+
+    const liveMerch = liveMerchSnap.data() || {};
+    const sData = subSnap.exists ? (subSnap.data() || {}) : {};
+    const liveMerchVer = Number(liveMerch.subscriptionVersion || 0);
+    const liveSubVer = subSnap.exists ? Number(sData.subscriptionVersion || 0) : 0;
+    const liveMaxVer = Math.max(liveMerchVer, liveSubVer);
+
+    // STRICT MONOTONIC GUARD: reject stale/delayed triggers immediately
+    if (incomingVer > 0 && incomingVer < liveMaxVer) {
+      return { synced: false, skippedReason: "stale_version" };
+    }
+    if (incomingVer === 0 && liveMaxVer > 0 && beforeVer < liveMaxVer) {
+      return { synced: false, skippedReason: "stale_unversioned_write" };
+    }
+
+    const resolvedMeta = resolvePlanMetadata(
+      after.planId ?? sData.planId,
+      after.planName ?? sData.planName,
+      Number(after.captainLimit || after.maxCaptains || 0) || Number(sData.captainLimit || sData.maxCaptains || 0),
+      after.price ?? sData.price
+    );
+    const afterPlanId = isActive ? resolvedMeta.planId : Number(after.planId || sData.planId || 0);
+    const afterPlanName = String(after.planName || (isActive ? resolvedMeta.planName : sData.planName || "")).trim();
+    const afterMax = isActive
+      ? resolvedMeta.captainLimit
+      : merchStatus === "cancelled" || merchStatus === "pending"
+        ? 0
+        : Number(after.captainLimit || after.maxCaptains || 0);
+    const afterPrice = Number(after.price || (isActive ? resolvedMeta.price : sData.price || 0));
+    const afterPaymentStatus = isActive
+      ? "paid"
+      : String(after.paymentStatus || sData.paymentStatus || "unpaid").toLowerCase().trim();
 
     const currentSubStatus = subSnap.exists ? normalizeSubscriptionStatus(sData.status || sData.subscriptionStatus) : "unsubscribed";
-    const currentSubFlag = subSnap.exists ? Boolean(sData.isSubscribed) : false;
+    const currentSubFlag = subSnap.exists ? Boolean(sData.isSubscribed && sData.isActive !== false) : false;
     const currentSubPlan = Number(sData.planId || 0);
-    const currentSubMax = Number(sData.maxCaptains || 0);
-    const currentSubEndMs = parseMillis(sData.endDate);
-    const afterEndMs = parseMillis(after.subscriptionEndDate);
-    const afterReason = String(after.suspensionReason || "").trim();
+    const currentSubMax = Number(sData.captainLimit || sData.maxCaptains || 0);
+    const currentSubEndMs = parseMillis(sData.expiresAt || sData.endDate);
     const currentReason = String(sData.suspensionReason || sData.cancellationReason || "").trim();
 
     if (
       subSnap.exists &&
+      liveSubVer >= incomingVer &&
       currentSubStatus === merchStatus &&
       currentSubFlag === isActive &&
-      currentSubPlan === Number(after.planId || 0) &&
-      currentSubMax === Number(after.maxCaptains || 0) &&
+      currentSubPlan === afterPlanId &&
+      currentSubMax === afterMax &&
       currentSubEndMs === afterEndMs &&
-      currentReason === afterReason
+      currentReason === afterReason &&
+      String(sData.paymentStatus || "").toLowerCase().trim() === afterPaymentStatus
     ) {
-      return; // Loop guard: already in sync
+      return { synced: false, skippedReason: "already_in_sync", resolvedVersion: liveSubVer };
     }
+
+    // Only advance version when a direct admin write on merchants/{uid} changed fields without bumping version
+    const targetVersion = incomingVer > liveSubVer ? incomingVer : liveMaxVer + 1;
 
     const subPayload: Record<string, any> = {
       merchantId,
       status: merchStatus,
       subscriptionStatus: merchStatus,
+      isActive,
       isSubscribed: isActive,
-      planId: Number(after.planId || 0),
-      planName: after.planName || sData.planName || "",
-      maxCaptains: Number(after.maxCaptains || 0),
-      price: Number(after.price || sData.price || 0),
-      paymentStatus: after.paymentStatus || sData.paymentStatus || (isActive ? "paid" : "unpaid"),
+      planId: afterPlanId,
+      planName: afterPlanName,
+      maxCaptains: afterMax,
+      captainLimit: afterMax,
+      price: afterPrice,
+      paymentStatus: afterPaymentStatus,
+      subscriptionVersion: targetVersion,
+      updatedBy: after.updatedBy || "admin_dashboard",
+      subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
-    if (after.subscriptionStartDate) subPayload.startDate = after.subscriptionStartDate;
-    if (after.subscriptionEndDate) subPayload.endDate = after.subscriptionEndDate;
+    if (afterStartVal) {
+      subPayload.startDate = afterStartVal;
+      subPayload.activatedAt = afterStartVal;
+    }
+    if (afterEndVal) {
+      subPayload.endDate = afterEndVal;
+      subPayload.expiresAt = afterEndVal;
+    }
     if (afterReason) {
       subPayload.suspensionReason = afterReason;
     } else if (isActive) {
@@ -1053,148 +2419,323 @@ export const onMerchantSubscriptionWriteSync = functions.firestore
       subPayload.cancellationReason = admin.firestore.FieldValue.delete();
     }
 
-    await subRef.set(subPayload, { merge: true });
+    transaction.set(subRef, subPayload, { merge: true });
+    if (liveMerchVer < targetVersion) {
+      transaction.set(
+        merchRef,
+        {
+          subscriptionVersion: targetVersion,
+          subscriptionUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+    }
+
+    return { synced: true, resolvedVersion: targetVersion };
   });
+}
 
 /**
- * Cloud Function: createOrderWithCode
- * 1. Checks Merchant Authentication.
- * 2. Idempotency Key check: prevents duplicate order creation on network retries or multi-click.
- * 3. Server-side Subscription Verification (reads 'subscriptions' and active captains capacity).
- * 4. Generates unique 6-digit order code (non-zero leading, distinct digits).
- * 5. Atomic reservation in Firestore Transaction:
- *    - reserves code in 'order_codes/{code}'
- *    - writes order in 'orders/{orderId}' with 'orderCode'
- *    - saves 'idempotency_keys/{key}'
- * 6. Triggers Auto-Dispatch and returns { orderId, orderCode, ... } immediately.
+ * Bidirectional Loop-Safe, Race-Free Sync Trigger 2:
+ * When Admin Dashboard writes subscription fields directly onto `merchants/{merchantId}`, mirror them onto
+ * canonical `subscriptions/{merchantId}` inside a version-guarded transaction.
  */
-export const createOrderWithCode = functions.https.onCall(async (data, context) => {
-  // 1. Verify Authentication
-  if (!context.auth || !context.auth.uid) {
-    throw new functions.https.HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً لإنشاء طلب جديد.");
-  }
-  const uid = context.auth.uid;
-  if (context.auth.token.email_verified !== true) {
-    throw new functions.https.HttpsError("permission-denied", "يجب تأكيد البريد الإلكتروني أولاً.");
-  }
+export const onMerchantSubscriptionWriteSync = functions.firestore
+  .document("merchants/{merchantId}")
+  .onUpdate(async (change, context) => {
+    const merchantId = context.params.merchantId;
+    const before = change.before.data() || {};
+    const after = change.after.data() || {};
+    await applyMerchantSubscriptionWriteSync(db, merchantId, before, after);
+  });
 
-  const idempotencyKey = (data.idempotencyKey || "").toString().trim();
-  const destinationAddress = (data.destinationAddress || data.address || "").toString().trim();
-  const serviceFee = (data.serviceFee || data.price || "30 جنيه").toString().trim();
-  const customerName = (data.customerName || "").toString().trim();
-  const customerPhone = (data.customerPhone || "").toString().trim();
-  const orderDetails = (data.orderDetails || data.items || "").toString().trim();
-  const deliveryNotes = (data.deliveryNotes || data.notes || "").toString().trim();
-  const customerLatitude = typeof data.customerLatitude === "number" ? data.customerLatitude : null;
-  const customerLongitude = typeof data.customerLongitude === "number" ? data.customerLongitude : null;
+export interface ReserveOrderParams {
+  uid: string;
+  actionName: string;
+  destinationAddress: string;
+  serviceFee: string;
+  customerName?: string;
+  customerPhone?: string;
+  orderDetails?: string;
+  deliveryNotes?: string;
+  requestedCaptains?: number;
+  idempotencyKey?: string;
+  requestId?: string;
+  merchantPhone?: string;
+  customerLatitude?: number | null;
+  customerLongitude?: number | null;
+  merchantLatitude?: number | null;
+  merchantLongitude?: number | null;
+  nowMs?: number;
+  simulatePostReserveError?: boolean;
+}
+
+function logSafeFunctionError(
+  functionName: string,
+  errorCode: string,
+  merchantId: string,
+  requestId: string,
+  detailMessage: string
+) {
+  console.error(
+    JSON.stringify({
+      event: "cloud_function_error",
+      functionName,
+      errorCode,
+      merchantId,
+      requestId,
+      detailMessage,
+      timestamp: new Date().toISOString()
+    })
+  );
+}
+
+/**
+ * Core atomic transaction for captainLimit capacity reservation + order creation + code reservation + idempotency key.
+ * Uses `merchants/{uid}/capacity/current` as the single shared contention document per merchant so
+ * concurrent requests serialize cleanly via Firestore Transactions and can NEVER exceed `captainLimit`.
+ */
+export async function reserveAndCreateOrderAtomic(
+  targetDb: FirebaseFirestore.Firestore,
+  params: ReserveOrderParams
+) {
+  const uid = params.uid;
+  const actionName = params.actionName;
+  const idempotencyKey = String(params.idempotencyKey || "").trim();
+  const requestId = String(params.requestId || idempotencyKey || crypto.randomBytes(6).toString("hex")).trim();
+  const destinationAddress = String(params.destinationAddress || "").trim();
+  const serviceFee = String(params.serviceFee || "30 جنيه").trim();
+  const customerName = String(params.customerName || "").trim();
+  const customerPhone = String(params.customerPhone || "").trim();
+  const orderDetails = String(params.orderDetails || "").trim();
+  const deliveryNotes = String(params.deliveryNotes || "").trim();
+  const requestedCaptains = Math.max(1, Math.min(8, Number(params.requestedCaptains || 1)));
+  const customerLatitude = typeof params.customerLatitude === "number" ? params.customerLatitude : null;
+  const customerLongitude = typeof params.customerLongitude === "number" ? params.customerLongitude : null;
 
   if (!destinationAddress) {
-    throw new functions.https.HttpsError("invalid-argument", "عنوان التوصيل مطلوب لإنشاء الطلب.");
+    logSafeFunctionError(actionName, "MISSING_CUSTOMER_ADDRESS", uid, requestId, "destinationAddress is blank");
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "بيانات عنوان العميل غير مكتملة. يرجى إدخال عنوان التوصيل.",
+      { reasonCode: "MISSING_CUSTOMER_ADDRESS", requestId }
+    );
   }
 
-  // 2. Check Idempotency Key
+  // Fast-path idempotency replay check (also enforced inside transaction)
   if (idempotencyKey) {
-    const existingKeyDoc = await db.collection("idempotency_keys").doc(idempotencyKey).get();
+    const existingKeyDoc = await targetDb.collection("idempotency_keys").doc(idempotencyKey).get();
     if (existingKeyDoc.exists) {
       const keyData = existingKeyDoc.data() || {};
-      console.log(`[CreateOrder] Idempotent replay for key ${idempotencyKey}, returning order ${keyData.orderId}`);
+      if (keyData.merchantId && keyData.merchantId !== uid) {
+        logSafeFunctionError(actionName, "IDEMPOTENCY_OWNERSHIP_MISMATCH", uid, requestId, "key owned by another merchant");
+        throw new functions.https.HttpsError(
+          "permission-denied",
+          "مفتاح التكرار لا يتبع هذا التاجر.",
+          { reasonCode: "IDEMPOTENCY_OWNERSHIP_MISMATCH", requestId }
+        );
+      }
       return {
         success: true,
         orderId: keyData.orderId,
         orderCode: keyData.orderCode,
         isReplay: true,
+        requestId,
         message: "تم استرجاع بيانات الطلب المنشأ مسبقاً بنجاح."
       };
     }
   }
 
-  // 3. Server-Side Subscription Verification
-  const subCheck = await verifyMerchantSubscription(uid);
-  if (!subCheck.isValid) {
-    throw new functions.https.HttpsError("failed-precondition", subCheck.errorMessage || "الاشتراك غير متاح لإنشاء الطلب.");
+  const merchantPreDoc = await targetDb.collection("merchants").doc(uid).get();
+  if (!merchantPreDoc.exists || !isMerchantAccountDoc(merchantPreDoc.data())) {
+    logSafeFunctionError(actionName, "MERCHANT_NOT_FOUND", uid, requestId, "merchants/{uid} missing or non-merchant");
+    throw new functions.https.HttpsError(
+      "not-found",
+      "تعذر العثور على بيانات حساب التاجر.",
+      { reasonCode: "MERCHANT_NOT_FOUND", requestId }
+    );
   }
+  const merchantPreData = merchantPreDoc.data() || {};
+  const merchantName = merchantPreData.name || "تاجر";
+  const merchantPhone = String(merchantPreData.phone || params.merchantPhone || "").trim();
+  const clientLat = typeof params.merchantLatitude === "number" ? params.merchantLatitude : null;
+  const clientLng = typeof params.merchantLongitude === "number" ? params.merchantLongitude : null;
+  const merchantLoc =
+    merchantPreData.location ||
+    (typeof merchantPreData.latitude === "number" && typeof merchantPreData.longitude === "number"
+      ? new admin.firestore.GeoPoint(merchantPreData.latitude, merchantPreData.longitude)
+      : clientLat !== null && clientLng !== null
+        ? new admin.firestore.GeoPoint(clientLat, clientLng)
+        : new admin.firestore.GeoPoint(30.0444, 31.2357));
 
-  // Read the merchant profile exclusively from merchants/{uid}.
-  const merchantDoc = await db.collection("merchants").doc(uid).get();
-  if (!merchantDoc.exists || merchantDoc.data()?.accountType !== "merchant") {
-    throw new functions.https.HttpsError("permission-denied", "حساب التاجر غير موجود في merchants.");
-  }
-  const merchantData = merchantDoc.data() || {};
-  if (merchantData.status !== "approved" && merchantData.status !== "active") {
-    throw new functions.https.HttpsError("failed-precondition", "حساب التاجر في انتظار موافقة الإدارة.");
-  }
-  const merchantName = merchantData.name || "تاجر";
-  const merchantLoc = merchantData.location ||
-    (typeof merchantData.latitude === "number" && typeof merchantData.longitude === "number"
-      ? new admin.firestore.GeoPoint(merchantData.latitude, merchantData.longitude)
-      : null);
-  if (!merchantLoc) {
-    throw new functions.https.HttpsError("failed-precondition", "يرجى تحديد موقع المتجر قبل إنشاء الطلب.");
-  }
+  const fallbackSubDocData = await findAuthoritativeSubscriptionDoc(uid, targetDb);
 
-  // 4. Atomic Transaction: Find unique 6-digit code and create order
-  const MAX_ATTEMPTS = 15;
+  // High-concurrency retry budget for Firestore contention on shared `merchants/{uid}/capacity/current`
+  const MAX_ATTEMPTS = 25;
   let allocatedCode = "";
   let newOrderId = "";
+  const txBox: { verification: VerifySubscriptionResult | null; reservedCountAfter: number } = {
+    verification: null,
+    reservedCountAfter: 0
+  };
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const candidateCode = generateDistinct6DigitCode();
-    const candidateOrderId = `${Date.now()}_${candidateCode}`;
+    const candidateOrderId = `${Date.now()}_${candidateCode}_${crypto.randomBytes(2).toString("hex")}`;
 
     try {
-      await db.runTransaction(async (transaction) => {
-        // Check uniqueness in 'order_codes/{code}'
-        const codeRef = db.collection("order_codes").doc(candidateCode);
-        const codeDoc = await transaction.get(codeRef);
+      await targetDb.runTransaction(async (transaction) => {
+        const merchRef = targetDb.collection("merchants").doc(uid);
+        const subRef = targetDb.collection("subscriptions").doc(uid);
+        const capRef = targetDb.collection("merchants").doc(uid).collection("capacity").doc("current");
+        const ordersByMerchQuery = targetDb.collection("orders").where("merchantId", "==", uid);
+        const ordersByUserQuery = targetDb.collection("orders").where("userId", "==", uid);
+        const ordersByRestQuery = targetDb.collection("orders").where("restaurantId", "==", uid);
+        const codeRef = targetDb.collection("order_codes").doc(candidateCode);
+        const keyRef = idempotencyKey ? targetDb.collection("idempotency_keys").doc(idempotencyKey) : null;
+
+        const baseReads: Promise<any>[] = [
+          transaction.get(merchRef),
+          transaction.get(subRef),
+          transaction.get(capRef),
+          transaction.get(ordersByMerchQuery),
+          transaction.get(ordersByUserQuery),
+          transaction.get(ordersByRestQuery),
+          transaction.get(codeRef)
+        ];
+        if (keyRef) {
+          baseReads.push(transaction.get(keyRef));
+        }
+
+        const [
+          txMerchDoc,
+          txSubDoc,
+          txCapDoc,
+          txOrdersMerch,
+          txOrdersUser,
+          txOrdersRest,
+          codeDoc,
+          keyDoc
+        ] = await Promise.all(baseReads);
+
+        // Check idempotency key FIRST before touching capacity
+        if (keyDoc && keyDoc.exists) {
+          throw new Error("IDEMPOTENT_ALREADY_EXISTS");
+        }
+
+        // Reconcile active capacity across ALL order ownership fields + shared capacity ledger
+        const liveActiveOrderIds = new Set<string>();
+        const finishedOrderIds = new Set<string>();
+        const allQueriedOrderIds = new Set<string>();
+        [txOrdersMerch, txOrdersUser, txOrdersRest].forEach((snap: FirebaseFirestore.QuerySnapshot) => {
+          snap.docs.forEach((d) => {
+            const dData = d.data();
+            allQueriedOrderIds.add(d.id);
+            if (isOrderDocActiveForCaptainLimit(dData)) {
+              liveActiveOrderIds.add(d.id);
+            } else {
+              finishedOrderIds.add(d.id);
+            }
+          });
+        });
+
+        const capData = txCapDoc.exists ? (txCapDoc.data() || {}) : {};
+        const storedReservedIds: string[] = Array.isArray(capData.reservedOrderIds)
+          ? capData.reservedOrderIds.map((x: unknown) => String(x)).filter(Boolean)
+          : [];
+
+        const effectiveReservedIds = new Set<string>(liveActiveOrderIds);
+        for (const id of storedReservedIds) {
+          if (!finishedOrderIds.has(id) && allQueriedOrderIds.has(id)) {
+            effectiveReservedIds.add(id);
+          }
+        }
+
+        const activeCount = effectiveReservedIds.size;
+        const evalResult = evaluateDualDocSubscription(
+          txSubDoc.exists ? (txSubDoc.data() || {}) : fallbackSubDocData,
+          txMerchDoc.exists ? (txMerchDoc.data() || {}) : null,
+          activeCount,
+          params.nowMs ?? Date.now(),
+          requestedCaptains
+        );
+        txBox.verification = evalResult;
+
+        if (!evalResult.isValid) {
+          throw new Error(`SUBSCRIPTION_REJECTED:${evalResult.errorMessage || "الاشتراك غير متاح لإنشاء الطلب."}`);
+        }
+        if (activeCount + requestedCaptains > evalResult.captainLimit) {
+          throw new Error(
+            `SUBSCRIPTION_REJECTED:وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك (${evalResult.captainLimit}).`
+          );
+        }
+
         if (codeDoc.exists) {
           throw new Error("CODE_ALREADY_USED");
         }
 
-        // Double check idempotency key inside transaction
-        if (idempotencyKey) {
-          const keyRef = db.collection("idempotency_keys").doc(idempotencyKey);
-          const keyDoc = await transaction.get(keyRef);
-          if (keyDoc.exists) {
-            throw new Error("IDEMPOTENT_ALREADY_EXISTS");
-          }
+        // 1. Atomically reserve 1 slot on shared per-merchant capacity document (forces Transaction Contention!)
+        effectiveReservedIds.add(candidateOrderId);
+        const nextReservedIds = Array.from(effectiveReservedIds);
+        txBox.reservedCountAfter = nextReservedIds.length;
+
+        transaction.set(
+          capRef,
+          {
+            merchantId: uid,
+            reservedOrderIds: nextReservedIds,
+            activeReservationsCount: nextReservedIds.length,
+            captainLimitSnapshot: evalResult.captainLimit,
+            capacityVersion: admin.firestore.FieldValue.increment(1),
+            lastReservedOrderId: candidateOrderId,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+
+        // Optional failure injection for atomic rollback tests (proves zero orphan reservation on failure)
+        if (params.simulatePostReserveError) {
+          throw new Error("SIMULATED_ORDER_CREATION_FAILURE");
         }
 
-        // Reserve code
+        // 2. Reserve unique 6-digit order code
         transaction.set(codeRef, {
           code: candidateCode,
+          orderCode: candidateCode,
           orderId: candidateOrderId,
           merchantId: uid,
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Create Order Document
-        const orderRef = db.collection("orders").doc(candidateOrderId);
+        // 3. Create Order Document
+        const orderRef = targetDb.collection("orders").doc(candidateOrderId);
         const orderPayload: Record<string, any> = {
           orderId: candidateOrderId,
           orderCode: candidateCode,
           code: candidateCode,
           address: destinationAddress,
-          destinationAddress: destinationAddress,
+          destinationAddress,
           deliveryAddress: destinationAddress,
           price: serviceFee,
           totalAmount: serviceFee,
-          serviceFee: serviceFee,
-          customerName: customerName,
-          customerPhone: customerPhone,
-          orderDetails: orderDetails,
+          serviceFee,
+          customerName,
+          customerPhone,
+          orderDetails,
           items: orderDetails,
-          deliveryNotes: deliveryNotes,
+          deliveryNotes,
           notes: deliveryNotes,
           status: "pending",
           dispatchStatus: "searching",
           merchantId: uid,
           userId: uid,
-          merchantName: merchantName,
-          
+          restaurantId: uid,
+          merchantName,
+          merchantPhone,
           merchantLocation: merchantLoc,
           pickupLocation: merchantLoc,
-          merchantLatitude: (merchantLoc as any).latitude,
-          merchantLongitude: (merchantLoc as any).longitude,
+          merchantLatitude: merchantLoc.latitude,
+          merchantLongitude: merchantLoc.longitude,
           captainId: null,
           driver_name: null,
           captainName: null,
@@ -1203,6 +2744,11 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
           customerDetailsSubmitted: false,
           customerDetailsConfirmed: false,
           customerDetailsRejected: false,
+          capacityReserved: true,
+          capacityReleased: false,
+          capacityReservedAt: admin.firestore.FieldValue.serverTimestamp(),
+          createdByServerFunction: actionName,
+          subscriptionVersionAtCreation: evalResult.subscriptionVersion,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           created_at: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -1216,9 +2762,8 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
 
         transaction.set(orderRef, orderPayload);
 
-        // Record Idempotency Key
-        if (idempotencyKey) {
-          const keyRef = db.collection("idempotency_keys").doc(idempotencyKey);
+        // 4. Register Idempotency Key atomically
+        if (keyRef) {
           transaction.set(keyRef, {
             idempotencyKey,
             orderId: candidateOrderId,
@@ -1231,11 +2776,22 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
 
       allocatedCode = candidateCode;
       newOrderId = candidateOrderId;
-      console.log(`[CreateOrder] Order ${newOrderId} created with unique code ${allocatedCode} on attempt ${attempt}`);
       break;
     } catch (err: any) {
-      if (err.message === "IDEMPOTENT_ALREADY_EXISTS") {
-        const replayDoc = await db.collection("idempotency_keys").doc(idempotencyKey).get();
+      const msg = String(err?.message || "");
+      if (msg.startsWith("SUBSCRIPTION_REJECTED:")) {
+        const rejectionReason = msg.replace("SUBSCRIPTION_REJECTED:", "");
+        return {
+          rejected: true as const,
+          rejectionReason,
+          verification: txBox.verification
+        };
+      }
+      if (msg === "SIMULATED_ORDER_CREATION_FAILURE") {
+        throw new functions.https.HttpsError("internal", "فشل إنشاء الطلب وتم إلغاء الحجز بالكامل دون ترك حجز يتيم.");
+      }
+      if (msg === "IDEMPOTENT_ALREADY_EXISTS") {
+        const replayDoc = await targetDb.collection("idempotency_keys").doc(idempotencyKey).get();
         const rData = replayDoc.data() || {};
         return {
           success: true,
@@ -1245,30 +2801,212 @@ export const createOrderWithCode = functions.https.onCall(async (data, context) 
           message: "تم استرجاع بيانات الطلب المنشأ مسبقاً بنجاح."
         };
       }
-      console.warn(`[CreateOrder] Candidate code ${candidateCode} collision/conflict: ${err.message}. Retrying...`);
+      // Retry on code collision or Firestore transaction contention (ABORTED / code 10)
+      const isRetryable =
+        msg === "CODE_ALREADY_USED" ||
+        err?.code === 10 ||
+        /ABORTED|contention|too much contention|cross-transaction/i.test(msg);
+      if (!isRetryable && attempt >= 3) {
+        throw err;
+      }
+      const jitterMs = 15 + Math.floor(Math.random() * 45);
+      await new Promise((resolve) => setTimeout(resolve, jitterMs));
     }
   }
 
   if (!allocatedCode || !newOrderId) {
-    throw new functions.https.HttpsError("resource-exhausted", "تعذر تخصيص كود طلب غير مكرر حالياً، يرجى المحاولة بعد لحظات أو التواصل مع الإدارة.");
+    throw new functions.https.HttpsError("resource-exhausted", "تعذر تخصيص كود طلب غير مكرر حالياً، يرجى المحاولة بعد لحظات.");
   }
 
-  // Trigger auto-dispatch
-  try {
-    const createdDoc = await db.collection("orders").doc(newOrderId).get();
-    if (createdDoc.exists) {
-      runAutoDispatch(newOrderId, createdDoc.data() || {}).catch((e) => {
-        console.warn(`[CreateOrder] AutoDispatch invocation warning: ${e.message}`);
-      });
-    }
-  } catch (_: any) {}
-
+  const verifiedSnapshot = txBox.verification;
+  const activeCountAfter = txBox.reservedCountAfter || ((verifiedSnapshot?.activeCaptainsCount ?? 0) + 1);
   return {
     success: true,
     orderId: newOrderId,
     orderCode: allocatedCode,
     status: "pending",
+    planId: verifiedSnapshot?.planId ?? 0,
+    planName: verifiedSnapshot?.planName ?? "",
+    captainLimit: verifiedSnapshot?.captainLimit ?? 0,
+    activeCaptainsCount: activeCountAfter,
+    remainingCaptains: Math.max(0, (verifiedSnapshot?.captainLimit ?? 0) - activeCountAfter),
+    subscriptionVersion: verifiedSnapshot?.subscriptionVersion ?? 1,
     message: "تم إنشاء طلب التوصيل بنجاح"
   };
-});
+}
+
+/**
+ * Shared atomic server-side order creation & captain request logic.
+ * Used by BOTH `requestCaptains` and `createOrderWithCode` so client requests can NEVER bypass
+ * subscription validation, expiry, email verification, or concurrent captain limits.
+ * Note: Initial auto-dispatch is triggered exclusively via the single authoritative `onOrderCreated` trigger.
+ */
+async function executeServerOrderCreation(
+  context: functions.https.CallableContext,
+  data: Record<string, any>,
+  actionName: string
+) {
+  const requestId = String(
+    data?.requestId || data?.idempotencyKey || crypto.randomBytes(6).toString("hex")
+  ).trim();
+
+  // 1. Verify Authentication & verified email
+  if (!context.auth || !context.auth.uid) {
+    logSafeFunctionError(actionName, "UNAUTHENTICATED", "anonymous", requestId, "missing auth context");
+    throw new functions.https.HttpsError(
+      "unauthenticated",
+      "يجب تسجيل الدخول أولاً لإنشاء طلب جديد.",
+      { reasonCode: "UNAUTHENTICATED", requestId }
+    );
+  }
+  const uid = context.auth.uid;
+  if (context.auth.token.email_verified !== true) {
+    logSafeFunctionError(actionName, "EMAIL_NOT_VERIFIED", uid, requestId, "email_verified is false");
+    await writeOperationLog({
+      type: "captain_request_rejected",
+      action: actionName,
+      merchantId: uid,
+      actorUid: uid,
+      actorRole: "merchant",
+      requestId,
+      errorCode: "EMAIL_NOT_VERIFIED",
+      success: false,
+      errorMessage: "البريد الإلكتروني غير مؤكد."
+    });
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "يجب تأكيد البريد الإلكتروني أولاً.",
+      { reasonCode: "EMAIL_NOT_VERIFIED", requestId }
+    );
+  }
+
+  const requestedCaptains = Math.max(1, Math.min(8, Number(data?.requestedCaptains || 1)));
+  try {
+    const outcome = await reserveAndCreateOrderAtomic(db, {
+      uid,
+      actionName,
+      requestId,
+      destinationAddress: String(data?.destinationAddress || data?.address || "").trim(),
+      serviceFee: String(data?.serviceFee || data?.price || "30 جنيه").trim(),
+      customerName: String(data?.customerName || "").trim(),
+      customerPhone: String(data?.customerPhone || "").trim(),
+      orderDetails: String(data?.orderDetails || data?.items || "").trim(),
+      deliveryNotes: String(data?.deliveryNotes || data?.notes || "").trim(),
+      merchantPhone: String(data?.merchantPhone || "").trim(),
+      requestedCaptains,
+      idempotencyKey: String(data?.idempotencyKey || "").trim(),
+      customerLatitude: typeof data?.customerLatitude === "number" ? data.customerLatitude : null,
+      customerLongitude: typeof data?.customerLongitude === "number" ? data.customerLongitude : null,
+      merchantLatitude: typeof data?.merchantLatitude === "number" ? data.merchantLatitude : null,
+      merchantLongitude: typeof data?.merchantLongitude === "number" ? data.merchantLongitude : null
+    });
+
+    if ("rejected" in outcome && outcome.rejected) {
+      const v = outcome.verification;
+      const reasonCode =
+        v?.status === "not_found"
+          ? "MERCHANT_NOT_FOUND"
+          : v?.status === "merchant_pending"
+            ? "MERCHANT_PENDING_APPROVAL"
+            : v?.status === "unsubscribed"
+              ? "SUBSCRIPTION_NOT_FOUND"
+              : v?.status === "active" && (v?.remainingCaptains ?? 0) < requestedCaptains
+                ? "CAPTAIN_LIMIT_REACHED"
+                : `SUBSCRIPTION_${String(v?.status || "REJECTED").toUpperCase()}`;
+
+      logSafeFunctionError(actionName, reasonCode, uid, requestId, outcome.rejectionReason);
+      await writeOperationLog({
+        type: "captain_request_rejected",
+        action: actionName,
+        merchantId: uid,
+        actorUid: uid,
+        actorRole: "merchant",
+        requestId,
+        errorCode: reasonCode,
+        requestedCaptains,
+        status: v?.status || "rejected",
+        activeCaptainsCount: v?.activeCaptainsCount ?? 0,
+        captainLimit: v?.captainLimit ?? 0,
+        success: false,
+        errorMessage: outcome.rejectionReason
+      });
+      const httpsCode: functions.https.FunctionsErrorCode =
+        reasonCode === "MERCHANT_NOT_FOUND"
+          ? "not-found"
+          : reasonCode === "CAPTAIN_LIMIT_REACHED"
+            ? "resource-exhausted"
+            : "failed-precondition";
+      throw new functions.https.HttpsError(httpsCode, outcome.rejectionReason, {
+        reasonCode,
+        requestId,
+        subscriptionStatus: v?.status || "rejected"
+      });
+    }
+
+    if (!outcome.isReplay) {
+      await writeOperationLog({
+        type: "captain_request_accepted",
+        action: actionName,
+        merchantId: uid,
+        actorUid: uid,
+        actorRole: "merchant",
+        requestId,
+        orderId: outcome.orderId,
+        orderCode: outcome.orderCode,
+        requestedCaptains,
+        activeCaptainsCount: outcome.activeCaptainsCount ?? 0,
+        captainLimit: outcome.captainLimit ?? 0,
+        planId: outcome.planId ?? 0,
+        planName: outcome.planName ?? "",
+        subscriptionVersion: outcome.subscriptionVersion ?? 1,
+        success: true
+      });
+    }
+
+    return outcome;
+  } catch (err: any) {
+    if (err instanceof functions.https.HttpsError) {
+      throw err;
+    }
+    const safeCode = String(err?.code || "INTERNAL_ORDER_ERROR");
+    logSafeFunctionError(actionName, safeCode, uid, requestId, String(err?.message || "unexpected error"));
+    await writeOperationLog({
+      type: "captain_request_error",
+      action: actionName,
+      merchantId: uid,
+      actorUid: uid,
+      actorRole: "merchant",
+      requestId,
+      errorCode: safeCode,
+      success: false,
+      errorMessage: "تعذر إنشاء الطلب بسبب خطأ داخلي في السيرفر."
+    });
+    throw new functions.https.HttpsError(
+      "internal",
+      "تعذر إنشاء الطلب على السيرفر حالياً، يرجى المحاولة مرة أخرى.",
+      { reasonCode: "INTERNAL_ORDER_ERROR", requestId }
+    );
+  }
+}
+
+/**
+ * Primary Server-Enforced Endpoint for requesting a captain & creating an order.
+ * Explicitly pinned to `us-central1` to match the Android Merchant App configuration.
+ */
+export const requestCaptains = functions
+  .region("us-central1")
+  .https.onCall(async (data, context) => {
+    return executeServerOrderCreation(context, data || {}, "requestCaptains");
+  });
+
+/**
+ * Unified Order Creation Endpoint sharing server subscription & capacity transaction enforcement.
+ * Explicitly pinned to `us-central1` to match the Android Merchant App configuration.
+ */
+export const createOrderWithCode = functions
+  .region("us-central1")
+  .https.onCall(async (data, context) => {
+    return executeServerOrderCreation(context, data || {}, "createOrderWithCode");
+  });
+
 

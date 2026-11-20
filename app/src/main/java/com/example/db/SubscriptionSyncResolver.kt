@@ -1,14 +1,19 @@
 package com.example.db
 
+import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentSnapshot
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
+import kotlin.math.abs
 
 data class SubscriptionStatusState(
     val isSubscribed: Boolean = false,
     val isExpired: Boolean = false,
     val isSuspended: Boolean = false,
     val isCancelled: Boolean = false,
+    val isPending: Boolean = false,
     val isOfflineUnverified: Boolean = false,
     val isFromCache: Boolean = false,
     val status: String = "unsubscribed",
@@ -17,6 +22,7 @@ data class SubscriptionStatusState(
     val lastServerSyncMillis: Long? = null,
     val message: String? = null,
     val suspensionReason: String? = null,
+    val serverError: String? = null,
     val isChecking: Boolean = false,
     val planId: Int = 0,
     val planName: String = "غير مشترك",
@@ -24,15 +30,47 @@ data class SubscriptionStatusState(
     val price: Int = 0,
     val activeCaptainsCount: Int = 0,
     val availableCaptainSlots: Int = 0,
-    val paymentStatus: String = "unpaid"
+    val paymentStatus: String = "unpaid",
+    val subscriptionVersion: Long = 0L,
+    val updatedBy: String? = null
 ) {
     fun canRequestCaptain(nowMillis: Long = System.currentTimeMillis()): Boolean {
-        if (!isSubscribed || isExpired || isSuspended || isCancelled || isOfflineUnverified) return false
+        if (!isSubscribed || isExpired || isSuspended || isCancelled || isPending || isOfflineUnverified) return false
         if (status != "active") return false
         if (paymentStatus in listOf("failed", "unpaid", "pending")) return false
         if (maxCaptains <= 0) return false
         if (endDateMillis != null && nowMillis >= endDateMillis) return false
         return true
+    }
+
+    fun remainingMillis(nowMillis: Long = System.currentTimeMillis()): Long {
+        val end = endDateMillis ?: return 0L
+        return (end - nowMillis).coerceAtLeast(0L)
+    }
+
+    fun remainingDays(nowMillis: Long = System.currentTimeMillis()): Int {
+        val rem = remainingMillis(nowMillis)
+        if (rem <= 0L) return 0
+        return (rem / (24L * 60L * 60L * 1000L)).toInt()
+    }
+
+    fun remainingHours(nowMillis: Long = System.currentTimeMillis()): Int {
+        val rem = remainingMillis(nowMillis)
+        if (rem <= 0L) return 0
+        return ((rem % (24L * 60L * 60L * 1000L)) / (60L * 60L * 1000L)).toInt()
+    }
+
+    fun remainingTimeLabel(nowMillis: Long = System.currentTimeMillis()): String {
+        val rem = remainingMillis(nowMillis)
+        if (rem <= 0L) return "منتهي"
+        val days = remainingDays(nowMillis)
+        val hours = remainingHours(nowMillis)
+        return when {
+            days >= 1 && hours > 0 -> "$days يوم و $hours ساعة"
+            days >= 1 -> "$days يوم"
+            hours >= 1 -> "$hours ساعة"
+            else -> "أقل من ساعة"
+        }
     }
 }
 
@@ -42,6 +80,7 @@ data class RawSubscriptionSnapshot(
     val subscriptionStatus: String? = null,
     val planStatus: String? = null,
     val paymentStatus: String? = null,
+    val isActive: Boolean? = null,
     val isSubscribed: Boolean? = null,
     val planId: Int? = null,
     val planName: String? = null,
@@ -50,7 +89,11 @@ data class RawSubscriptionSnapshot(
     val startDateMillis: Long? = null,
     val endDateMillis: Long? = null,
     val updatedAtMillis: Long? = null,
+    val subscriptionUpdatedAtMillis: Long? = null,
+    val lastLoginAtMillis: Long? = null,
     val reason: String? = null,
+    val subscriptionVersion: Long? = null,
+    val updatedBy: String? = null,
     val isFromCache: Boolean = false
 )
 
@@ -62,18 +105,85 @@ data class SubscriptionTransitionEvent(
 
 object SubscriptionSyncResolver {
 
+    private val ISO_DATE_PATTERNS = listOf(
+        "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+        "yyyy-MM-dd'T'HH:mm:ss'Z'",
+        "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+        "yyyy-MM-dd'T'HH:mm:ssXXX",
+        "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        "yyyy-MM-dd'T'HH:mm:ss",
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-dd"
+    )
+
     fun normalizeStatus(raw: String?): String {
         val s = raw?.trim()?.lowercase(Locale.ROOT).orEmpty()
         return when (s) {
-            "active", "نشط", "نشطة", "سارية" -> "active"
-            "suspended", "suspend", "paused", "موقوف", "موقوفة", "متوقف", "متوقفة", "inactive" -> "suspended"
-            "cancelled", "canceled", "cancel", "ملغي", "ملغى", "ملغاة" -> "cancelled"
-            "expired", "منتهي", "منتهية" -> "expired"
+            "active", "activated", "subscribed", "enabled", "valid", "approved", "paid",
+            "نشط", "نشطة", "ساري", "سارية", "فعال", "فعّال", "فعالة", "فعّالة",
+            "مفعل", "مفعّل", "مفعلة", "مفعّلة", "مشترك", "مشتركة" -> "active"
+
+            "inactive", "disabled", "not_active", "deactivated",
+            "غير نشط", "غير نشطة", "غير فعال", "غير فعّال", "غير مفعل", "غير مفعّل" -> "inactive"
+
+            "suspended", "suspend", "paused", "blocked", "frozen",
+            "موقوف", "موقوفة", "متوقف", "متوقفة" -> "suspended"
+
+            "cancelled", "canceled", "cancel", "revoked", "terminated",
+            "ملغي", "ملغى", "ملغاة" -> "cancelled"
+
+            "expired", "منتهي", "منتهية", "منتهي الصلاحية" -> "expired"
+
+            "pending", "under_review", "in_review", "merchant_pending",
+            "قيد المراجعة", "معلق", "معلقة", "بانتظار التفعيل" -> "pending"
+
             "payment_failed", "failed", "declined" -> "payment_failed"
-            "pending_payment", "في انتظار الدفع" -> "pending_payment"
-            "unsubscribed", "none", "" -> "unsubscribed"
+            "pending_payment", "awaiting_payment", "في انتظار الدفع" -> "pending_payment"
+            "unsubscribed", "none", "not_found", "" -> "unsubscribed"
             else -> s
         }
+    }
+
+    fun parseDateMillis(raw: Any?): Long? {
+        if (raw == null) return null
+        when (raw) {
+            is Timestamp -> return raw.toDate().time
+            is Date -> return raw.time
+            is Number -> {
+                val v = raw.toLong()
+                if (v <= 0L) return null
+                // Normalize Unix timestamps provided in seconds (< 1e12) into milliseconds
+                return if (v < 1_000_000_000_000L) v * 1000L else v
+            }
+            is Map<*, *> -> {
+                val secs = (raw["_seconds"] as? Number)?.toLong()
+                    ?: (raw["seconds"] as? Number)?.toLong()
+                if (secs != null && secs > 0L) return secs * 1000L
+            }
+            is String -> {
+                val trimmed = raw.trim()
+                if (trimmed.isEmpty()) return null
+                trimmed.toLongOrNull()?.let { num ->
+                    if (num > 1_000_000_000L) {
+                        return if (num < 1_000_000_000_000L) num * 1000L else num
+                    }
+                }
+                for (pattern in ISO_DATE_PATTERNS) {
+                    try {
+                        val sdf = SimpleDateFormat(pattern, Locale.US).apply {
+                            isLenient = false
+                            if (pattern.endsWith("'Z'")) {
+                                timeZone = TimeZone.getTimeZone("UTC")
+                            }
+                        }
+                        val parsed = sdf.parse(trimmed)
+                        if (parsed != null) return parsed.time
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+        return null
     }
 
     fun fromFirestoreSnapshot(snapshot: DocumentSnapshot?): RawSubscriptionSnapshot {
@@ -83,36 +193,89 @@ object SubscriptionSyncResolver {
                 isFromCache = snapshot?.metadata?.isFromCache == true
             )
         }
+        val isActiveField = snapshot.getBoolean("isActive")
+        val isSubscribedField = snapshot.getBoolean("isSubscribed")
+        val limitValue = (snapshot.get("captainLimit") as? Number)?.toInt()
+            ?: (snapshot.get("maxCaptains") as? Number)?.toInt()
+            ?: (snapshot.get("captains") as? Number)?.toInt()
+            ?: snapshot.safeString("captainLimit")?.toIntOrNull()
+            ?: snapshot.safeString("maxCaptains")?.toIntOrNull()
         return RawSubscriptionSnapshot(
             exists = true,
             status = snapshot.safeString("status"),
             subscriptionStatus = snapshot.safeString("subscriptionStatus"),
             planStatus = snapshot.safeString("planStatus"),
             paymentStatus = snapshot.safeString("paymentStatus"),
-            isSubscribed = snapshot.getBoolean("isSubscribed"),
+            isActive = isActiveField,
+            isSubscribed = isSubscribedField,
             planId = (snapshot.get("planId") as? Number)?.toInt()
                 ?: snapshot.safeString("planId")?.toIntOrNull(),
             planName = snapshot.getAnyString("planName", "plan_name", "packageName", "title"),
-            maxCaptains = (snapshot.get("maxCaptains") as? Number)?.toInt()
-                ?: (snapshot.get("captains") as? Number)?.toInt()
-                ?: snapshot.safeString("maxCaptains")?.toIntOrNull(),
+            maxCaptains = limitValue,
             price = (snapshot.get("price") as? Number)?.toInt()
                 ?: (snapshot.get("amount") as? Number)?.toInt()
                 ?: snapshot.safeString("price")?.toIntOrNull(),
             startDateMillis = parseDateFields(
                 snapshot,
-                listOf("startDate", "subscriptionStartDate", "createdAt")
+                listOf("activatedAt", "startDate", "subscriptionStartDate", "createdAt")
             ),
             endDateMillis = parseDateFields(
                 snapshot,
-                listOf("endDate", "subscriptionEndDate", "renewalDate", "nextBillingDate", "expiryDate", "expiresAt")
+                listOf("expiresAt", "endDate", "subscriptionEndDate", "renewalDate", "nextBillingDate", "expiryDate")
             ),
             updatedAtMillis = parseDateFields(
                 snapshot,
                 listOf("updatedAt", "cancelledAt", "suspendedAt")
             ),
+            subscriptionUpdatedAtMillis = parseDateFields(
+                snapshot,
+                listOf("subscriptionUpdatedAt", "activatedAt", "suspendedAt", "cancelledAt")
+            ),
+            lastLoginAtMillis = parseDateFields(snapshot, listOf("lastLoginAt")),
             reason = snapshot.getAnyString("suspensionReason", "cancellationReason", "reason"),
+            subscriptionVersion = (snapshot.get("subscriptionVersion") as? Number)?.toLong(),
+            updatedBy = snapshot.getAnyString("updatedBy", "updatedByAdminUid"),
             isFromCache = snapshot.metadata.isFromCache
+        )
+    }
+
+    fun fromServerCallableMap(data: Map<*, *>): RawSubscriptionSnapshot {
+        val rawStatus = data["status"]?.toString()?.trim()
+        val normalized = normalizeStatus(rawStatus)
+        val isActive = (data["isActive"] as? Boolean)
+            ?: (data["isSubscribed"] as? Boolean)
+            ?: (data["isValid"] as? Boolean)
+            ?: (normalized == "active")
+        val planId = (data["planId"] as? Number)?.toInt() ?: 0
+        val planName = data["planName"]?.toString()
+        val limit = (data["captainLimit"] as? Number)?.toInt() ?: (data["maxCaptains"] as? Number)?.toInt()
+        val price = (data["price"] as? Number)?.toInt()
+        val startMs = parseDateMillis(data["activatedAt"]) ?: parseDateMillis(data["startDate"])
+        val endMs = parseDateMillis(data["expiresAt"]) ?: parseDateMillis(data["endDate"])
+        val serverTimeMs = parseDateMillis(data["serverTimeMs"]) ?: System.currentTimeMillis()
+        val version = (data["subscriptionVersion"] as? Number)?.toLong()
+        val updatedBy = data["updatedBy"]?.toString()
+        val reason = data["reason"]?.toString()?.takeIf { it.isNotBlank() }
+            ?: data["errorMessage"]?.toString()?.takeIf { it.isNotBlank() && normalized != "active" }
+        return RawSubscriptionSnapshot(
+            exists = rawStatus != "not_found",
+            status = rawStatus,
+            subscriptionStatus = rawStatus,
+            paymentStatus = if (normalized == "payment_failed" || normalized == "pending_payment") "failed" else "paid",
+            isActive = isActive,
+            isSubscribed = isActive,
+            planId = planId,
+            planName = planName,
+            maxCaptains = limit,
+            price = price,
+            startDateMillis = startMs,
+            endDateMillis = endMs,
+            updatedAtMillis = serverTimeMs,
+            subscriptionUpdatedAtMillis = serverTimeMs,
+            reason = reason,
+            subscriptionVersion = version,
+            updatedBy = updatedBy,
+            isFromCache = false
         )
     }
 
@@ -127,19 +290,23 @@ object SubscriptionSyncResolver {
                 if (date != null) return date.time
             } catch (_: Exception) {}
             try {
-                val num = snapshot.get(field) as? Number
-                if (num != null) return num.toLong()
-            } catch (_: Exception) {}
-            try {
-                val str = snapshot.safeString(field)
-                if (!str.isNullOrBlank()) {
-                    str.toLongOrNull()?.let { return it }
-                    val parsed = SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(str)
-                    if (parsed != null) return parsed.time
-                }
+                val parsed = parseDateMillis(snapshot.get(field))
+                if (parsed != null) return parsed
             } catch (_: Exception) {}
         }
         return null
+    }
+
+    private fun effectiveMerchantSubTimestamp(merchantDoc: RawSubscriptionSnapshot): Long {
+        // Dedicated subscriptionUpdatedAt is immune to profile/login/FCM updatedAt writes.
+        merchantDoc.subscriptionUpdatedAtMillis?.let { return it }
+        val updated = merchantDoc.updatedAtMillis ?: return 0L
+        val login = merchantDoc.lastLoginAtMillis
+        // Ignore updatedAt if it was stamped during merchant login/auth sync
+        if (login != null && abs(updated - login) <= 10_000L) {
+            return 0L
+        }
+        return updated
     }
 
     fun resolve(
@@ -148,7 +315,9 @@ object SubscriptionSyncResolver {
         isOnline: Boolean,
         nowMillis: Long = System.currentTimeMillis(),
         activeCaptainsCount: Int = 0,
-        hasVerifiedServerOnce: Boolean = false
+        hasVerifiedServerOnce: Boolean = false,
+        isInitialServerCheckInProgress: Boolean = false,
+        serverError: String? = null
     ): SubscriptionStatusState {
         val subStatusNorm = if (subscriptionDoc.exists) {
             normalizeStatus(subscriptionDoc.status ?: subscriptionDoc.subscriptionStatus ?: subscriptionDoc.planStatus)
@@ -161,20 +330,27 @@ object SubscriptionSyncResolver {
             "unsubscribed"
         }
 
-        // Reconcile subscriptions/{uid} and merchants/{uid}:
-        // 1. Both exist -> prefer newer updatedAt; on tie/missing updatedAt, restricted states (suspended/cancelled/expired) win for security.
-        // 2. Fallback to whichever exists.
+        // Reconcile canonical subscriptions/{uid} and mirrored merchants/{uid}:
+        // 1. Higher subscriptionVersion always wins.
+        // 2. On version tie, compare dedicated subscriptionUpdatedAt (never letting login/FCM/profile updatedAt override subscriptions/{uid}).
+        // 3. Fallback cleanly to whichever doc exists or holds the active subscription.
         val useMerchantAsPrimary = when {
             !subscriptionDoc.exists && merchantDoc.exists -> true
             subscriptionDoc.exists && merchantDoc.exists -> {
-                val subUpdated = subscriptionDoc.updatedAtMillis ?: 0L
-                val merchUpdated = merchantDoc.updatedAtMillis ?: 0L
-                val merchExplicitRestrictive = merchStatusNorm in listOf("suspended", "cancelled", "expired", "payment_failed")
-                val subExplicitActive = subStatusNorm == "active" && subscriptionDoc.isSubscribed != false
+                val subUpdated = subscriptionDoc.subscriptionUpdatedAtMillis ?: subscriptionDoc.updatedAtMillis ?: 0L
+                val merchUpdated = effectiveMerchantSubTimestamp(merchantDoc)
+                val subVersion = subscriptionDoc.subscriptionVersion ?: 0L
+                val merchVersion = merchantDoc.subscriptionVersion ?: 0L
+                val merchExplicitRestrictive = merchStatusNorm in listOf("suspended", "inactive", "cancelled", "expired", "payment_failed", "pending")
+                val subExplicitDeactivated = subscriptionDoc.isActive == false && subscriptionDoc.isSubscribed != true
+                val subExplicitActive = subStatusNorm == "active" && !subExplicitDeactivated
                 when {
+                    merchStatusNorm != "unsubscribed" && merchVersion > subVersion -> true
+                    subVersion > merchVersion -> false
+                    subStatusNorm == "unsubscribed" && merchStatusNorm != "unsubscribed" -> true
                     merchStatusNorm != "unsubscribed" && merchUpdated > subUpdated -> true
                     subUpdated > merchUpdated -> false
-                    merchExplicitRestrictive && subStatusNorm != merchStatusNorm -> true
+                    merchExplicitRestrictive && subStatusNorm != merchStatusNorm && merchUpdated > 0L -> true
                     !subExplicitActive && merchStatusNorm == "active" -> true
                     else -> false
                 }
@@ -185,6 +361,37 @@ object SubscriptionSyncResolver {
         val primary = if (useMerchantAsPrimary) merchantDoc else subscriptionDoc
         val secondary = if (useMerchantAsPrimary) subscriptionDoc else merchantDoc
 
+        // If we are still waiting on the first authoritative server check while online,
+        // keep showing a clean loading state instead of flashing "غير مشترك".
+        if (isInitialServerCheckInProgress && isOnline && !hasVerifiedServerOnce && (!primary.exists || primary.isFromCache)) {
+            return SubscriptionStatusState(
+                isChecking = true,
+                isSubscribed = false,
+                isOfflineUnverified = false,
+                isFromCache = primary.isFromCache || secondary.isFromCache,
+                status = "checking",
+                message = "جاري التحقق من حالة الاشتراك مع السيرفر...",
+                activeCaptainsCount = activeCaptainsCount,
+                availableCaptainSlots = 0
+            )
+        }
+
+        // If server verification failed with a network/server error and we never verified from server,
+        // surface a clear error state instead of falsely showing "inactive" or "unsubscribed".
+        if (!serverError.isNullOrBlank() && !hasVerifiedServerOnce && (!primary.exists || primary.isFromCache)) {
+            return SubscriptionStatusState(
+                isChecking = false,
+                isSubscribed = false,
+                isOfflineUnverified = true,
+                isFromCache = primary.isFromCache || secondary.isFromCache,
+                status = "error",
+                serverError = serverError,
+                message = serverError,
+                activeCaptainsCount = activeCaptainsCount,
+                availableCaptainSlots = 0
+            )
+        }
+
         if (!primary.exists) {
             return SubscriptionStatusState(
                 isChecking = false,
@@ -192,6 +399,7 @@ object SubscriptionSyncResolver {
                 isExpired = false,
                 isSuspended = false,
                 isCancelled = false,
+                isPending = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = primary.isFromCache || secondary.isFromCache,
                 status = "unsubscribed",
@@ -212,6 +420,8 @@ object SubscriptionSyncResolver {
         val endDateMillis = primary.endDateMillis ?: secondary.endDateMillis
         val startDateMillis = primary.startDateMillis ?: secondary.startDateMillis
         val reason = (primary.reason ?: secondary.reason)?.trim()?.takeIf { it.isNotBlank() }
+        val version = maxOf(primary.subscriptionVersion ?: 0L, secondary.subscriptionVersion ?: 0L)
+        val updatedBy = primary.updatedBy ?: secondary.updatedBy
 
         val pId = primary.planId?.takeIf { it > 0 } ?: secondary.planId?.takeIf { it > 0 } ?: 0
         val rawPlanName = primary.planName?.takeIf { it.isNotBlank() } ?: secondary.planName?.takeIf { it.isNotBlank() }
@@ -228,7 +438,8 @@ object SubscriptionSyncResolver {
             else -> "الباقة الأساسية"
         }
         val rawMaxCaptains = primary.maxCaptains?.takeIf { it > 0 } ?: secondary.maxCaptains?.takeIf { it > 0 } ?: 0
-        val hasValidPlan = pId > 0 || !rawPlanName.isNullOrBlank() || rawMaxCaptains > 0
+        // If Admin explicitly set status == "active", even a minimal doc without planId/maxCaptains defaults to Basic plan (2 captains)
+        val hasValidPlan = pId > 0 || !rawPlanName.isNullOrBlank() || rawMaxCaptains > 0 || chosenStatus == "active"
         val resolvedMaxCaptains = if (rawMaxCaptains > 0) rawMaxCaptains else if (hasValidPlan) {
             when (effectivePlanId) {
                 1 -> 2
@@ -246,8 +457,13 @@ object SubscriptionSyncResolver {
             else -> 400
         }
 
-        // Handle explicit admin suspension FIRST
-        if (chosenStatus == "suspended" || (chosenStatus == "active" && primary.isSubscribed == false)) {
+        // Only treat boolean flags as deactivating an "active" status if isActive was explicitly set to false
+        // without isSubscribed == true. A stale signup `isSubscribed: false` alone must NOT override Admin activation.
+        val isExplicitlyDeactivatedByFlag = primary.isActive == false && primary.isSubscribed != true
+
+        // Handle explicit admin suspension or inactive state FIRST
+        if (chosenStatus == "suspended" || chosenStatus == "inactive" || (chosenStatus == "active" && isExplicitlyDeactivatedByFlag)) {
+            val resolvedStatus = if (chosenStatus == "inactive") "inactive" else "suspended"
             val suspendMsg = if (reason != null) {
                 "تم إيقاف اشتراكك من قبل الإدارة ($reason). يرجى التواصل مع الإدارة أو تجديد الاشتراك."
             } else {
@@ -258,9 +474,10 @@ object SubscriptionSyncResolver {
                 isExpired = false,
                 isSuspended = true,
                 isCancelled = false,
+                isPending = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = chosenIsFromCache,
-                status = "suspended",
+                status = resolvedStatus,
                 startDateMillis = startDateMillis,
                 endDateMillis = endDateMillis,
                 lastServerSyncMillis = if (!chosenIsFromCache && isOnline) nowMillis else null,
@@ -273,7 +490,9 @@ object SubscriptionSyncResolver {
                 price = if (hasValidPlan) planPrice else 0,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = rawPaymentStatus
+                paymentStatus = rawPaymentStatus,
+                subscriptionVersion = version,
+                updatedBy = updatedBy
             )
         }
 
@@ -289,6 +508,7 @@ object SubscriptionSyncResolver {
                 isExpired = false,
                 isSuspended = false,
                 isCancelled = true,
+                isPending = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = chosenIsFromCache,
                 status = "cancelled",
@@ -304,23 +524,54 @@ object SubscriptionSyncResolver {
                 price = 0,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = rawPaymentStatus
+                paymentStatus = rawPaymentStatus,
+                subscriptionVersion = version,
+                updatedBy = updatedBy
             )
         }
 
-        // Handle payment failed / pending payment
+        // Handle pending admin review
+        if (chosenStatus == "pending") {
+            return SubscriptionStatusState(
+                isSubscribed = false,
+                isExpired = false,
+                isSuspended = false,
+                isCancelled = false,
+                isPending = true,
+                isOfflineUnverified = !isOnline,
+                isFromCache = chosenIsFromCache,
+                status = "pending",
+                startDateMillis = startDateMillis,
+                endDateMillis = endDateMillis,
+                lastServerSyncMillis = if (!chosenIsFromCache && isOnline) nowMillis else null,
+                message = reason ?: "طلب الاشتراك قيد المراجعة من قبل الإدارة. سيتم التفعيل تلقائياً فور الموافقة.",
+                isChecking = false,
+                planId = if (hasValidPlan) effectivePlanId else 0,
+                planName = if (hasValidPlan) planName else "قيد المراجعة",
+                maxCaptains = 0,
+                price = if (hasValidPlan) planPrice else 0,
+                activeCaptainsCount = activeCaptainsCount,
+                availableCaptainSlots = 0,
+                paymentStatus = rawPaymentStatus,
+                subscriptionVersion = version,
+                updatedBy = updatedBy
+            )
+        }
+
+        // Handle payment failed / pending payment (never block an explicitly Admin-activated "active" status)
         val isPaymentFailed = chosenStatus in listOf("payment_failed", "pending_payment") ||
-            rawPaymentStatus in listOf("failed", "unpaid", "pending")
-        if (isPaymentFailed && chosenStatus != "active") {
+            (chosenStatus != "active" && rawPaymentStatus in listOf("failed", "unpaid", "pending"))
+        if (isPaymentFailed) {
             return SubscriptionStatusState(
                 isChecking = false,
                 isSubscribed = false,
                 isExpired = false,
                 isSuspended = false,
                 isCancelled = false,
+                isPending = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = chosenIsFromCache,
-                status = "payment_failed",
+                status = if (chosenStatus == "pending_payment") "pending_payment" else "payment_failed",
                 lastServerSyncMillis = if (!chosenIsFromCache && isOnline) nowMillis else null,
                 message = "فشل عملية الدفع للباقة: لا يمكن طلب كابتن إلا بعد نجاح الدفع وتأكيد الاشتراك من السيرفر.",
                 planId = 0,
@@ -329,7 +580,9 @@ object SubscriptionSyncResolver {
                 price = 0,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = "failed"
+                paymentStatus = "failed",
+                subscriptionVersion = version,
+                updatedBy = updatedBy
             )
         }
 
@@ -341,6 +594,7 @@ object SubscriptionSyncResolver {
                 isExpired = false,
                 isSuspended = false,
                 isCancelled = false,
+                isPending = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = chosenIsFromCache,
                 status = "unsubscribed",
@@ -352,7 +606,9 @@ object SubscriptionSyncResolver {
                 price = 0,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = "unpaid"
+                paymentStatus = "unpaid",
+                subscriptionVersion = version,
+                updatedBy = updatedBy
             )
         }
 
@@ -365,6 +621,7 @@ object SubscriptionSyncResolver {
                 isExpired = true,
                 isSuspended = false,
                 isCancelled = false,
+                isPending = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = chosenIsFromCache,
                 status = "expired",
@@ -378,12 +635,14 @@ object SubscriptionSyncResolver {
                 price = planPrice,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = rawPaymentStatus
+                paymentStatus = rawPaymentStatus,
+                subscriptionVersion = version,
+                updatedBy = updatedBy
             )
         }
 
         // Active status: verify server trust & connectivity
-        val isExplicitActive = chosenStatus == "active" && primary.isSubscribed != false && resolvedMaxCaptains > 0
+        val isExplicitActive = chosenStatus == "active" && !isExplicitlyDeactivatedByFlag && resolvedMaxCaptains > 0
         if (!isExplicitActive) {
             return SubscriptionStatusState(
                 isChecking = false,
@@ -391,6 +650,7 @@ object SubscriptionSyncResolver {
                 isExpired = false,
                 isSuspended = false,
                 isCancelled = false,
+                isPending = false,
                 isOfflineUnverified = !isOnline,
                 isFromCache = chosenIsFromCache,
                 status = chosenStatus.ifBlank { "unsubscribed" },
@@ -403,7 +663,9 @@ object SubscriptionSyncResolver {
                 price = planPrice,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = rawPaymentStatus
+                paymentStatus = rawPaymentStatus,
+                subscriptionVersion = version,
+                updatedBy = updatedBy
             )
         }
 
@@ -416,6 +678,7 @@ object SubscriptionSyncResolver {
                 isExpired = false,
                 isSuspended = false,
                 isCancelled = false,
+                isPending = false,
                 isOfflineUnverified = true,
                 isFromCache = true,
                 status = "active",
@@ -434,7 +697,9 @@ object SubscriptionSyncResolver {
                 price = planPrice,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = rawPaymentStatus
+                paymentStatus = "paid",
+                subscriptionVersion = version,
+                updatedBy = updatedBy
             )
         }
 
@@ -444,6 +709,7 @@ object SubscriptionSyncResolver {
             isExpired = false,
             isSuspended = false,
             isCancelled = false,
+            isPending = false,
             isOfflineUnverified = false,
             isFromCache = chosenIsFromCache,
             status = "active",
@@ -452,6 +718,7 @@ object SubscriptionSyncResolver {
             lastServerSyncMillis = if (!chosenIsFromCache) nowMillis else null,
             message = null,
             suspensionReason = null,
+            serverError = null,
             isChecking = false,
             planId = effectivePlanId,
             planName = planName,
@@ -459,7 +726,10 @@ object SubscriptionSyncResolver {
             price = planPrice,
             activeCaptainsCount = activeCaptainsCount,
             availableCaptainSlots = availableSlots,
-            paymentStatus = rawPaymentStatus
+            // Admin-activated active subscription is always treated as paid so stale unpaid flags cannot block requests
+            paymentStatus = "paid",
+            subscriptionVersion = version,
+            updatedBy = updatedBy
         )
     }
 
@@ -479,6 +749,13 @@ object SubscriptionSyncResolver {
                 body = "تم تفعيل ${current.planName} (${current.maxCaptains} كابتن) بنجاح. يمكنك الآن طلب الكباتن.",
                 isActivation = true
             )
+            wasActive && isNowActive && !current.isOfflineUnverified &&
+                (previous.planId != current.planId || previous.maxCaptains != current.maxCaptains) ->
+                SubscriptionTransitionEvent(
+                    title = "تم تغيير الباقة 🔄",
+                    body = "تم تحديث اشتراكك إلى ${current.planName} بحد أقصى ${current.maxCaptains} كابتن.",
+                    isActivation = true
+                )
             wasActive && current.isSuspended -> SubscriptionTransitionEvent(
                 title = "تم إيقاف الاشتراك",
                 body = current.message ?: "تم إيقاف اشتراكك من قبل الإدارة. يرجى التواصل مع الإدارة أو تجديد الاشتراك.",
@@ -492,6 +769,11 @@ object SubscriptionSyncResolver {
             wasActive && current.isExpired -> SubscriptionTransitionEvent(
                 title = "انتهى الاشتراك",
                 body = current.message ?: "انتهت فترة اشتراكك، يرجى تجديد الاشتراك.",
+                isActivation = false
+            )
+            !previous.isPending && current.isPending -> SubscriptionTransitionEvent(
+                title = "الاشتراك قيد المراجعة ⏳",
+                body = current.message ?: "طلب اشتراكك قيد المراجعة من الإدارة.",
                 isActivation = false
             )
             else -> null

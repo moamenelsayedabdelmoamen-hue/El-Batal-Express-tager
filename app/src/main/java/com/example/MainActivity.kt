@@ -29,6 +29,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,6 +52,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.example.db.OrderViewModel
 import com.example.network.NetworkHelper
+import com.example.notification.MerchantMessagingService
 import com.example.ui.theme.ElBatalExpressTheme
 import com.example.ui.theme.ThemeManager
 import com.google.firebase.Firebase
@@ -99,8 +101,16 @@ object OrderHistoryRoute
 data class EditOrderRoute(val orderId: Int)
 
 class MainActivity : ComponentActivity() {
+
+  companion object {
+    const val EXTRA_START_DESTINATION = "extra_start_destination"
+    const val START_DESTINATION_DASHBOARD = "restaurant_dashboard"
+    const val START_DESTINATION_LOGIN = "login"
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    com.example.splash.SplashSessionState.markCompleted()
     NetworkHelper.startMonitoring(this)
     try {
       val settings = firestoreSettings {
@@ -132,6 +142,12 @@ class MainActivity : ComponentActivity() {
             Firebase.auth.removeAuthStateListener(listener)
           }
         }
+        LaunchedEffect(verifiedMerchantUid) {
+          val uid = verifiedMerchantUid
+          if (uid != null) {
+            MerchantMessagingService.syncCurrentFcmTokenForMerchant(uid)
+          }
+        }
         val lifecycleOwner = LocalLifecycleOwner.current
         DisposableEffect(lifecycleOwner, verifiedMerchantUid) {
           val observer = LifecycleEventObserver { _, event ->
@@ -145,11 +161,14 @@ class MainActivity : ComponentActivity() {
             lifecycleOwner.lifecycle.removeObserver(observer)
           }
         }
+        val requestedStart = intent?.getStringExtra(EXTRA_START_DESTINATION)
         val initialRoute = remember {
-          if (currentUser != null && currentUser.isEmailVerified) {
-            RestaurantDashboardRoute
-          } else {
-            LoginRoute
+          val isVerifiedSession = currentUser != null && currentUser.isEmailVerified
+          when {
+            requestedStart == START_DESTINATION_DASHBOARD && isVerifiedSession -> RestaurantDashboardRoute
+            requestedStart == START_DESTINATION_LOGIN -> LoginRoute
+            isVerifiedSession -> RestaurantDashboardRoute
+            else -> LoginRoute
           }
         }
         val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -369,10 +388,13 @@ class MainActivity : ComponentActivity() {
           }
 
           if (verifiedMerchantUid != null &&
+            !subscriptionStatus.isChecking &&
             (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired) &&
             !isOnSubscriptionRoute
           ) {
             val fallbackMessage = when {
+              subscriptionStatus.status == "inactive" ->
+                "اشتراكك غير نشط حالياً. يرجى التواصل مع الإدارة أو تجديد الاشتراك لتفعيل الخدمات."
               subscriptionStatus.isSuspended ->
                 "تم إيقاف اشتراكك مؤقتاً من قبل الإدارة. يرجى التواصل مع الإدارة أو تجديد الاشتراك."
               subscriptionStatus.isCancelled ->

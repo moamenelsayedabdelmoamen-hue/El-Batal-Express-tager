@@ -161,4 +161,54 @@ object NotificationHelper {
             Log.e("NotificationHelper", "Failed to show no internet notification: ${e.message}", e)
         }
     }
+
+    fun showSubscriptionSyncNotification(
+        context: Context,
+        title: String,
+        body: String,
+        notificationId: Int = System.currentTimeMillis().toInt()
+    ) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    Log.w("NotificationHelper", "POST_NOTIFICATIONS permission not granted for subscription alert")
+                    return
+                }
+            }
+
+            val notificationManager =
+                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            val subChannelId = "subscription_sync_channel"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    subChannelId,
+                    "تحديثات اشتراك الباقة",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "تنبيهات تفعيل وإيقاف وتجديد اشتراك التاجر"
+                    enableVibration(true)
+                }
+                notificationManager.createNotificationChannel(channel)
+            }
+
+            val notification = NotificationCompat.Builder(context, subChannelId)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+                .setAutoCancel(true)
+                .build()
+
+            notificationManager.notify(notificationId, notification)
+        } catch (e: Exception) {
+            Log.e("NotificationHelper", "Failed to show subscription notification: ${e.message}", e)
+        }
+    }
 }

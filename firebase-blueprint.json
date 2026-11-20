@@ -97,20 +97,39 @@
         "merchantId": { "type": "string" },
         "status": {
           "type": "string",
-          "enum": ["unsubscribed", "active", "suspended", "cancelled", "expired", "payment_failed"]
+          "enum": ["unsubscribed", "active", "inactive", "suspended", "cancelled", "expired", "pending", "pending_payment", "payment_failed"]
         },
+        "isActive": { "type": "boolean" },
         "isSubscribed": { "type": "boolean" },
         "planId": { "type": "integer" },
         "planName": { "type": "string" },
+        "captainLimit": { "type": "integer" },
         "maxCaptains": { "type": "integer" },
         "price": { "type": "integer" },
         "paymentStatus": { "type": "string" },
         "suspensionReason": { "type": "string" },
+        "subscriptionVersion": { "type": "integer" },
+        "updatedBy": { "type": "string" },
         "startDate": { "type": "string", "format": "date-time" },
+        "activatedAt": { "type": "string", "format": "date-time" },
         "endDate": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["merchantId", "status", "isSubscribed"]
+    },
+    "OperationLog": {
+      "title": "OperationLog",
+      "description": "Server-side Cloud Functions audit trail for subscriptions and captain requests",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "action": { "type": "string" },
+        "merchantId": { "type": "string" },
+        "actorUid": { "type": "string" },
+        "success": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      }
     },
     "Order": {
       "title": "Order",
@@ -143,6 +162,10 @@
     "/subscriptions/{subscriptionId}": {
       "schema": "Subscription",
       "description": "Canonical merchant subscription documents keyed by merchantId"
+    },
+    "/operation_logs/{logId}": {
+      "schema": "OperationLog",
+      "description": "Server-only Cloud Functions audit logs"
     },
     "/orders/{orderId}": {
       "schema": "Order",

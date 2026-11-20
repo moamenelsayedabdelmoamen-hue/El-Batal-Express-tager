@@ -1653,25 +1653,45 @@ fun SubscriptionPlansScreen(
 
     val isSubActive = subscriptionStatus.canRequestCaptain()
     val subStatusText = when {
+        subscriptionStatus.isChecking && !isSubActive -> "جاري التحقق مع السيرفر..."
+        !subscriptionStatus.serverError.isNullOrBlank() && !isSubActive -> "تعذر التحقق من السيرفر"
         subscriptionStatus.isOfflineUnverified -> "بانتظار مزامنة السيرفر (غير متصل)"
+        subscriptionStatus.status == "inactive" -> "غير نشط (متوقف من الإدارة)"
         subscriptionStatus.isSuspended -> "موقوفة من الإدارة"
         subscriptionStatus.isCancelled -> "ملغاة"
+        subscriptionStatus.isPending || subscriptionStatus.status == "pending" -> "قيد المراجعة من الإدارة ⏳"
         subscriptionStatus.isExpired || subscriptionStatus.status == "expired" -> "منتهية"
         subscriptionStatus.status == "payment_failed" || subscriptionStatus.paymentStatus == "failed" -> "فشل الدفع (غير مشترك)"
         !subscriptionStatus.isSubscribed || subscriptionStatus.status == "unsubscribed" || subscriptionStatus.maxCaptains <= 0 -> "غير مشترك"
-        else -> "نشطة وسارية ✓"
+        else -> "فعال ومتاح ✓"
     }
     val subStatusColor = when {
         isSubActive -> Color(0xFF2E7D32)
-        subscriptionStatus.isOfflineUnverified -> Color(0xFFE65100)
+        subscriptionStatus.isChecking -> Primary
+        !subscriptionStatus.serverError.isNullOrBlank() || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending -> Color(0xFFE65100)
         else -> Color(0xFFC62828)
     }
-    val renewalDateText = remember(subscriptionStatus.endDateMillis, subscriptionStatus.isSubscribed, isSubActive, subscriptionStatus.isExpired) {
+    val startDateText = remember(subscriptionStatus.startDateMillis, isSubActive, subscriptionStatus.isExpired, subscriptionStatus.isSuspended) {
+        val millis = subscriptionStatus.startDateMillis
+        if (millis != null && millis > 0L) {
+            SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(millis))
+        } else {
+            "—"
+        }
+    }
+    val renewalDateText = remember(subscriptionStatus.endDateMillis, subscriptionStatus.isSubscribed, isSubActive, subscriptionStatus.isExpired, subscriptionStatus.isSuspended) {
         val millis = subscriptionStatus.endDateMillis
-        if ((isSubActive || subscriptionStatus.isExpired) && millis != null && millis > 0L) {
+        if (millis != null && millis > 0L) {
             SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(millis))
         } else {
             "غير مشترك حالياً"
+        }
+    }
+    val remainingDurationText = remember(subscriptionStatus.endDateMillis, isSubActive, subscriptionStatus.isExpired) {
+        when {
+            isSubActive && subscriptionStatus.endDateMillis != null -> subscriptionStatus.remainingTimeLabel()
+            subscriptionStatus.isExpired -> "منتهي"
+            else -> "—"
         }
     }
 
@@ -1999,8 +2019,8 @@ fun SubscriptionPlansScreen(
                                         // فتح صفحة الدفع لإكمال التأكيد
                                         fallbackUrl = resolvedRedirectUrl
                                     }
-                                    serverRespondedSuccess || com.example.network.NetworkHelper.isNetworkAvailable(context) -> {
-                                        // تأكيد الاشتراك وتفعيله في قاعدة البيانات على السيرفر
+                                    serverRespondedSuccess -> {
+                                        // إرسال طلب التحقق والمزامنة مع السيرفر دون تفعيل محلي غير مصرح به
                                         activateConfirmedPlan(plan, normalizedPhone)
                                     }
                                     else -> {
@@ -2041,11 +2061,12 @@ fun SubscriptionPlansScreen(
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Real-time Current Subscription Card from Firestore `subscriptions` collection
+        // Real-time Current Subscription Card synced with Firestore & Cloud Functions
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp),
+                .padding(horizontal = 16.dp)
+                .testTag("current_subscription_summary_card"),
             shape = RoundedCornerShape(16.dp),
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surface
@@ -2099,19 +2120,19 @@ fun SubscriptionPlansScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "الباقة المختارة:",
+                        text = "اسم الباقة:",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = if (subscriptionStatus.isSubscribed && subscriptionStatus.maxCaptains > 0) {
-                            "${subscriptionStatus.planName} (${subscriptionStatus.maxCaptains} كابتن - ${subscriptionStatus.price} ج.م)"
+                        text = if (subscriptionStatus.planId > 0 || subscriptionStatus.maxCaptains > 0) {
+                            "${subscriptionStatus.planName} (${subscriptionStatus.price} ج.م)"
                         } else {
                             "غير مشترك في باقة"
                         },
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Bold,
-                        color = if (subscriptionStatus.isSubscribed) Primary else Color(0xFFC62828)
+                        color = if (isSubActive) Primary else Color(0xFFC62828)
                     )
                 }
 
@@ -2121,7 +2142,29 @@ fun SubscriptionPlansScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "حالة الباقة:",
+                        text = "الكباتن المسموح بهم:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = if (isSubActive && subscriptionStatus.maxCaptains > 0) {
+                            "${subscriptionStatus.maxCaptains} كابتن (النشط الآن: ${subscriptionStatus.activeCaptainsCount}/${subscriptionStatus.maxCaptains})"
+                        } else {
+                            "0 كابتن"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "حالة الاشتراك:",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2133,13 +2176,33 @@ fun SubscriptionPlansScreen(
                     )
                 }
 
+                if (startDateText != "—") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "تاريخ البداية:",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = startDateText,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "ميعاد التجديد:",
+                        text = "تاريخ الانتهاء / التجديد:",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2150,17 +2213,49 @@ fun SubscriptionPlansScreen(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                 }
+
+                if (remainingDurationText != "—") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "المدة المتبقية:",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = remainingDurationText,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isSubActive) Color(0xFF2E7D32) else Color(0xFFC62828)
+                        )
+                    }
+                }
+
+                if (!subscriptionStatus.suspensionReason.isNullOrBlank()) {
+                    Text(
+                        text = "السبب: ${subscriptionStatus.suspensionReason}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFC62828)
+                    )
+                }
             }
         }
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        if (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired || subscriptionStatus.isOfflineUnverified) {
-            val alertBgColor = if (subscriptionStatus.isOfflineUnverified) Color(0xFFFFF3E0) else Color(0xFFFFEBEE)
-            val alertBorderColor = if (subscriptionStatus.isOfflineUnverified) Color(0xFFFF9800) else Color(0xFFEF5350)
-            val alertAccentColor = if (subscriptionStatus.isOfflineUnverified) Color(0xFFE65100) else Color(0xFFC62828)
+        if (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isExpired || subscriptionStatus.isPending || subscriptionStatus.isOfflineUnverified) {
+            val isAmberAlert = subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending
+            val alertBgColor = if (isAmberAlert) Color(0xFFFFF3E0) else Color(0xFFFFEBEE)
+            val alertBorderColor = if (isAmberAlert) Color(0xFFFF9800) else Color(0xFFEF5350)
+            val alertAccentColor = if (isAmberAlert) Color(0xFFE65100) else Color(0xFFC62828)
             val alertTitle = when {
                 subscriptionStatus.isOfflineUnverified -> "بانتظار التحقق المباشر من السيرفر"
+                subscriptionStatus.isPending -> "طلب الاشتراك قيد المراجعة"
+                subscriptionStatus.status == "inactive" -> "اشتراكك غير نشط حالياً"
                 subscriptionStatus.isSuspended -> "تم إيقاف اشتراكك من الإدارة"
                 subscriptionStatus.isCancelled -> "تم إلغاء اشتراكك"
                 else -> "اشتراكك منتهي الصلاحية"
@@ -2571,14 +2666,113 @@ fun RestaurantDashboardScreen(
                     contentPadding = PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    if (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isExpired) {
+                    val isDashboardSubActive = subscriptionStatus.canRequestCaptain()
+                    val dashboardActiveOrders = maxOf(
+                        subscriptionStatus.activeCaptainsCount,
+                        orders.count { isOrderInProgress(it.status) }
+                    )
+
+                    if (subscriptionStatus.isChecking && !isDashboardSubActive) {
                         item {
-                            val isOfflineCard = subscriptionStatus.isOfflineUnverified
-                            val cardBg = if (isOfflineCard) Color(0xFFFFF3E0) else Color(0xFFFFEBEE)
-                            val cardBorder = if (isOfflineCard) Color(0xFFFF9800) else Color(0xFFEF5350)
-                            val cardAccent = if (isOfflineCard) Color(0xFFE65100) else Color(0xFFC62828)
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("dashboard_subscription_loading_card"),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)),
+                                border = BorderStroke(1.dp, Primary.copy(alpha = 0.35f))
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.5.dp,
+                                        color = Primary
+                                    )
+                                    Text(
+                                        text = "جاري التحقق الفوري من حالة الاشتراك مع السيرفر...",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    } else if (isDashboardSubActive) {
+                        item {
+                            val endFormatted = remember(subscriptionStatus.endDateMillis) {
+                                subscriptionStatus.endDateMillis?.takeIf { it > 0L }?.let {
+                                    SimpleDateFormat("dd MMMM yyyy", Locale("ar")).format(Date(it))
+                                } ?: "مفتوح"
+                            }
+                            val remainingLabel = remember(subscriptionStatus.endDateMillis) {
+                                if (subscriptionStatus.endDateMillis != null) subscriptionStatus.remainingTimeLabel() else "ساري"
+                            }
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onPlansClick() }
+                                    .testTag("dashboard_active_subscription_card"),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
+                                border = BorderStroke(1.2.dp, Color(0xFF2E7D32).copy(alpha = 0.5f))
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "الاشتراك فعال ✓ • ${subscriptionStatus.planName}",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            color = Color(0xFF1B5E20)
+                                        )
+                                        Surface(
+                                            color = Color(0xFF2E7D32),
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Text(
+                                                text = "$dashboardActiveOrders / ${subscriptionStatus.maxCaptains} كابتن",
+                                                color = Color.White,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        text = "تاريخ الانتهاء: $endFormatted • المتبقي: $remainingLabel",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = FontWeight.Medium,
+                                        color = Color(0xFF2E7D32)
+                                    )
+                                }
+                            }
+                        }
+                    } else if (subscriptionStatus.isSuspended || subscriptionStatus.isCancelled || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isExpired || subscriptionStatus.isPending || !subscriptionStatus.serverError.isNullOrBlank()) {
+                        item {
+                            val isServerErr = !subscriptionStatus.serverError.isNullOrBlank()
+                            val isAmberCard = isServerErr || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending
+                            val cardBg = if (isAmberCard) Color(0xFFFFF3E0) else Color(0xFFFFEBEE)
+                            val cardBorder = if (isAmberCard) Color(0xFFFF9800) else Color(0xFFEF5350)
+                            val cardAccent = if (isAmberCard) Color(0xFFE65100) else Color(0xFFC62828)
                             val cardTitle = when {
-                                isOfflineCard -> "تعذر التحقق المباشر من الاشتراك (غير متصل)"
+                                isServerErr -> "تعذر التحقق من الاشتراك مع السيرفر"
+                                subscriptionStatus.isOfflineUnverified -> "تعذر التحقق المباشر من الاشتراك (غير متصل)"
+                                subscriptionStatus.isPending -> "طلب الاشتراك قيد المراجعة من الإدارة"
+                                subscriptionStatus.status == "inactive" -> "اشتراكك غير نشط حالياً"
                                 subscriptionStatus.isSuspended -> "اشتراكك موقوف من الإدارة"
                                 subscriptionStatus.isCancelled -> "اشتراكك ملغي"
                                 else -> "اشتراكك منتهي الصلاحية"
@@ -2600,7 +2794,7 @@ fun RestaurantDashboardScreen(
                                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
                                         Icon(
-                                            imageVector = if (isOfflineCard) Icons.Default.WifiOff else Icons.Default.Warning,
+                                            imageVector = if (subscriptionStatus.isOfflineUnverified) Icons.Default.WifiOff else Icons.Default.Warning,
                                             contentDescription = cardTitle,
                                             tint = cardAccent,
                                             modifier = Modifier.size(20.dp)
@@ -2613,7 +2807,7 @@ fun RestaurantDashboardScreen(
                                         )
                                     }
                                     Text(
-                                        text = subscriptionStatus.message ?: "يرجى التواصل مع الإدارة أو تجديد الاشتراك لإتاحة طلب الكباتن.",
+                                        text = subscriptionStatus.serverError ?: subscriptionStatus.message ?: "يرجى التواصل مع الإدارة أو تجديد الاشتراك لإتاحة طلب الكباتن.",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = cardAccent
                                     )
@@ -2624,7 +2818,8 @@ fun RestaurantDashboardScreen(
                                         OutlinedButton(
                                             onClick = { orderViewModel.recheckSubscription() },
                                             shape = RoundedCornerShape(10.dp),
-                                            border = BorderStroke(1.dp, cardAccent)
+                                            border = BorderStroke(1.dp, cardAccent),
+                                            modifier = Modifier.testTag("dashboard_refresh_subscription_button")
                                         ) {
                                             Text(
                                                 text = "تحديث الحالة",
@@ -2633,7 +2828,7 @@ fun RestaurantDashboardScreen(
                                                 fontWeight = FontWeight.Bold
                                             )
                                         }
-                                        if (!isOfflineCard) {
+                                        if (!isAmberCard) {
                                             Button(
                                                 onClick = onPlansClick,
                                                 shape = RoundedCornerShape(10.dp),
@@ -3033,17 +3228,20 @@ fun SideMenuContent(
             // 3. 💳 الباقة الحالية (Current Subscription Plan - Connected to Firestore `subscriptions`)
             val isPlanActive = subscriptionStatus.canRequestCaptain()
             val planStatusLabel = when {
+                subscriptionStatus.isChecking && !isPlanActive -> "جاري التحقق..."
+                !subscriptionStatus.serverError.isNullOrBlank() && !isPlanActive -> "خطأ اتصال"
                 subscriptionStatus.isOfflineUnverified -> "غير متصل"
                 subscriptionStatus.isSuspended -> "موقوفة"
                 subscriptionStatus.isCancelled -> "ملغاة"
                 subscriptionStatus.isExpired || subscriptionStatus.status == "expired" -> "منتهية"
                 subscriptionStatus.status == "payment_failed" || subscriptionStatus.paymentStatus == "failed" -> "فشل الدفع"
                 !subscriptionStatus.isSubscribed || subscriptionStatus.status == "unsubscribed" || subscriptionStatus.maxCaptains <= 0 -> "غير مشترك"
-                else -> "نشطة ✓"
+                else -> "فعال ✓"
             }
             val planStatusBadgeColor = when {
                 isPlanActive -> Color(0xFF2E7D32)
-                subscriptionStatus.isOfflineUnverified -> Color(0xFFE65100)
+                subscriptionStatus.isChecking -> Primary
+                !subscriptionStatus.serverError.isNullOrBlank() || subscriptionStatus.isOfflineUnverified -> Color(0xFFE65100)
                 else -> Color(0xFFC62828)
             }
             val formattedRenewalDate = remember(subscriptionStatus.endDateMillis, subscriptionStatus.isSubscribed, isPlanActive) {
@@ -4819,18 +5017,48 @@ fun RequestCaptainPopupDialog(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                if (!isSubscribedAndActive) {
+                if (subscriptionStatus.isChecking && !isSubscribedAndActive) {
+                    Surface(
+                        color = Primary.copy(alpha = 0.08f),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Primary.copy(alpha = 0.35f)),
+                        modifier = Modifier.fillMaxWidth().testTag("request_captain_checking_banner")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = Primary
+                            )
+                            Text(
+                                text = "جاري التحقق من حالة الاشتراك مع السيرفر...",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Primary
+                            )
+                        }
+                    }
+                } else if (!isSubscribedAndActive) {
+                    val isServerErr = !subscriptionStatus.serverError.isNullOrBlank()
+                    val isAmberBanner = isServerErr || subscriptionStatus.isOfflineUnverified || subscriptionStatus.isPending
                     val blockTitle = when {
+                        isServerErr -> "⚠️ تعذر التحقق من الاشتراك مع السيرفر"
                         subscriptionStatus.isOfflineUnverified -> "⚠️ تعذر التحقق من الاشتراك (غير متصل)"
+                        subscriptionStatus.isPending -> "⏳ طلب الاشتراك قيد المراجعة"
+                        subscriptionStatus.status == "inactive" -> "⛔ اشتراكك غير نشط حالياً"
                         subscriptionStatus.isSuspended -> "⛔ تم إيقاف الاشتراك من الإدارة"
                         subscriptionStatus.isCancelled -> "❌ تم إلغاء الاشتراك"
                         subscriptionStatus.isExpired -> "⌛ انتهت فترة الاشتراك"
                         else -> "⚠️ لا يمكن عمل طلب كابتن"
                     }
                     Surface(
-                        color = if (subscriptionStatus.isOfflineUnverified) Color(0xFFFFF3E0) else Color(0xFFFFEBEE),
+                        color = if (isAmberBanner) Color(0xFFFFF3E0) else Color(0xFFFFEBEE),
                         shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, if (subscriptionStatus.isOfflineUnverified) Color(0xFFFF9800) else Color(0xFFEF5350)),
+                        border = BorderStroke(1.dp, if (isAmberBanner) Color(0xFFFF9800) else Color(0xFFEF5350)),
                         modifier = Modifier.fillMaxWidth().testTag("request_captain_blocked_banner")
                     ) {
                         Column(
@@ -4841,13 +5069,13 @@ fun RequestCaptainPopupDialog(
                                 text = blockTitle,
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.ExtraBold,
-                                color = if (subscriptionStatus.isOfflineUnverified) Color(0xFFE65100) else Color(0xFFC62828)
+                                color = if (isAmberBanner) Color(0xFFE65100) else Color(0xFFC62828)
                             )
                             Text(
-                                text = subscriptionStatus.message
+                                text = subscriptionStatus.serverError ?: subscriptionStatus.message
                                     ?: "أنت غير مشترك في باقة حالياً. يجب الاشتراك في إحدى الباقات المتاحة أولاً لتتمكن من طلب كابتن.",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (subscriptionStatus.isOfflineUnverified) Color(0xFF5D4037) else Color(0xFFB71C1C),
+                                color = if (isAmberBanner) Color(0xFF5D4037) else Color(0xFFB71C1C),
                                 fontWeight = FontWeight.Medium
                             )
                         }
@@ -8756,13 +8984,16 @@ fun SubscriptionExpiredScreen(
 ) {
     val normalizedStatus = status.trim().lowercase(Locale.ROOT)
     val screenTitle = when (normalizedStatus) {
+        "inactive" -> "اشتراكك غير نشط حالياً"
         "suspended" -> "تم إيقاف اشتراكك"
         "cancelled", "canceled" -> "تم إلغاء اشتراكك"
+        "pending" -> "الاشتراك قيد المراجعة"
         else -> "اشتراكك منتهي"
     }
     val statusEmoji = when (normalizedStatus) {
-        "suspended" -> "⛔"
+        "inactive", "suspended" -> "⛔"
         "cancelled", "canceled" -> "❌"
+        "pending" -> "⏳"
         else -> "⚠️"
     }
 

@@ -169,4 +169,5 @@
     <string name="receipt_image_title">إيصال الاستلام المحمل من الكابتن</string>
     <string name="active_captains_limit_banner">الحد الأقصى للكباتن المتزامنين: %1$d من %2$d مستخدم</string>
     <string name="captains_limit_reached_warning">لقد وصلت للحد الأقصى لعدد الكباتن المتزامنين المسموح بهم في باقتك (%d كباتن). يرجى انتظار تسليم طلب جاري أو ترقية باقتك.</string>
+    <string name="splash_video_content_description">فيديو افتتاحي لتطبيق البطل إكسبريس</string>
 </resources>
