@@ -52,18 +52,17 @@ data class SubscriptionPlanOption(
 )
 
 data class VodafoneCashSettings(
-    val walletNumber: String = OFFICIAL_VODAFONE_CASH_NUMBER,
+    val walletNumber: String = "",
     val walletHolderName: String = "",
     val instructions: String = "1. قم بتحويل قيمة الباقة عبر فودافون كاش إلى الرقم الرسمي الموضح أعلاه.\n2. التقط صورة واضحة (سكرين شوت) لإيصال أو رسالة تأكيد التحويل.\n3. أدخل رقم الهاتف المحوَّل منه وارفع صورة الإيصال ثم اضغط إرسال للمراجعة.\n4. سيتم تفعيل باقتك تلقائياً فور مراجعة وموافقة الإدارة.",
-    val plans: List<SubscriptionPlanOption> = OFFICIAL_PLANS,
+    val plans: List<SubscriptionPlanOption> = emptyList(),
     val isConfiguredOnServer: Boolean = false,
+    val isAcceptingSubscriptions: Boolean = false,
+    val pauseMessage: String? = null,
     val isLoading: Boolean = false,
     val loadError: String? = null
 ) {
     companion object {
-        // Official Vodafone Cash wallet number (overridden dynamically if Admin sets a newer number in Firestore settings/subscription_config)
-        const val OFFICIAL_VODAFONE_CASH_NUMBER: String = "01095783737"
-
         // Official 4 subscription plans matching server OFFICIAL_SUBSCRIPTION_PLANS (prices preserved untouched)
         val OFFICIAL_PLANS: List<SubscriptionPlanOption> = listOf(
             SubscriptionPlanOption(
@@ -188,39 +187,54 @@ class MerchantSubscriptionRepository {
          * while falling back safely to [VodafoneCashSettings.OFFICIAL_PLANS].
          */
         fun parseConfiguredPlans(rawPlans: Any?): List<SubscriptionPlanOption> {
-            val list = rawPlans as? List<*> ?: return VodafoneCashSettings.OFFICIAL_PLANS
-            val parsed = list.mapNotNull { entry ->
+            val list = rawPlans as? List<*> ?: return emptyList()
+            return list.mapNotNull { entry ->
                 val map = entry as? Map<*, *> ?: return@mapNotNull null
-                val id = (map["id"] as? Number)?.toInt()
-                    ?: (map["planId"] as? Number)?.toInt()
+                if (map["isActive"] == false) return@mapNotNull null
+
+                val legacyId = (map["id"] as? Number)?.toInt()
                     ?: (map["packageId"] as? Number)?.toInt()
-                    ?: return@mapNotNull null
-                if (id !in 1..4) return@mapNotNull null
-                val defaultPlan = VodafoneCashSettings.OFFICIAL_PLANS.firstOrNull { it.id == id }
-                    ?: return@mapNotNull null
-                val name = (map["name"] ?: map["planName"] ?: map["title"])?.toString()?.trim()
-                    ?.takeIf { it.isNotBlank() } ?: defaultPlan.name
-                val maxCaptains = (map["maxCaptains"] as? Number)?.toInt()
+                    ?: (map["planId"] as? Number)?.toInt()
+                val configuredLimit = (map["maxCaptains"] as? Number)?.toInt()
                     ?: (map["captainLimit"] as? Number)?.toInt()
-                    ?: defaultPlan.maxCaptains
-                val priceEgp = (map["price"] as? Number)?.toInt()
+                    ?: when (legacyId) {
+                        1 -> 2
+                        2 -> 4
+                        3 -> 6
+                        4 -> 8
+                        else -> null
+                    }
+                    ?: return@mapNotNull null
+
+                val canonicalId = when (configuredLimit) {
+                    2 -> 1
+                    4 -> 2
+                    6 -> 3
+                    8 -> 4
+                    else -> return@mapNotNull null
+                }
+                val defaults = VodafoneCashSettings.OFFICIAL_PLANS.first { it.id == canonicalId }
+                val price = (map["price"] as? Number)?.toInt()
                     ?: (map["priceEgp"] as? Number)?.toInt()
                     ?: (map["amount"] as? Number)?.toInt()
-                    ?: defaultPlan.priceEgp
+                    ?: return@mapNotNull null
+                if (price <= 0) return@mapNotNull null
+
                 val durationDays = (map["durationDays"] as? Number)?.toInt()
-                    ?.takeIf { it > 0 } ?: defaultPlan.durationDays
-                val isPopular = (map["isPopular"] as? Boolean) ?: defaultPlan.isPopular
+                    ?.takeIf { it in 1..365 } ?: return@mapNotNull null
+                val name = (map["planName"] ?: map["name"] ?: map["title"])
+                    ?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                    ?: defaults.name
                 SubscriptionPlanOption(
-                    id = id,
+                    id = canonicalId,
                     name = name,
-                    captainsLabel = "$maxCaptains كابتن",
-                    maxCaptains = maxCaptains,
-                    priceEgp = priceEgp,
+                    captainsLabel = "$configuredLimit كابتن",
+                    maxCaptains = configuredLimit,
+                    priceEgp = price,
                     durationDays = durationDays,
-                    isPopular = isPopular
+                    isPopular = (map["isPopular"] as? Boolean) ?: defaults.isPopular
                 )
-            }.sortedBy { it.id }
-            return if (parsed.isNotEmpty()) parsed else VodafoneCashSettings.OFFICIAL_PLANS
+            }.distinctBy { it.maxCaptains }.sortedBy { it.id }
         }
 
         /**
@@ -238,6 +252,9 @@ class MerchantSubscriptionRepository {
             }
             if (currentSubscription.isPendingReview || currentSubscription.status == "pending_review") {
                 return "لديك بالفعل طلب اشتراك قيد مراجعة الإدارة حالياً. يرجى انتظار قرار الإدارة."
+            }
+            if (currentSubscription.isResubmissionRequired && currentSubscription.pendingRequestId.isNullOrBlank()) {
+                return "تعذر العثور على رقم طلب الاشتراك المطلوب إعادة إرساله. حدّث حالة الاشتراك من السيرفر ثم حاول مرة أخرى."
             }
             if (plan == null || plan.id !in 1..4) {
                 return "يرجى اختيار إحدى الباقات الرسمية المتاحة."
@@ -615,70 +632,56 @@ class MerchantSubscriptionRepository {
      * and instructions configured by Admin in Firebase Firestore (`settings/subscription_config`).
      */
     suspend fun fetchVodafoneCashSettings(): VodafoneCashSettings {
-        val candidateDocIds = listOf(
-            "subscription_config",
-            "vodafone_cash",
-            "payments",
-            "app_settings",
-            "general"
-        )
-        var resolvedWallet = VodafoneCashSettings.OFFICIAL_VODAFONE_CASH_NUMBER
-        var resolvedHolder = ""
-        var resolvedInstructions = VodafoneCashSettings().instructions
-        var resolvedPlans = VodafoneCashSettings.OFFICIAL_PLANS
-        var foundOnServer = false
+        return try {
+            // This is the canonical settings document written by the Dashboard Cloud Function.
+            // Never fall back to a hard-coded wallet or stale legacy settings documents.
+            val snapshot = Firebase.firestore.collection("settings")
+                .document("manual_subscription_config")
+                .get(Source.SERVER)
+                .await()
 
-        for (docId in candidateDocIds) {
-            try {
-                val snap = try {
-                    Firebase.firestore.collection("settings").document(docId).get(Source.SERVER).await()
-                } catch (_: Exception) {
-                    Firebase.firestore.collection("settings").document(docId).get().await()
-                }
-                if (snap.exists()) {
-                    val rawPlans = snap.get("plans") ?: snap.get("packages")
-                    if (rawPlans != null) {
-                        resolvedPlans = parseConfiguredPlans(rawPlans)
+            if (!snapshot.exists()) {
+                VodafoneCashSettings(
+                    loadError = "إعدادات الاشتراك غير موجودة على السيرفر. يرجى التواصل مع الإدارة."
+                )
+            } else {
+                val wallet = snapshot.getAnyString("vodafoneCashNumber", "walletNumber")
+                    ?.trim().orEmpty()
+                val walletIsValid = Regex("^01[0125][0-9]{8}$").matches(wallet)
+                val plans = parseConfiguredPlans(snapshot.get("plans"))
+                val accepting = snapshot.getBoolean("isAcceptingSubscriptions") == true
+                val pauseMessage = snapshot.getAnyString("pauseMessage")?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                val configured = walletIsValid && plans.isNotEmpty()
+
+                VodafoneCashSettings(
+                    walletNumber = if (walletIsValid) wallet else "",
+                    walletHolderName = snapshot.getAnyString("walletHolderName", "accountName")
+                        ?.trim().orEmpty(),
+                    instructions = snapshot.getAnyString(
+                        "vodafoneCashInstructions",
+                        "paymentInstructions",
+                        "instructions"
+                    )?.trim()?.takeIf { it.isNotBlank() } ?: VodafoneCashSettings().instructions,
+                    plans = plans,
+                    isConfiguredOnServer = configured,
+                    isAcceptingSubscriptions = accepting,
+                    pauseMessage = pauseMessage,
+                    isLoading = false,
+                    loadError = when {
+                        !walletIsValid -> "رقم محفظة فودافون كاش غير مضبوط أو غير صالح في إعدادات الإدارة."
+                        plans.isEmpty() -> "لا توجد باقات نشطة ومدعومة في إعدادات الاشتراك على السيرفر."
+                        !accepting -> pauseMessage ?: "استقبال طلبات الاشتراك متوقف مؤقتاً من الإدارة."
+                        else -> null
                     }
-                    val wallet = snap.getAnyString(
-                        "vodafoneCashNumber",
-                        "vodafone_cash_number",
-                        "vodafoneCashWallet",
-                        "walletNumber",
-                        "officialWalletNumber",
-                        "paymentWalletNumber",
-                        "subscriptionWalletNumber"
-                    )?.trim().orEmpty()
-                    if (wallet.isNotBlank()) {
-                        resolvedWallet = wallet
-                        foundOnServer = true
-                        snap.getAnyString(
-                            "vodafoneCashAccountName",
-                            "walletHolderName",
-                            "accountName"
-                        )?.trim()?.takeIf { it.isNotBlank() }?.let { resolvedHolder = it }
-                        snap.getAnyString(
-                            "vodafoneCashInstructions",
-                            "paymentInstructions",
-                            "instructions"
-                        )?.trim()?.takeIf { it.isNotBlank() }?.let { resolvedInstructions = it }
-                        break
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Reading settings/$docId note: ${e.message}")
+                )
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Reading settings/manual_subscription_config from server failed: ${e.message}", e)
+            VodafoneCashSettings(
+                loadError = "تعذر تحميل إعدادات الاشتراك من السيرفر. تحقق من الاتصال والصلاحيات ثم أعد المحاولة."
+            )
         }
-
-        return VodafoneCashSettings(
-            walletNumber = resolvedWallet,
-            walletHolderName = resolvedHolder,
-            instructions = resolvedInstructions,
-            plans = resolvedPlans,
-            isConfiguredOnServer = foundOnServer,
-            isLoading = false,
-            loadError = null
-        )
     }
 
     /**
