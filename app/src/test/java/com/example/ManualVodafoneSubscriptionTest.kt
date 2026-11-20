@@ -123,6 +123,18 @@ class ManualVodafoneSubscriptionTest {
         )
         assertEquals("merchants/merchant_uid_42/subscription_receipts/subreq_1760000_abcd.jpg", path)
 
+        val firstReceipt = FirebaseStorageManager.buildSubscriptionReceiptStoragePath(
+            uid = "merchant_uid_42",
+            requestId = "subreq_1760000_abcd",
+            receiptUploadId = "subreq_1760000_abcd_attempt1"
+        )
+        val secondReceipt = FirebaseStorageManager.buildSubscriptionReceiptStoragePath(
+            uid = "merchant_uid_42",
+            requestId = "subreq_1760000_abcd",
+            receiptUploadId = "subreq_1760000_abcd_attempt2"
+        )
+        assertTrue(firstReceipt != secondReceipt)
+
         composeTestRule.setContent {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
