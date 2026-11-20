@@ -1973,39 +1973,64 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         orderDetails: String,
         customerPhone: String = "",
         customerName: String = "",
-        serviceFee: String
+        serviceFee: String,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
     ) {
         if (!NetworkHelper.isNetworkAvailable(getApplication())) {
             val noNetMsg = "لا يمكن تعديل بيانات الطلب: أنت غير متصل بالإنترنت!"
             _snackbarMessage.value = noNetMsg
             NetworkHelper.notifyNoInternet(getApplication(), "تعديل بيانات الطلب")
+            onError(noNetMsg)
             return
         }
+
         viewModelScope.launch {
-            repository.updateOrderDetails(
-                orderId = orderId,
-                destinationAddress = destinationAddress,
-                orderDetails = orderDetails,
-                customerPhone = customerPhone,
-                customerName = customerName,
-                serviceFee = serviceFee
-            )
             try {
+                val trimmedAddress = destinationAddress.trim()
+                val feeText = serviceFee.trim()
                 val matchedDoc = findMerchantOrderDocument(orderId)
-                matchedDoc?.reference?.update(
-                    mapOf(
-                        "address" to destinationAddress,
-                        "deliveryAddress" to destinationAddress,
-                        "destinationAddress" to destinationAddress,
-                        "items" to orderDetails,
-                        "orderDetails" to orderDetails,
-                        "price" to serviceFee,
-                        "totalAmount" to serviceFee,
-                        "serviceFee" to serviceFee
-                    )
-                )?.await()
+                    ?: throw IllegalStateException("الطلب غير موجود في قاعدة البيانات")
+
+                // The server verifies ownership and refuses edits once a captain has received an offer.
+                subscriptionRepository.updateMerchantOrderDetails(
+                    orderId = matchedDoc.id,
+                    destinationAddress = trimmedAddress,
+                    orderDetails = orderDetails,
+                    customerName = customerName,
+                    customerPhone = customerPhone,
+                    deliveryNotes = "",
+                    serviceFee = feeText
+                ).getOrThrow()
+
+                repository.updateOrderDetails(
+                    orderId = orderId,
+                    destinationAddress = trimmedAddress,
+                    orderDetails = orderDetails,
+                    customerPhone = customerPhone,
+                    customerName = customerName,
+                    serviceFee = feeText
+                )
+
+                _firestoreOrders.value = _firestoreOrders.value.map { item ->
+                    if (item.firestoreOrderId == matchedDoc.id || item.id == orderId) {
+                        item.copy(
+                            destinationAddress = trimmedAddress,
+                            orderDetails = orderDetails,
+                            customerPhone = customerPhone,
+                            customerName = customerName,
+                            serviceFee = feeText
+                        )
+                    } else item
+                }
+
+                _snackbarMessage.value = "تم تحديث بيانات الطلب وخدمة التوصيل بنجاح."
+                onSuccess()
             } catch (e: Exception) {
-                Log.e("OrderViewModel", "Error updating order details in Firestore", e)
+                Log.e("OrderViewModel", "Server merchant order edit failed: ${e.message}", e)
+                val message = e.localizedMessage ?: "تعذر تعديل الطلب من الخادم."
+                _snackbarMessage.value = message
+                onError(message)
             }
         }
     }
