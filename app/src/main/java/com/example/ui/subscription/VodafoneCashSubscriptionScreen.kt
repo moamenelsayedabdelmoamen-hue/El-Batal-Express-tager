@@ -671,7 +671,12 @@ fun VodafoneCashPaymentContent(
     val isBlockedByExistingState = subscriptionStatus.canRequestCaptain() ||
         subscriptionStatus.isPendingReview ||
         subscriptionStatus.status == "pending_review"
-    val isPaymentFlowUnavailable = !settings.isConfiguredOnServer || !settings.isAcceptingSubscriptions
+    val isSelectedPlanConfigured = settings.plans.any {
+        it.id == plan.id && it.maxCaptains == plan.maxCaptains &&
+            it.priceEgp == plan.priceEgp && it.durationDays == plan.durationDays
+    }
+    val isPaymentFlowUnavailable = !settings.isConfiguredOnServer ||
+        !settings.isAcceptingSubscriptions || !isSelectedPlanConfigured
     val errorText = localValidationError ?: (uiState as? ManualSubscriptionUiState.Error)?.message
 
     Column(
