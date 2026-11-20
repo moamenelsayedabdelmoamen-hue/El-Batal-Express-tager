@@ -166,8 +166,7 @@ class MerchantSubscriptionRepository {
     companion object {
         private const val TAG = "MerchantSubRepo"
         const val FUNCTIONS_REGION = "us-central1"
-        const val PRIMARY_ORDER_FUNCTION = "requestCaptains"
-        const val LEGACY_SERVER_ORDER_FUNCTION = "createOrderWithCode"
+        const val PRIMARY_ORDER_FUNCTION = "merchantCreateOrder"
         const val MANUAL_SUBSCRIPTION_FUNCTION = "submitManualSubscriptionRequest"
 
         fun normalizeEgyptianMobile(rawPhone: String?): String? {
@@ -549,11 +548,10 @@ class MerchantSubscriptionRepository {
     }
 
     /**
-     * Authoritative Cloud Function order creation & captain dispatch request (`requestCaptains`).
-     * Enforces auth, verified email, active server subscription, non-expired date, and captain limit atomically.
-     * If `requestCaptains` returns HTTP 404 (not yet deployed on the project), seamlessly falls back ONLY to
-     * the server-enforced callable `createOrderWithCode` with the exact same `idempotencyKey` — NEVER writes
-     * directly to Firestore from the client.
+     * Creates a delivery order through the single Dashboard Cloud Function.
+     * Delivery fee is sent only from the merchant's input; the server reads the
+     * merchant name, registered phone, and logo from the trusted merchants/{uid} document.
+     * No legacy client-side or alternate-dispatch fallback is allowed.
      */
     suspend fun requestCaptains(payload: Map<String, Any?>): Result<CaptainRequestResult> {
         val merchantUid = Firebase.auth.currentUser?.uid.orEmpty()
@@ -563,60 +561,24 @@ class MerchantSubscriptionRepository {
 
         return try {
             Result.success(invokeServerOrderCallable(PRIMARY_ORDER_FUNCTION, payload))
-        } catch (primaryErr: FirebaseFunctionsException) {
-            if (isEndpointNotFoundError(primaryErr.code, primaryErr.message, primaryErr.details)) {
-                Log.w(
-                    TAG,
-                    "Cloud Function endpoint NOT_FOUND | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${primaryErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()} -> attempting server callable $LEGACY_SERVER_ORDER_FUNCTION"
-                )
-                return try {
-                    Result.success(invokeServerOrderCallable(LEGACY_SERVER_ORDER_FUNCTION, payload))
-                } catch (fallbackErr: FirebaseFunctionsException) {
-                    val bothMissing = isEndpointNotFoundError(
-                        fallbackErr.code,
-                        fallbackErr.message,
-                        fallbackErr.details
-                    )
-                    Log.e(
-                        TAG,
-                        "Server order callable failed | functionName=$LEGACY_SERVER_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${fallbackErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}"
-                    )
-                    val mapped = mapRequestCaptainsError(
-                        code = fallbackErr.code,
-                        rawMessage = fallbackErr.message,
-                        details = fallbackErr.details,
-                        endpointUnavailableOnServer = bothMissing
-                    )
-                    Result.failure(IllegalStateException(mapped, fallbackErr))
-                } catch (fallbackUnexpected: Exception) {
-                    Log.e(
-                        TAG,
-                        "Unexpected error on $LEGACY_SERVER_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}: ${fallbackUnexpected.message}"
-                    )
-                    Result.failure(
-                        IllegalStateException(
-                            fallbackUnexpected.localizedMessage ?: "تعذر إنشاء الطلب عبر السيرفر، يرجى المحاولة مرة أخرى.",
-                            fallbackUnexpected
-                        )
-                    )
-                }
-            }
-
+        } catch (e: FirebaseFunctionsException) {
             Log.e(
                 TAG,
-                "Server order callable rejected | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${primaryErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}"
+                "Server order callable rejected | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${e.code} merchantId=$merchantUid requestId=$requestId",
+                e
             )
-            val msg = mapRequestCaptainsError(
-                code = primaryErr.code,
-                rawMessage = primaryErr.message,
-                details = primaryErr.details,
-                endpointUnavailableOnServer = false
+            val message = mapRequestCaptainsError(
+                code = e.code,
+                rawMessage = e.message,
+                details = e.details,
+                endpointUnavailableOnServer = isEndpointNotFoundError(e.code, e.message, e.details)
             )
-            Result.failure(IllegalStateException(msg, primaryErr))
+            Result.failure(IllegalStateException(message, e))
         } catch (e: Exception) {
             Log.e(
                 TAG,
-                "Unexpected error calling $PRIMARY_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}: ${e.message}"
+                "Unexpected error calling $PRIMARY_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId: ${e.message}",
+                e
             )
             Result.failure(
                 IllegalStateException(
