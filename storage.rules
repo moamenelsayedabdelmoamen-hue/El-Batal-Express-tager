@@ -129,22 +129,6 @@ service firebase.storage {
       allow delete: if isAdmin() || (isAuthenticated() && request.auth.uid == merchantId);
     }
 
-    // Merchant manual Vodafone Cash subscription payment receipts:
-    // merchants/{merchantId}/subscription_receipts/{fileName}
-    // - Read: ONLY the owning merchant or an admin.
-    // - Create: ONLY the owning merchant account with a validated image (<= 10 MB, jpg/png/webp).
-    // - Update/Delete: Admin only (receipts are immutable once submitted for audit integrity).
-    match /merchants/{merchantId}/subscription_receipts/{fileName} {
-      allow read: if isAuthenticated() && (
-        request.auth.uid == merchantId || isAdmin()
-      );
-      allow create: if isMerchantAccount()
-        && request.auth.uid == merchantId
-        && fileName.matches('^[A-Za-z0-9_\\-]{6,120}\\.(jpg|jpeg|png|webp)$')
-        && isValidImageUpload();
-      allow update, delete: if isAdmin();
-    }
-
     // 1. Captain Profile Photo: captains/{captainId}/profile/profile.jpg
     // - Read: ONLY the owning captain, an admin, or the specific merchant linked to an active order with this captain.
     //   Blanket read access across all captains by arbitrary merchants is DENIED.
