@@ -601,45 +601,32 @@ export async function runAutoDispatch(
  * Trigger: On New Order Created in Firestore.
  * Single authoritative entry point for initial auto-dispatch of new orders.
  */
+/**
+ * Retired compatibility trigger.
+ * Initial order dispatch is owned exclusively by Dashboard/functions/onOrderCreatedDispatch.
+ * Keep this export during migration so the legacy Firebase function can be updated safely.
+ */
 export const onOrderCreated = functions.firestore
   .document("orders/{orderId}")
   .onCreate(async (snap, context) => {
-    const orderId = context.params.orderId;
-    const orderData = snap.data();
-    if (!orderData) return;
-
-    await runAutoDispatch(orderId, orderData, { triggerSource: "onOrderCreated" });
+    if (!snap.exists) return;
+    console.info(`[AutoDispatch] Legacy Tager trigger is retired for ${context.params.orderId}; Dashboard/functions owns dispatch.`);
   });
 
 /**
- * Trigger: When a Captain updates status or location.
- * If the captain turns Online & Available, checks if there are pending orders
- * waiting in "searching" state and dispatches the oldest pending order!
+ * Retired compatibility trigger.
+ * Dashboard/functions/onCaptainAvailabilityChanged now retries queued orders.
  */
 export const onCaptainUpdated = functions.firestore
   .document("captains/{captainId}")
   .onUpdate(async (change, context) => {
     const beforeData = change.before.data();
     const afterData = change.after.data();
-
     const becameAvailable =
       isCaptainReadyForDispatch(afterData) &&
       !isCaptainReadyForDispatch(beforeData);
-
     if (becameAvailable) {
-      console.log(`[AutoDispatch] Captain ${context.params.captainId} is now online & available. Looking for queued orders...`);
-      const pendingOrdersSnapshot = await db.collection("orders")
-        .where("status", "==", "pending")
-        .where("dispatchStatus", "==", "searching")
-        .orderBy("createdAt", "asc")
-        .limit(1)
-        .get();
-
-      if (!pendingOrdersSnapshot.empty) {
-        const orderDoc = pendingOrdersSnapshot.docs[0];
-        console.log(`[AutoDispatch] Queued order ${orderDoc.id} found. Triggering auto-dispatch.`);
-        await runAutoDispatch(orderDoc.id, orderDoc.data(), { triggerSource: "onCaptainUpdated" });
-      }
+      console.info(`[AutoDispatch] Captain ${context.params.captainId} became available; queue retry is owned by Dashboard/functions.`);
     }
   });
 
@@ -680,6 +667,8 @@ export const onOrderStatusChanged = functions.firestore
       try {
         await db.collection("captains").doc(captainId).update({
           availabilityStatus: "available",
+          presenceStatus: "available",
+          isBusy: false,
           currentOrderId: null,
           activeMerchantId: admin.firestore.FieldValue.delete(),
           currentMerchantId: admin.firestore.FieldValue.delete(),
