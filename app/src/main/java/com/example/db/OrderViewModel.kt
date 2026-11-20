@@ -1698,7 +1698,6 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val created = serverResult.getOrThrow()
-            clearOrderIdempotencyKey(idempotencyFingerprint)
             lastServerActiveCaptainsCount = created.activeCaptainsCount
             recomputeSubscriptionState()
 
@@ -1721,6 +1720,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 captainPhotoUrl = ""
             )
             repository.insertOrder(newOrder)
+            clearOrderIdempotencyKey(idempotencyFingerprint)
             _latestCreatedOrderCode.value = created.orderCode
             onSuccess(created.orderCode)
         }
