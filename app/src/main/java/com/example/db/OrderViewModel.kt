@@ -639,6 +639,12 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         if (user != null && user.isEmailVerified) {
             listenToFirestore()
         } else {
+            // Room orders are account-private. Wipe the local cache on logout so a
+            // different merchant on the same device never sees the previous account's orders.
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { repository.clearAllOrders() }
+                    .onFailure { error -> Log.w("OrderViewModel", "Could not clear merchant order cache on sign-out: ${error.message}") }
+            }
             clearListeners()
         }
     }
@@ -1312,8 +1318,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             "awaiting_merchant_confirmation", "details_submitted", "data_submitted",
             "customer_details_submitted", "بانتظار تأكيد البيانات", "في انتظار تأكيد البيانات",
             "بانتظار التأكيد", "تأكيد البيانات", "تم إرسال البيانات", "تم ارسال البيانات" -> "بانتظار تأكيد البيانات"
-            "customer_confirmed", "confirmed_by_merchant", "تم تأكيد البيانات" -> "جاري التوصيل"
-            "customer_rejected", "بيانات مرفوضة" -> "بيانات مرفوضة"
+            "customer_confirmed", "confirmed_by_merchant", "en_route", "تم تأكيد البيانات" -> "جاري التوصيل"
+            "customer_rejected", "merchant_rejected", "بيانات مرفوضة" -> "بيانات مرفوضة"
             "in_progress", "out_for_delivery", "جاري التوصيل", "delivering", "في الطريق إلى العميل" -> "جاري التوصيل"
             "completed", "delivered", "تم التسليم", "مكتمل", "مكتملة", "تم التوصيل" -> "تم التسليم"
             "cancelled", "canceled", "ملغي", "ملغية", "تم الإلغاء", "تم الالغاء" -> "ملغي"
@@ -1577,7 +1583,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val feeInput = serviceFee.trim()
-            val feeDigits = Regex("""\\d+(?:\\.\\d+)?""")
+            val feeDigits = Regex("""\d+(?:\.\d+)?""")
                 .find(feeInput.replace(",", ""))?.value?.toDoubleOrNull()
             if (feeInput.isBlank() || feeDigits == null || !feeDigits.isFinite() || feeDigits < 0.0 || feeDigits > 100000.0) {
                 val feeMsg = "يرجى إدخال قيمة صحيحة لخدمة التوصيل من تطبيق التاجر."
@@ -1695,88 +1701,17 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * The merchant application must not advance captain delivery stages.
+     * Captains use authenticated Cloud Functions; merchants may only confirm
+     * the receipt/customer details through merchantConfirmOrder.
+     */
     fun advanceOrderStatus(orderId: Int, currentStatus: String) {
-        val nextStatus = when (currentStatus.trim()) {
-            "جاري البحث", "جاري البحث عن كابتن", "في انتظار كابتن", "قيد التحضير", "Preparing", "pending" -> "في الطريق لك"
-            "في الطريق لك", "الكابتن في الطريق لك", "accepted", "في الطريق إلى المطعم" -> "جاري التوصيل"
-            "جاري التوصيل", "قيد التوصيل", "Out for Delivery", "delivering" -> "تم التسليم"
-            else -> "تم التسليم"
-        }
-
-        viewModelScope.launch {
-            val orders = repository.allOrders.firstOrNull() ?: emptyList()
-            val targetOrder = orders.find { it.id == orderId }
-
-            val currentDriverName = _driverProfile.value.name.trim()
-            val currentDriverPhone = _driverProfile.value.phone.trim()
-            val currentDriverPhoto = _driverProfile.value.photoUrl.trim().takeIf {
-                FirebaseStorageManager.isValidDisplayableCaptainPhoto(it)
-            } ?: ""
-
-            if ((nextStatus == "في الطريق لك" || nextStatus == "جاري التوصيل") &&
-                targetOrder != null &&
-                !FirebaseStorageManager.isValidCaptainName(targetOrder.captainName) &&
-                currentDriverName.isNotBlank()
-            ) {
-                repository.updateOrder(
-                    targetOrder.copy(
-                        status = nextStatus,
-                        captainName = currentDriverName,
-                        captainPhone = currentDriverPhone.ifBlank { targetOrder.captainPhone },
-                        captainPhotoUrl = currentDriverPhoto.ifBlank { targetOrder.captainPhotoUrl },
-                        estimatedArrival = targetOrder.estimatedArrival.ifBlank { "20 دقيقة" }
-                    )
-                )
-            } else {
-                repository.updateOrderStatus(orderId, nextStatus)
-            }
-
-            // Sync status with Firestore without ever overwriting real captain fields with placeholders
-            try {
-                val firestoreStatus = when (nextStatus) {
-                    "في الطريق لك" -> "accepted"
-                    "جاري التوصيل" -> "in_progress"
-                    "تم التسليم" -> "delivered"
-                    else -> nextStatus
-                }
-                val matchedDoc = findMerchantOrderDocument(orderId)
-                val updates = hashMapOf<String, Any>("status" to firestoreStatus)
-                if (currentDriverName.isNotBlank()) {
-                    updates["driver_name"] = currentDriverName
-                    updates["captainName"] = currentDriverName
-                }
-                if (currentDriverPhone.isNotBlank()) {
-                    updates["captainPhone"] = currentDriverPhone
-                }
-                matchedDoc?.reference?.update(updates)?.await()
-            } catch (e: Exception) {
-                Log.w("OrderViewModel", "Could not sync advance status to Firestore: ${e.message}")
-            }
-
-            // Trigger simulated push notification if transitioning from 'Preparing' to 'Out for Delivery'
-            if (nextStatus == "جاري التوصيل") {
-                val destination = targetOrder?.destinationAddress?.ifBlank { "العنوان المتردد" } ?: "العنوان المحدد"
-
-                val title = getApplication<Application>().getString(R.string.notification_out_for_delivery_title)
-                val body = getApplication<Application>().getString(R.string.notification_out_for_delivery_body, destination)
-                val timeSdf = SimpleDateFormat("hh:mm a", Locale("ar"))
-                val timeStr = timeSdf.format(Date())
-
-                // 1. Post actual System Notification
-                try {
-                    NotificationHelper.showOutForDeliveryNotification(getApplication(), destination)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-
-                // 2. Emit simulated push notification banner state
-                _pushNotificationState.value = PushNotificationBanner(
-                    title = title,
-                    body = body,
-                    timestamp = timeStr
-                )
-            }
-        }
+        Log.w(
+            "OrderViewModel",
+            "Blocked merchant-side order status mutation for order=$orderId status=$currentStatus"
+        )
+        _snackbarMessage.value = "مراحل التوصيل يتم تحديثها من تطبيق الكابتن والخادم فقط."
     }
 
     private suspend fun findMerchantOrderDocument(orderId: Any): DocumentSnapshot? {
@@ -1827,7 +1762,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         onSuccess: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {
-        updateMerchantDeliveryConfirmation(orderId, confirmed = true, rejectionReason = "", onSuccess, onError)
+        updateMerchantDeliveryConfirmation(
+            orderId = orderId,
+            confirmed = true,
+            rejectionReason = "",
+            onSuccess = onSuccess,
+            onError = onError
+        )
     }
 
     fun rejectCustomerDetails(
@@ -1842,7 +1783,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             onError(message)
             return
         }
-        updateMerchantDeliveryConfirmation(orderId, confirmed = false, rejectionReason = reason, onSuccess, onError)
+        updateMerchantDeliveryConfirmation(
+            orderId = orderId,
+            confirmed = false,
+            rejectionReason = reason,
+            onSuccess = onSuccess,
+            onError = onError
+        )
     }
 
     private fun updateMerchantDeliveryConfirmation(
