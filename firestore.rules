@@ -28,14 +28,16 @@ service cloud.firestore {
     // below is owner-read-only, so the authorization helper cannot recurse through
     // that match when a captain or merchant rule asks whether a caller is an admin.
     function isRegisteredAdmin() {
-      let adminRecord = get(/databases/$(database)/documents/admins/$(request.auth.uid));
-      return adminRecord.data != null &&
+      // get() for a missing document can evaluate to null in the rules emulator.
+      // Guard it with exists() before reading .data to avoid a Null value error
+      // for normal merchants, captains and customers.
+      return exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
         (
-          adminRecord.data.get('role', '') == 'admin' ||
-          adminRecord.data.get('isAdmin', false) == true ||
-          adminRecord.data.get('isSuperAdmin', false) == true
+          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('role', '') == 'admin' ||
+          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('isAdmin', false) == true ||
+          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('isSuperAdmin', false) == true
         ) &&
-        adminRecord.data.get('status', 'active') in ['active', 'approved'];
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('status', 'active') in ['active', 'approved'];
     }
 
     function isAdmin() {
@@ -478,11 +480,15 @@ service cloud.firestore {
     }
 
     match /operation_logs/{logId} {
-      allow read, write: if isAdmin();
+      // Logs are read-only to dashboard admins; creation and mutation stay server-side.
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
     }
 
     match /webhook_events/{eventId} {
-      allow read, write: if isAdmin();
+      // Payment webhook audit events are written only by trusted server code.
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
     }
 
     // --- 6. Captain Schedules & Shifts (Read-Only for Owning Captain, Admin-Managed) ---
