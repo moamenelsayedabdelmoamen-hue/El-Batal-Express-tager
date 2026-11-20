@@ -127,7 +127,9 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = VodafoneCashSettings.OFFICIAL_PLANS[0],
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                    settings = VodafoneCashSettings(walletNumber = "01099887766",
+                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                        isConfiguredOnServer = true,
                         isAcceptingSubscriptions = true),
                     subscriptionStatus = SubscriptionStatusState(status = "unsubscribed"),
                     uiState = ManualSubscriptionUiState.Idle,
@@ -190,7 +192,9 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = plan,
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                    settings = VodafoneCashSettings(walletNumber = "01099887766",
+                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                        isConfiguredOnServer = true,
                         isAcceptingSubscriptions = true),
                     subscriptionStatus = unsubscribed,
                     uiState = ManualSubscriptionUiState.Idle,
@@ -255,7 +259,9 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = plan,
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                    settings = VodafoneCashSettings(walletNumber = "01099887766",
+                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                        isConfiguredOnServer = true,
                         isAcceptingSubscriptions = true),
                     subscriptionStatus = pendingState,
                     uiState = ManualSubscriptionUiState.Idle,
@@ -314,7 +320,9 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = VodafoneCashSettings.OFFICIAL_PLANS[3],
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                    settings = VodafoneCashSettings(walletNumber = "01099887766",
+                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                        isConfiguredOnServer = true,
                         isAcceptingSubscriptions = true),
                     subscriptionStatus = SubscriptionStatusState(status = "pending_review", isPendingReview = true),
                     uiState = ManualSubscriptionUiState.Submitted(
