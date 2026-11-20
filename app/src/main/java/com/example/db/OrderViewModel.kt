@@ -1578,7 +1578,31 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
             val sdf = SimpleDateFormat("dd MMMM yyyy - hh:mm a", Locale("ar"))
             val currentDate = sdf.format(Date())
-            val formattedFee = if (serviceFee.isBlank()) "30 جنيه" else if (serviceFee.contains("جنيه")) serviceFee.trim() else "${serviceFee.trim()} جنيه"
+            val normalizedFeeInput = buildString {
+                serviceFee.trim().forEach { char ->
+                    when (char) {
+                        in '٠'..'٩' -> append(('0'.code + (char.code - '٠'.code)).toChar())
+                        in '۰'..'۹' -> append(('0'.code + (char.code - '۰'.code)).toChar())
+                        ',', '٫' -> append('.')
+                        else -> if (char.isDigit() || char == '.') append(char)
+                    }
+                }
+            }
+            val serviceFeeAmount = Regex("""\d+(?:\.\d{1,2})?""")
+                .find(normalizedFeeInput)?.value?.toDoubleOrNull()
+            if (serviceFeeAmount == null || !serviceFeeAmount.isFinite() ||
+                serviceFeeAmount <= 0.0 || serviceFeeAmount > 10_000.0
+            ) {
+                val feeError = "يرجى إدخال قيمة صحيحة لخدمة التوصيل أكبر من صفر ولا تتجاوز 10000 جنيه."
+                _snackbarMessage.value = feeError
+                onError?.invoke(feeError)
+                return@launch
+            }
+            val formattedFee = if (serviceFeeAmount % 1.0 == 0.0) {
+                "${serviceFeeAmount.toLong()} جنيه"
+            } else {
+                "${serviceFeeAmount} جنيه"
+            }
             val uid = currentUser.uid
             val idempotencyKey = UUID.randomUUID().toString()
             val profile = _restaurantProfile.value
@@ -1593,8 +1617,11 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 "restaurantId" to uid,
                 "destinationAddress" to trimmedAddress,
                 "address" to trimmedAddress,
-                "serviceFee" to formattedFee,
-                "price" to formattedFee,
+                // Merchant-authored delivery service amount is sent as a number.
+                // The server stores this authoritative amount in deliveryFee/serviceFee.
+                "serviceFee" to serviceFeeAmount,
+                "deliveryFee" to serviceFeeAmount,
+                "price" to serviceFeeAmount,
                 "customerName" to customerName.trim(),
                 "customerPhone" to customerPhone.trim(),
                 "orderDetails" to orderDetails.trim(),
@@ -1845,8 +1872,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         "rejectionReason" to "",
                         "confirmedAt" to FieldValue.serverTimestamp(),
                         "updatedAt" to FieldValue.serverTimestamp(),
-                        "status" to "customer_confirmed",
-                        "orderStatus" to "customer_confirmed",
+                        "status" to "en_route",
+                        "orderStatus" to "en_route",
                         "status_ar" to "جاري التوصيل"
                     )
                     matchedDoc.reference.update(updates).await()
@@ -1923,8 +1950,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         "rejectionReason" to reason.trim(),
                         "rejectedAt" to FieldValue.serverTimestamp(),
                         "updatedAt" to FieldValue.serverTimestamp(),
-                        "status" to "customer_rejected",
-                        "orderStatus" to "customer_rejected",
+                        "status" to "merchant_rejected",
+                        "orderStatus" to "merchant_rejected",
                         "status_ar" to "بيانات مرفوضة"
                     )
                     matchedDoc.reference.update(updates).await()
