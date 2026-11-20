@@ -6,10 +6,31 @@ service firebase.storage {
       return request.auth != null;
     }
 
-    // Trusted DB-backed admin check (never trusts spoofable client fields)
+    // Admin authorization mirrors Firestore: server claims, a verified allowlisted email,
+    // or a server-provisioned admin registry document.
     function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.get('admin', false) == true ||
+        request.auth.token.get('role', '') == 'admin' ||
+        (
+          request.auth.token.get('email_verified', false) == true &&
+          request.auth.token.get('email', '') in [
+            'moamen.elsayed.abdelmoamen@gmail.com',
+            'admin@elbatalexpress.com'
+          ]
+        ) ||
+        firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isApprovedCaptain() {
+      let captainDoc = firestore.get(/databases/(default)/documents/captains/$(request.auth.uid));
       return isAuthenticated() &&
-        firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid));
+        !isMerchantAccount() &&
+        captainDoc != null &&
+        captainDoc.data != null &&
+        captainDoc.data.get('accountType', '') == 'captain' &&
+        captainDoc.data.get('status', '') in ['active', 'approved'];
     }
 
     // Trusted DB-backed merchant account check
@@ -93,15 +114,17 @@ service firebase.storage {
         );
     }
 
-    // Merchant profile images: merchants/{merchantId}/profile.jpg
-    // The merchant can manage only their own image; admins can moderate any merchant image.
-    match /merchants/{merchantId}/{fileName} {
+    // Merchant profile images are business identity assets, not private subscription receipts.
+    // Only the owning merchant, admins, and approved captains can read these files.
+    match /merchants/{merchantId}/{allFiles=**} {
       allow read: if isAuthenticated() && (
-        request.auth.uid == merchantId || isAdmin()
+        request.auth.uid == merchantId ||
+        isAdmin() ||
+        (isApprovedCaptain() && !allFiles.matches('subscription_receipts/.*'))
       );
       allow create, update: if isAuthenticated()
         && (request.auth.uid == merchantId || isAdmin())
-        && fileName in ['profile.jpg', 'logo.jpg', 'logo.png', 'logo.webp']
+        && allFiles in ['profile.jpg', 'logo.jpg', 'logo.png', 'logo.webp']
         && isValidImageUpload();
       allow delete: if isAdmin() || (isAuthenticated() && request.auth.uid == merchantId);
     }
