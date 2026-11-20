@@ -2925,7 +2925,7 @@ export async function reserveAndCreateOrderAtomic(
   const merchantPhone = String(merchantPreData.phone || merchantPreData.phoneNumber || "").trim();
   const merchantImage = String(
     merchantPreData.logo || merchantPreData.photoUrl || merchantPreData.logoUrl ||
-    merchantPreData.imageUrl || merchantPreData.profileImageUrl || merchantPreData.storagePath || ""
+    merchantPreData.imageUrl || merchantPreData.profileImageUrl || ""
   ).trim();
   const clientLat = typeof params.merchantLatitude === "number" ? params.merchantLatitude : null;
   const clientLng = typeof params.merchantLongitude === "number" ? params.merchantLongitude : null;
