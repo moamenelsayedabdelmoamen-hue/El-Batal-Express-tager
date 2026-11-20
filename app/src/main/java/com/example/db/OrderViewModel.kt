@@ -1993,13 +1993,15 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     ?: throw IllegalStateException("الطلب غير موجود في قاعدة البيانات")
 
                 // The server verifies ownership and refuses edits once a captain has received an offer.
+                val existingDeliveryNotes = matchedDoc.getString("deliveryNotes")
+                    ?: matchedDoc.getString("notes").orEmpty()
                 subscriptionRepository.updateMerchantOrderDetails(
                     orderId = matchedDoc.id,
                     destinationAddress = trimmedAddress,
                     orderDetails = orderDetails,
                     customerName = customerName,
                     customerPhone = customerPhone,
-                    deliveryNotes = "",
+                    deliveryNotes = existingDeliveryNotes,
                     serviceFee = feeText
                 ).getOrThrow()
 
