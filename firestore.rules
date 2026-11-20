@@ -399,6 +399,7 @@ service cloud.firestore {
     function isOrderOwnedByMerchant(data) {
       return isMerchantAccount() && (
         ('merchantId' in data && data.merchantId == request.auth.uid) ||
+        ('restaurantId' in data && data.restaurantId == request.auth.uid) ||
         ('storeId' in data && data.storeId == request.auth.uid) ||
         ('vendorId' in data && data.vendorId == request.auth.uid) ||
         ('ownerId' in data && data.ownerId == request.auth.uid) ||
