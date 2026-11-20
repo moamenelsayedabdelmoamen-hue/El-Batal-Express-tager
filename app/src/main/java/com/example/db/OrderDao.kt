@@ -17,6 +17,11 @@ interface OrderDao {
     @Query("SELECT COUNT(*) FROM delivery_orders")
     suspend fun getOrderCount(): Int
 
+    // Orders are local cache data for the currently signed-in merchant only.
+    // Clear them on logout/account switch to prevent cross-account disclosure.
+    @Query("DELETE FROM delivery_orders")
+    suspend fun deleteAllOrders()
+
     @Query("UPDATE delivery_orders SET status = :status WHERE id = :orderId")
     suspend fun updateOrderStatus(orderId: Int, status: String)
 
