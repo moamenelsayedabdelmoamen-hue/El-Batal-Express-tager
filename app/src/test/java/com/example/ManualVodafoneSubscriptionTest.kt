@@ -51,7 +51,7 @@ class ManualVodafoneSubscriptionTest {
         assertEquals(listOf(2, 4, 6, 8), plans.map { it.maxCaptains })
         assertEquals(listOf(400, 800, 1200, 1600), plans.map { it.priceEgp })
         assertTrue(plans.all { it.durationDays == 30 })
-        assertEquals("01095783737", VodafoneCashSettings().walletNumber)
+        assertEquals("", VodafoneCashSettings().walletNumber)
 
         val chosenPlan = plans[2] // الباقة المميزة - 6 كابتن - 1200 ج.م
         var copiedWallet = ""
@@ -63,7 +63,8 @@ class ManualVodafoneSubscriptionTest {
                     settings = VodafoneCashSettings(
                         walletNumber = "01099887766",
                         walletHolderName = "البطل إكسبريس",
-                        isConfiguredOnServer = true
+                        isConfiguredOnServer = true,
+                        isAcceptingSubscriptions = true
                     ),
                     subscriptionStatus = SubscriptionStatusState(status = "unsubscribed"),
                     uiState = ManualSubscriptionUiState.Idle,
@@ -126,7 +127,8 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = VodafoneCashSettings.OFFICIAL_PLANS[0],
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true),
+                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                        isAcceptingSubscriptions = true),
                     subscriptionStatus = SubscriptionStatusState(status = "unsubscribed"),
                     uiState = ManualSubscriptionUiState.Idle,
                     senderPhone = "01012345678",
@@ -188,7 +190,8 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = plan,
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true),
+                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                        isAcceptingSubscriptions = true),
                     subscriptionStatus = unsubscribed,
                     uiState = ManualSubscriptionUiState.Idle,
                     senderPhone = "01012345678",
@@ -252,7 +255,8 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = plan,
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true),
+                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                        isAcceptingSubscriptions = true),
                     subscriptionStatus = pendingState,
                     uiState = ManualSubscriptionUiState.Idle,
                     senderPhone = "01012345678",
@@ -310,7 +314,8 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = VodafoneCashSettings.OFFICIAL_PLANS[3],
-                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true),
+                    settings = VodafoneCashSettings(walletNumber = "01099887766", isConfiguredOnServer = true,
+                        isAcceptingSubscriptions = true),
                     subscriptionStatus = SubscriptionStatusState(status = "pending_review", isPendingReview = true),
                     uiState = ManualSubscriptionUiState.Submitted(
                         ManualSubscriptionSubmissionResult(
@@ -681,4 +686,73 @@ class ManualVodafoneSubscriptionTest {
         composeTestRule.onNodeWithTag("subscription_resubmission_reason_box").assertIsDisplayed()
         composeTestRule.onNodeWithTag("subscription_resubmission_reason_text").assertIsDisplayed().assertTextEquals(resubReason)
     }
+    @Test
+    fun scenario12_serverPlanIdsAndReceiptResubmissionKeepTheOriginalRequest() {
+        val configuredPlans = MerchantSubscriptionRepository.parseConfiguredPlans(
+            listOf(
+                mapOf(
+                    "planId" to "plan_2_captains",
+                    "planName" to "باقة كابتنين",
+                    "maxCaptains" to 2,
+                    "price" to 425,
+                    "durationDays" to 30,
+                    "isActive" to true
+                ),
+                mapOf(
+                    "planId" to "plan_12_captains",
+                    "planName" to "باقة غير مدعومة بالتطبيق",
+                    "maxCaptains" to 12,
+                    "price" to 900,
+                    "durationDays" to 30,
+                    "isActive" to true
+                )
+            )
+        )
+        assertEquals(1, configuredPlans.size)
+        assertEquals(1, configuredPlans.single().id)
+        assertEquals(2, configuredPlans.single().maxCaptains)
+        assertEquals(425, configuredPlans.single().priceEgp)
+        assertTrue(MerchantSubscriptionRepository.parseConfiguredPlans(emptyList<Any>()).isEmpty())
+
+        val requestId = "subreq_existing_resubmission_01"
+        val resubmissionState = SubscriptionSyncResolver.resolve(
+            subscriptionDoc = RawSubscriptionSnapshot(
+                exists = true,
+                status = "resubmission_required",
+                isActive = false,
+                isSubscribed = false,
+                planId = 2,
+                planName = "الباقة المتوسطة",
+                paymentMethod = "vodafone_cash_manual",
+                pendingRequestId = requestId,
+                resubmissionReason = "يرجى رفع إيصال أوضح"
+            ),
+            merchantDoc = RawSubscriptionSnapshot(exists = false),
+            isOnline = true,
+            nowMillis = nowMs,
+            hasVerifiedServerOnce = true
+        )
+        assertTrue(resubmissionState.isResubmissionRequired)
+        assertEquals(requestId, resubmissionState.pendingRequestId)
+
+        val plan = VodafoneCashSettings.OFFICIAL_PLANS[1]
+        assertNotNull(
+            MerchantSubscriptionRepository.validateManualSubscriptionInput(
+                plan = plan,
+                senderPhone = "01012345678",
+                receiptLocalUri = "content://media/picker/0/1001",
+                currentSubscription = resubmissionState.copy(pendingRequestId = null)
+            )
+        )
+        assertNull(
+            MerchantSubscriptionRepository.validateManualSubscriptionInput(
+                plan = plan,
+                senderPhone = "01012345678",
+                receiptLocalUri = "content://media/picker/0/1001",
+                currentSubscription = resubmissionState
+            )
+        )
+    }
+
+
 }
