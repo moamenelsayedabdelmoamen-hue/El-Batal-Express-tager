@@ -14,6 +14,7 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 data class StorageUploadResult(
@@ -486,15 +487,22 @@ object FirebaseStorageManager {
     }
 
     /**
-     * Builds the canonical Firebase Storage path for a merchant's manual Vodafone Cash receipt:
-     * `merchants/{uid}/subscription_receipts/{sanitizedRequestId}.jpg`
+     * Builds a unique immutable receipt object path. The subscription request ID stays the same
+     * across resubmissions, while each uploaded image receives a new storage object name.
      */
-    fun buildSubscriptionReceiptStoragePath(uid: String, requestId: String): String {
+    fun buildSubscriptionReceiptStoragePath(
+        uid: String,
+        requestId: String,
+        receiptUploadId: String = requestId
+    ): String {
         val safeUid = uid.trim()
         val safeReq = requestId.trim().replace(Regex("[^A-Za-z0-9_\\-]"), "_")
+        val safeUploadId = receiptUploadId.trim().replace(Regex("[^A-Za-z0-9_\\-]"), "_")
         require(safeUid.isNotEmpty()) { "معرف التاجر غير صالح" }
         require(safeReq.length >= 6) { "معرف طلب الاشتراك غير صالح" }
-        return "merchants/$safeUid/subscription_receipts/$safeReq.jpg"
+        require(safeUploadId.length in 6..110) { "معرف رفع الإيصال غير صالح" }
+        require(safeUploadId.startsWith(safeReq)) { "معرف رفع الإيصال لا يرتبط بطلب الاشتراك" }
+        return "merchants/$safeUid/subscription_receipts/$safeUploadId.jpg"
     }
 
     /**
@@ -518,8 +526,9 @@ object FirebaseStorageManager {
             return@withContext Result.failure(IllegalArgumentException("يرجى اختيار صورة إيصال صالحة من الجهاز"))
         }
 
+        val receiptUploadId = "${requestId}_${System.currentTimeMillis()}_${UUID.randomUUID().toString().replace("-", "").take(8)}"
         val storagePath = try {
-            buildSubscriptionReceiptStoragePath(uid, requestId)
+            buildSubscriptionReceiptStoragePath(uid, requestId, receiptUploadId)
         } catch (e: IllegalArgumentException) {
             return@withContext Result.failure(e)
         }
