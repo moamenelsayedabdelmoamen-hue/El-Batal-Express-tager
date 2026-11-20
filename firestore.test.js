@@ -386,10 +386,10 @@ test("Ongoing orders, Captain delivery workflow, Captain earnings protection, an
     .authenticatedContext(OTHER_CAPTAIN_UID, { email: "cap2@example.com", email_verified: true })
     .firestore();
 
-  // Ongoing order remains readable & confirmable by Merchant even after subscription suspension
+  // Merchant can read own orders after suspension, but confirmation is server-callable only.
   await assertSucceeds(merchDb.collection("orders").doc("ord_active").get());
   await assertSucceeds(merchDb.collection("orders").doc("ord_legacy_rest").get());
-  await assertSucceeds(
+  await assertFails(
     merchDb.collection("orders").doc("ord_active").update({ customerDetailsConfirmed: true })
   );
 
@@ -410,20 +410,20 @@ test("Ongoing orders, Captain delivery workflow, Captain earnings protection, an
     merchDb.collection("orders").doc("ord_active").update({ capacityReleased: true })
   );
 
-  // Merchant CAN still cancel an unassigned pending order
-  await assertSucceeds(
+  // Merchant cancellation is performed through the authenticated merchantCancelOrder callable.
+  await assertFails(
     merchDb.collection("orders").doc("ord_pending").update({
       status: "cancelled",
       cancelReason: "إلغاء التاجر",
     })
   );
 
-  // Assigned captain CAN read & progress delivery status
+  // Assigned captain can read own orders; all lifecycle mutations are callable-only.
   await assertSucceeds(captainDb.collection("orders").doc("ord_active").get());
-  await assertSucceeds(
+  await assertFails(
     captainDb.collection("orders").doc("ord_active").update({ status: "in_progress" })
   );
-  await assertSucceeds(
+  await assertFails(
     captainDb.collection("orders").doc("ord_active").update({ status: "delivered" })
   );
 
