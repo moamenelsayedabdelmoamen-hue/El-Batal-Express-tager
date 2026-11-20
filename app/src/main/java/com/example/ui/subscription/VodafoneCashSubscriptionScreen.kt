@@ -671,6 +671,12 @@ fun VodafoneCashPaymentContent(
     val isBlockedByExistingState = subscriptionStatus.canRequestCaptain() ||
         subscriptionStatus.isPendingReview ||
         subscriptionStatus.status == "pending_review"
+    val isSelectedPlanConfigured = settings.plans.any {
+        it.id == plan.id && it.maxCaptains == plan.maxCaptains &&
+            it.priceEgp == plan.priceEgp && it.durationDays == plan.durationDays
+    }
+    val isPaymentFlowUnavailable = !settings.isConfiguredOnServer ||
+        !settings.isAcceptingSubscriptions || !isSelectedPlanConfigured
     val errorText = localValidationError ?: (uiState as? ManualSubscriptionUiState.Error)?.message
 
     Column(
@@ -1118,6 +1124,25 @@ fun VodafoneCashPaymentContent(
                 }
             }
 
+            if (!settings.isLoading && settings.isConfiguredOnServer && !settings.isAcceptingSubscriptions) {
+                Surface(
+                    color = Color(0xFFFFF7ED),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, StatusPendingAmber),
+                    modifier = Modifier.fillMaxWidth().testTag("vodafone_subscriptions_paused_notice")
+                ) {
+                    Text(
+                        text = settings.pauseMessage
+                            ?: settings.loadError
+                            ?: "استقبال طلبات الاشتراك متوقف مؤقتاً من الإدارة.",
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF92400E),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+
             // 5. Clear Transfer Instructions
             Card(
                 modifier = Modifier
@@ -1182,7 +1207,7 @@ fun VodafoneCashPaymentContent(
                     OutlinedTextField(
                         value = senderPhone,
                         onValueChange = onSenderPhoneChange,
-                        enabled = !isSubmitting && !isBlockedByExistingState,
+                        enabled = !isSubmitting && !isBlockedByExistingState && !isPaymentFlowUnavailable,
                         label = { Text(stringResource(R.string.vodafone_sender_phone_label)) },
                         placeholder = { Text("010xxxxxxxx") },
                         leadingIcon = {
@@ -1203,7 +1228,7 @@ fun VodafoneCashPaymentContent(
                     OutlinedTextField(
                         value = transactionReference,
                         onValueChange = onTransactionReferenceChange,
-                        enabled = !isSubmitting && !isBlockedByExistingState && submittedResult == null,
+                        enabled = !isSubmitting && !isBlockedByExistingState && !isPaymentFlowUnavailable && submittedResult == null,
                         label = { Text(stringResource(R.string.vodafone_reference_label)) },
                         placeholder = { Text(stringResource(R.string.vodafone_reference_placeholder)) },
                         leadingIcon = {
@@ -1223,7 +1248,7 @@ fun VodafoneCashPaymentContent(
                     OutlinedTextField(
                         value = notes,
                         onValueChange = onNotesChange,
-                        enabled = !isSubmitting && !isBlockedByExistingState && submittedResult == null,
+                        enabled = !isSubmitting && !isBlockedByExistingState && !isPaymentFlowUnavailable && submittedResult == null,
                         label = { Text(stringResource(R.string.vodafone_notes_label)) },
                         placeholder = { Text(stringResource(R.string.vodafone_notes_placeholder)) },
                         leadingIcon = {
@@ -1334,7 +1359,7 @@ fun VodafoneCashPaymentContent(
 
                     OutlinedButton(
                         onClick = onPickReceiptClick,
-                        enabled = !isSubmitting && !isBlockedByExistingState,
+                        enabled = !isSubmitting && !isBlockedByExistingState && !isPaymentFlowUnavailable,
                         shape = RoundedCornerShape(14.dp),
                         border = BorderStroke(1.2.dp, Primary),
                         modifier = Modifier
@@ -1398,7 +1423,7 @@ fun VodafoneCashPaymentContent(
             if (submittedResult == null) {
                 Button(
                     onClick = onSubmitClick,
-                    enabled = !isSubmitting && !isBlockedByExistingState,
+                    enabled = !isSubmitting && !isBlockedByExistingState && !isPaymentFlowUnavailable,
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Primary,
