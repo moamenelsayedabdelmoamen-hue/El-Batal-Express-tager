@@ -1583,13 +1583,21 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     when (char) {
                         in '٠'..'٩' -> append(('0'.code + (char.code - '٠'.code)).toChar())
                         in '۰'..'۹' -> append(('0'.code + (char.code - '۰'.code)).toChar())
-                        ',', '٫' -> append('.')
-                        else -> if (char.isDigit() || char == '.') append(char)
+                        '.', '٫' -> append('.')
+                        ',', '٬' -> append(',')
+                        else -> if (char.isDigit()) append(char)
                     }
                 }
             }
+            val feeNumberText = when {
+                normalizedFeeInput.contains('.') && normalizedFeeInput.contains(',') ->
+                    normalizedFeeInput.replace(",", "")
+                Regex("""^\d{1,3}(,\d{3})+$""").matches(normalizedFeeInput) ->
+                    normalizedFeeInput.replace(",", "")
+                else -> normalizedFeeInput.replace(",", ".")
+            }
             val serviceFeeAmount = Regex("""\d+(?:\.\d{1,2})?""")
-                .find(normalizedFeeInput)?.value?.toDoubleOrNull()
+                .find(feeNumberText)?.value?.toDoubleOrNull()
             if (serviceFeeAmount == null || !serviceFeeAmount.isFinite() ||
                 serviceFeeAmount <= 0.0 || serviceFeeAmount > 10_000.0
             ) {
