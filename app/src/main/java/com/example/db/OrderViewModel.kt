@@ -2492,6 +2492,16 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             onError(pausedError)
             return
         }
+        val trustedPlan = paymentSettings.plans.firstOrNull { it.id == plan.id }
+        if (trustedPlan == null || trustedPlan.maxCaptains != plan.maxCaptains ||
+            trustedPlan.priceEgp != plan.priceEgp || trustedPlan.durationDays != plan.durationDays
+        ) {
+            val planError = "الباقة المختارة لم تعد مطابقة لإعدادات الإدارة الحالية. أعد تحميل الباقات ثم اختر الباقة من جديد."
+            _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(planError)
+            _snackbarMessage.value = planError
+            onError(planError)
+            return
+        }
         if (validationError != null) {
             _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(validationError)
             _snackbarMessage.value = validationError
