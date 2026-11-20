@@ -628,6 +628,81 @@ class MerchantSubscriptionRepository {
     }
 
     /**
+     * Executes all merchant order lifecycle mutations through the authoritative Dashboard
+     * Cloud Functions. The merchant client must never write dispatch/status transitions directly.
+     */
+    private suspend fun executeMerchantOrderMutation(
+        functionName: String,
+        payload: Map<String, Any?>
+    ): Result<Unit> {
+        return try {
+            val result = functionsClient()
+                .getHttpsCallable(functionName)
+                .call(payload)
+                .await()
+            val data = result.getData() as? Map<*, *>
+                ?: throw IllegalStateException("استجابة غير صالحة من خادم الطلبات.")
+            if (data["success"] == false) {
+                throw IllegalStateException(
+                    data["message"]?.toString()?.takeIf { it.isNotBlank() }
+                        ?: "رفض الخادم تنفيذ العملية."
+                )
+            }
+            Result.success(Unit)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            Log.e(TAG, "Merchant order callable $functionName failed: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun confirmMerchantOrder(
+        orderId: String,
+        confirmed: Boolean,
+        rejectionReason: String = ""
+    ): Result<Unit> = executeMerchantOrderMutation(
+        functionName = "merchantConfirmOrder",
+        payload = mapOf(
+            "orderId" to orderId.trim(),
+            "confirmed" to confirmed,
+            "rejectionReason" to rejectionReason.trim()
+        )
+    )
+
+    suspend fun cancelMerchantOrder(
+        orderId: String,
+        reason: String
+    ): Result<Unit> = executeMerchantOrderMutation(
+        functionName = "merchantCancelOrder",
+        payload = mapOf(
+            "orderId" to orderId.trim(),
+            "reason" to reason.trim()
+        )
+    )
+
+    suspend fun updateMerchantOrderDetails(
+        orderId: String,
+        destinationAddress: String,
+        orderDetails: String,
+        customerPhone: String,
+        customerName: String,
+        deliveryNotes: String,
+        serviceFee: String
+    ): Result<Unit> = executeMerchantOrderMutation(
+        functionName = "merchantUpdateOrderDetails",
+        payload = mapOf(
+            "orderId" to orderId.trim(),
+            "destinationAddress" to destinationAddress.trim(),
+            "orderDetails" to orderDetails.trim(),
+            "customerPhone" to customerPhone.trim(),
+            "customerName" to customerName.trim(),
+            "deliveryNotes" to deliveryNotes.trim(),
+            "serviceFee" to serviceFee.trim()
+        )
+    )
+
+    /**
      * Fetches the official Vodafone Cash wallet number, optional wallet holder name, dynamic plans,
      * and instructions configured by Admin in Firebase Firestore (`settings/subscription_config`).
      */
