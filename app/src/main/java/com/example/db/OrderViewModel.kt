@@ -634,18 +634,52 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         _trackedCaptainInfo.value = null
     }
 
+    private val merchantOrderCachePreferences by lazy {
+        getApplication<Application>().getSharedPreferences(
+            "merchant_order_cache",
+            android.content.Context.MODE_PRIVATE
+        )
+    }
+
     private val authStateListener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { auth ->
-        val user = auth.currentUser
-        if (user != null && user.isEmailVerified) {
-            listenToFirestore()
-        } else {
-            // Room orders are account-private. Wipe the local cache on logout so a
-            // different merchant on the same device never sees the previous account's orders.
+        val verifiedUser = auth.currentUser?.takeIf { it.isEmailVerified }
+        val uid = verifiedUser?.uid
+
+        if (uid == null) {
+            merchantOrderCachePreferences.edit().remove("merchant_uid").apply()
+            clearListeners()
             viewModelScope.launch(Dispatchers.IO) {
                 runCatching { repository.clearAllOrders() }
-                    .onFailure { error -> Log.w("OrderViewModel", "Could not clear merchant order cache on sign-out: ${error.message}") }
+                    .onFailure { error ->
+                        Log.w("OrderViewModel", "Could not clear merchant order cache on sign-out: ${error.message}")
+                    }
             }
+            return@AuthStateListener
+        }
+
+        val cachedOwnerUid = merchantOrderCachePreferences.getString("merchant_uid", null)
+        if (cachedOwnerUid != uid) {
+            // This also handles app upgrades and direct account switching without an
+            // intermediate signed-out state. Old merchant rows are removed before loading
+            // any data for the newly authenticated merchant.
+            merchantOrderCachePreferences.edit().putString("merchant_uid", uid).apply()
             clearListeners()
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { repository.clearAllOrders() }
+                    .onFailure { error ->
+                        Log.w("OrderViewModel", "Could not isolate Room cache for new merchant: ${error.message}")
+                    }
+                withContext(Dispatchers.Main) {
+                    if (
+                        Firebase.auth.currentUser?.uid == uid &&
+                        Firebase.auth.currentUser?.isEmailVerified == true
+                    ) {
+                        listenToFirestore()
+                    }
+                }
+            }
+        } else {
+            listenToFirestore()
         }
     }
 
