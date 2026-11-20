@@ -2803,8 +2803,19 @@ function parseMerchantServiceFee(raw: unknown): number {
     "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
     "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9"
   };
-  const normalized = String(raw ?? "").trim().replace(/[٠-٩۰-۹]/g, (digit) => arabicDigits[digit] || digit);
-  const token = normalized.replace(/,/g, ".").match(/-?\d+(?:\.\d{1,2})?/);
+  let normalized = String(raw ?? "").trim()
+    .replace(/[٠-٩۰-۹]/g, (digit) => arabicDigits[digit] || digit)
+    .replace(/٫/g, ".")
+    .replace(/٬/g, ",")
+    .replace(/[^0-9.,-]/g, "");
+  if (normalized.includes(".") && normalized.includes(",")) {
+    normalized = normalized.replace(/,/g, "");
+  } else if (/^\d{1,3}(,\d{3})+$/.test(normalized)) {
+    normalized = normalized.replace(/,/g, "");
+  } else {
+    normalized = normalized.replace(/,/g, ".");
+  }
+  const token = normalized.match(/-?\d+(?:\.\d{1,2})?/);
   return token ? Number(token[0]) : Number.NaN;
 }
 
