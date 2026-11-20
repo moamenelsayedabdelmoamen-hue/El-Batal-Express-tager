@@ -615,6 +615,41 @@ class MerchantSubscriptionRepository {
     }
 
     /**
+     * Updates delivery information and merchant-entered service fee only while
+     * an order remains unassigned and no captain offer has been sent.
+     */
+    suspend fun updateMerchantOrderDetails(
+        orderId: String,
+        destinationAddress: String,
+        orderDetails: String,
+        customerName: String,
+        customerPhone: String,
+        deliveryNotes: String,
+        serviceFee: String
+    ): Result<Unit> {
+        return runCatching {
+            require(orderId.isNotBlank()) { "معرف الطلب غير صالح." }
+            require(destinationAddress.isNotBlank()) { "عنوان التوصيل مطلوب." }
+            require(serviceFee.isNotBlank()) { "خدمة التوصيل مطلوبة." }
+            functionsClient()
+                .getHttpsCallable("merchantUpdateOrderDetails")
+                .call(
+                    hashMapOf(
+                        "orderId" to orderId,
+                        "destinationAddress" to destinationAddress.trim(),
+                        "orderDetails" to orderDetails.trim(),
+                        "customerName" to customerName.trim(),
+                        "customerPhone" to customerPhone.trim(),
+                        "deliveryNotes" to deliveryNotes.trim(),
+                        "serviceFee" to serviceFee.trim()
+                    )
+                )
+                .await()
+            Unit
+        }
+    }
+
+    /**
      * Cancels a merchant-owned order through the server. The server validates the
      * merchant owner, lifecycle status and releases any captain reservation atomically.
      */
