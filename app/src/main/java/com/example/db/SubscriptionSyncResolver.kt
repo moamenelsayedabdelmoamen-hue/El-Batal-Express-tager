@@ -851,7 +851,7 @@ object SubscriptionSyncResolver {
                 price = planPrice,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = "paid",
+                paymentStatus = if (paymentMethod == "admin_manual" || rawPaymentStatus == "admin_manual") "admin_manual" else "paid",
                 subscriptionVersion = version,
                 updatedBy = updatedBy
             )
@@ -886,8 +886,8 @@ object SubscriptionSyncResolver {
             price = planPrice,
             activeCaptainsCount = activeCaptainsCount,
             availableCaptainSlots = availableSlots,
-            // Admin-activated active subscription is always treated as paid so stale unpaid flags cannot block requests
-            paymentStatus = "paid",
+            // Preserve explicit admin-granted activation without inventing a payment; ignore stale unpaid flags for ordinary active plans.
+            paymentStatus = if (paymentMethod == "admin_manual" || rawPaymentStatus == "admin_manual") "admin_manual" else "paid",
             paymentMethod = paymentMethod,
             subscriptionVersion = version,
             updatedBy = updatedBy
