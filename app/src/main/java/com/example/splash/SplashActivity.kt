@@ -141,6 +141,8 @@ class SplashActivity : ComponentActivity() {
                 .build()
 
             val player = ExoPlayer.Builder(this).build().apply {
+                // The intro video must always play silently in the merchant app.
+                volume = 0f
                 repeatMode = Player.REPEAT_MODE_OFF
                 addListener(playerListener)
                 setMediaItem(MediaItem.fromUri(rawVideoUri))
