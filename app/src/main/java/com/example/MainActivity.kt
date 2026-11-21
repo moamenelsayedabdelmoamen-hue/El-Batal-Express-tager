@@ -121,6 +121,10 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    FirebaseAppCheck.getInstance().installAppCheckProviderFactory(
+      if (BuildConfig.DEBUG) DebugAppCheckProviderFactory.getInstance()
+      else PlayIntegrityAppCheckProviderFactory.getInstance()
+    )
     com.example.splash.SplashSessionState.markCompleted()
     NetworkHelper.startMonitoring(this)
     try {
