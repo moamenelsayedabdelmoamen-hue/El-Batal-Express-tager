@@ -83,6 +83,35 @@ class MerchantMessagingService : FirebaseMessagingService() {
             }
         }
 
+        /**
+         * Detaches this installation's token from the merchant before logout so the next
+         * signed-in account cannot receive the previous merchant's notifications.
+         */
+        suspend fun clearCurrentFcmTokenForMerchant(uid: String) {
+            if (uid.isBlank()) return
+            try {
+                val token = Firebase.messaging.token.await()
+                val merchantRef = Firebase.firestore.collection("merchants").document(uid)
+                val snapshot = merchantRef.get().await()
+                if (snapshot.exists() && snapshot.getString("fcmToken") == token) {
+                    merchantRef.update(
+                        mapOf(
+                            "fcmToken" to FieldValue.delete(),
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    ).await()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to detach merchant FCM token: ${e.message}")
+            } finally {
+                try {
+                    Firebase.messaging.deleteToken().await()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to delete local FCM token: ${e.message}")
+                }
+            }
+        }
+
         private suspend fun persistTokenForCurrentMerchant(token: String) {
             val user = Firebase.auth.currentUser ?: return
             if (!user.isEmailVerified || token.isBlank()) return
