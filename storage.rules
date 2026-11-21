@@ -6,20 +6,28 @@ service firebase.storage {
       return request.auth != null;
     }
 
-    // Trusted DB-backed or token-verified admin check (matches firestore.rules)
+    // Must match the verified, active administrator policy in firestore.rules.
+    function isActiveAdminDocument() {
+      return isAuthenticated()
+        && 'email_verified' in request.auth.token
+        && request.auth.token.email_verified == true
+        && firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.role == 'admin'
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.emailVerified == true
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.status in ['active', 'approved'];
+    }
+
     function isAdmin() {
-      return isAuthenticated() && (
-        firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid)) ||
-        (
-          'email' in request.auth.token &&
-          request.auth.token.email in [
+      return isAuthenticated()
+        && 'email_verified' in request.auth.token
+        && request.auth.token.email_verified == true
+        && (
+          isActiveAdminDocument() ||
+          ('email' in request.auth.token && request.auth.token.email in [
             'moamen.elsayed.abdelmoamen@gmail.com',
             'admin@elbatalexpress.com'
-          ]
-        ) ||
-        ('role' in request.auth.token && request.auth.token.role == 'admin') ||
-        ('admin' in request.auth.token && request.auth.token.admin == true)
-      );
+          ])
+        );
     }
 
     // Trusted DB-backed merchant account check
