@@ -267,6 +267,11 @@ export async function runAutoDispatch(
     nowMs?: number;
   } = {}
 ): Promise<boolean> {
+  // Legacy merchant-app distribution is disabled. Dashboard Cloud Functions are the
+  // single authoritative dispatcher for every new order and captain offer.
+  console.warn(`[LegacyAutoDispatchDisabled] Order ${orderId} must be dispatched by Dashboard Functions.`);
+  return false;
+
   const targetDb = options.targetDb || db;
   const triggerSource = options.triggerSource || "onOrderCreated";
   const nowMs = options.nowMs ?? Date.now();
@@ -655,6 +660,9 @@ export const onOrderStatusChanged = functions.firestore
     const orderId = context.params.orderId;
     const afterData = change.after.data() || {};
     const beforeData = change.before.data() || {};
+
+    // Dashboard Functions own capacity release and captain cleanup for canonical orders.
+    if (afterData.dispatchAuthority === "dashboard_functions") return;
 
     const newStatus = String(afterData.status || "").toLowerCase().trim();
     const oldStatus = String(beforeData.status || "").toLowerCase().trim();
