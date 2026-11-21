@@ -1578,7 +1578,28 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
             val sdf = SimpleDateFormat("dd MMMM yyyy - hh:mm a", Locale("ar"))
             val currentDate = sdf.format(Date())
-            val formattedFee = if (serviceFee.isBlank()) "30 جنيه" else if (serviceFee.contains("جنيه")) serviceFee.trim() else "${serviceFee.trim()} جنيه"
+            // Delivery fee must be entered by the merchant; never invent a default.
+            val normalizedFeeInput = serviceFee.trim()
+                .replace("جنيه", "")
+                .replace("EGP", "", ignoreCase = true)
+                .replace(",", "")
+                .replace("٬", "")
+                .trim()
+                .map { ch ->
+                    when (ch) {
+                        in '٠'..'٩' -> ('0'.code + (ch.code - '٠'.code)).toChar()
+                        in '۰'..'۹' -> ('0'.code + (ch.code - '۰'.code)).toChar()
+                        else -> ch
+                    }
+                }.joinToString("")
+            val feeAmount = normalizedFeeInput.toIntOrNull()
+            if (feeAmount == null || feeAmount <= 0 || feeAmount > 100000) {
+                val feeMsg = "يرجى إدخال رسوم توصيل صحيحة من تطبيق التاجر (أكبر من صفر)."
+                _snackbarMessage.value = feeMsg
+                onError?.invoke(feeMsg)
+                return@launch
+            }
+            val formattedFee = "$" + "{feeAmount} جنيه"
             val uid = currentUser.uid
             val idempotencyKey = UUID.randomUUID().toString()
             val profile = _restaurantProfile.value
