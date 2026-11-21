@@ -732,7 +732,18 @@ class ManualVodafoneSubscriptionTest {
         assertEquals(1, configuredPlans.single().id)
         assertEquals(2, configuredPlans.single().maxCaptains)
         assertEquals(425, configuredPlans.single().priceEgp)
+        assertEquals(30, configuredPlans.single().durationDays)
         assertTrue(MerchantSubscriptionRepository.parseConfiguredPlans(emptyList<Any>()).isEmpty())
+
+        val nonThirtyDayPlan = MerchantSubscriptionRepository.parseConfiguredPlans(
+            listOf(mapOf("id" to 1, "maxCaptains" to 2, "price" to 425, "durationDays" to 45))
+        )
+        assertTrue("A non-30-day plan must not be shown", nonThirtyDayPlan.isEmpty())
+
+        val legacyPlanWithoutDuration = MerchantSubscriptionRepository.parseConfiguredPlans(
+            listOf(mapOf("id" to 1, "maxCaptains" to 2, "price" to 425))
+        )
+        assertEquals(30, legacyPlanWithoutDuration.single().durationDays)
 
         val requestId = "subreq_existing_resubmission_01"
         val resubmissionState = SubscriptionSyncResolver.resolve(

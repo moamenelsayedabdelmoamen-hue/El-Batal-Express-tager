@@ -220,8 +220,13 @@ class MerchantSubscriptionRepository {
                     ?: return@mapNotNull null
                 if (price <= 0) return@mapNotNull null
 
-                val durationDays = (map["durationDays"] as? Number)?.toInt()
-                    ?.takeIf { it in 1..365 } ?: return@mapNotNull null
+                // All official merchant plans are fixed at 30 days. Ignore a missing
+                // legacy field as 30, but never display a conflicting server duration.
+                val configuredDurationDays = (map["durationDays"] as? Number)?.toInt()
+                if (configuredDurationDays != null && configuredDurationDays != 30) {
+                    return@mapNotNull null
+                }
+                val durationDays = 30
                 val name = (map["planName"] ?: map["name"] ?: map["title"])
                     ?.toString()?.trim()?.takeIf { it.isNotBlank() }
                     ?: defaults.name
