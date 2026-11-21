@@ -378,7 +378,7 @@ service cloud.firestore {
 
     // --- 5. Orders Collection (Server-Authoritative Only) ---
     // - NO public or blanket authenticated reads.
-    // - Captains read ONLY their own assigned/offered orders OR unassigned 'pending' orders.
+    // - Captains read ONLY their own assigned orders or the single offer addressed to their UID.
     // - Merchants read ONLY orders belonging to their own store.
     // - Customers read ONLY their own orders.
     // - ZERO client writes by captains or regular users; all order mutations go exclusively through Cloud Functions (Admin SDK).
