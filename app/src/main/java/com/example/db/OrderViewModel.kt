@@ -1599,7 +1599,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 onError?.invoke(feeMsg)
                 return@launch
             }
-            val formattedFee = "$" + "{feeAmount} جنيه"
+            val formattedFee = "\${feeAmount} جنيه"
             val uid = currentUser.uid
             val idempotencyKey = UUID.randomUUID().toString()
             val profile = _restaurantProfile.value
