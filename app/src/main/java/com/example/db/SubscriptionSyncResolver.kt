@@ -301,13 +301,14 @@ object SubscriptionSyncResolver {
             ?: rejectionReason
             ?: data["reason"]?.toString()?.takeIf { it.isNotBlank() }
             ?: data["errorMessage"]?.toString()?.takeIf { it.isNotBlank() && normalized != "active" }
+        val explicitPaymentStatus = data["paymentStatus"]?.toString()?.trim()?.ifBlank { null }
         val derivedPaymentStatus = when (normalized) {
-            "active" -> "paid"
-            "pending_review" -> "pending_review"
-            "rejected" -> "rejected"
-            "resubmission_required" -> "resubmission_required"
-            "payment_failed", "pending_payment" -> "failed"
-            else -> data["paymentStatus"]?.toString()?.trim()?.ifBlank { null } ?: "unpaid"
+            "active" -> explicitPaymentStatus ?: "paid"
+            "pending_review" -> explicitPaymentStatus ?: "pending_review"
+            "rejected" -> explicitPaymentStatus ?: "rejected"
+            "resubmission_required" -> explicitPaymentStatus ?: "resubmission_required"
+            "payment_failed", "pending_payment" -> explicitPaymentStatus ?: "failed"
+            else -> explicitPaymentStatus ?: "unpaid"
         }
         return RawSubscriptionSnapshot(
             exists = rawStatus != "not_found",
