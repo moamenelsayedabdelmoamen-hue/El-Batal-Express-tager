@@ -24,18 +24,25 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isActiveAdminDocument() {
+      return isSignedIn()
+        && 'email_verified' in request.auth.token
+        && request.auth.token.email_verified == true
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin'
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.emailVerified == true
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.status in ['active', 'approved'];
+    }
+
     function isAdmin() {
-      return isSignedIn() && (
-        ('role' in request.auth.token && request.auth.token.role == 'admin') ||
-        ('admin' in request.auth.token && request.auth.token.admin == true) ||
-        (
-          'email_verified' in request.auth.token &&
-          request.auth.token.email_verified == true &&
-          'email' in request.auth.token &&
-          request.auth.token.email in ['moamen.elsayed.abdelmoamen@gmail.com', 'admin@elbatalexpress.com']
-        ) ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
+      return isSignedIn()
+        && 'email_verified' in request.auth.token
+        && request.auth.token.email_verified == true
+        && (
+          isActiveAdminDocument() ||
+          ('email' in request.auth.token &&
+           request.auth.token.email in ['moamen.elsayed.abdelmoamen@gmail.com', 'admin@elbatalexpress.com'])
+        );
     }
 
     function isCaptainAccount() {
@@ -487,8 +494,8 @@ service cloud.firestore {
     }
 
     match /settings/{settingId} {
-      allow read: if isAdmin() || isSignedIn();
-      // Sensitive configuration is changed only by trusted Admin SDK Cloud Functions.
+      // Only the public Vodafone Cash/plan configuration is readable by signed-in merchants.
+      allow read: if isAdmin() || (isSignedIn() && settingId == 'subscription_config');
       allow write: if false;
     }
 
