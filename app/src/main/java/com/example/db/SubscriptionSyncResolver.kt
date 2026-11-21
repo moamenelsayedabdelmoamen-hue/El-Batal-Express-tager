@@ -301,13 +301,14 @@ object SubscriptionSyncResolver {
             ?: rejectionReason
             ?: data["reason"]?.toString()?.takeIf { it.isNotBlank() }
             ?: data["errorMessage"]?.toString()?.takeIf { it.isNotBlank() && normalized != "active" }
+        val explicitPaymentStatus = data["paymentStatus"]?.toString()?.trim()?.ifBlank { null }
         val derivedPaymentStatus = when (normalized) {
-            "active" -> "paid"
-            "pending_review" -> "pending_review"
-            "rejected" -> "rejected"
-            "resubmission_required" -> "resubmission_required"
-            "payment_failed", "pending_payment" -> "failed"
-            else -> data["paymentStatus"]?.toString()?.trim()?.ifBlank { null } ?: "unpaid"
+            "active" -> explicitPaymentStatus ?: "paid"
+            "pending_review" -> explicitPaymentStatus ?: "pending_review"
+            "rejected" -> explicitPaymentStatus ?: "rejected"
+            "resubmission_required" -> explicitPaymentStatus ?: "resubmission_required"
+            "payment_failed", "pending_payment" -> explicitPaymentStatus ?: "failed"
+            else -> explicitPaymentStatus ?: "unpaid"
         }
         return RawSubscriptionSnapshot(
             exists = rawStatus != "not_found",
@@ -850,7 +851,7 @@ object SubscriptionSyncResolver {
                 price = planPrice,
                 activeCaptainsCount = activeCaptainsCount,
                 availableCaptainSlots = 0,
-                paymentStatus = "paid",
+                paymentStatus = if (paymentMethod == "admin_manual" || rawPaymentStatus == "admin_manual") "admin_manual" else "paid",
                 subscriptionVersion = version,
                 updatedBy = updatedBy
             )
@@ -885,8 +886,8 @@ object SubscriptionSyncResolver {
             price = planPrice,
             activeCaptainsCount = activeCaptainsCount,
             availableCaptainSlots = availableSlots,
-            // Admin-activated active subscription is always treated as paid so stale unpaid flags cannot block requests
-            paymentStatus = "paid",
+            // Preserve explicit admin-granted activation without inventing a payment; ignore stale unpaid flags for ordinary active plans.
+            paymentStatus = if (paymentMethod == "admin_manual" || rawPaymentStatus == "admin_manual") "admin_manual" else "paid",
             paymentMethod = paymentMethod,
             subscriptionVersion = version,
             updatedBy = updatedBy
