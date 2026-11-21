@@ -495,7 +495,7 @@ service cloud.firestore {
 
     match /settings/{settingId} {
       // Only the public Vodafone Cash/plan configuration is readable by signed-in merchants.
-      allow read: if isAdmin() || (isSignedIn() && settingId == 'subscription_config');
+      allow read: if isAdmin() || (isSignedIn() && settingId in ['subscription_config', 'manual_subscription_config']);
       allow write: if false;
     }
 
