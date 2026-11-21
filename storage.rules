@@ -6,10 +6,28 @@ service firebase.storage {
       return request.auth != null;
     }
 
-    // Trusted DB-backed admin check (never trusts spoofable client fields)
+    // Must match the verified, active administrator policy in firestore.rules.
+    function isActiveAdminDocument() {
+      return isAuthenticated()
+        && 'email_verified' in request.auth.token
+        && request.auth.token.email_verified == true
+        && firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.role == 'admin'
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.emailVerified == true
+        && firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)).data.status in ['active', 'approved'];
+    }
+
     function isAdmin() {
-      return isAuthenticated() &&
-        firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid));
+      return isAuthenticated()
+        && 'email_verified' in request.auth.token
+        && request.auth.token.email_verified == true
+        && (
+          isActiveAdminDocument() ||
+          ('email' in request.auth.token && request.auth.token.email in [
+            'moamen.elsayed.abdelmoamen@gmail.com',
+            'admin@elbatalexpress.com'
+          ])
+        );
     }
 
     // Trusted DB-backed merchant account check
@@ -106,22 +124,6 @@ service firebase.storage {
       allow delete: if isAdmin() || (isAuthenticated() && request.auth.uid == merchantId);
     }
 
-    // Merchant manual Vodafone Cash subscription payment receipts:
-    // merchants/{merchantId}/subscription_receipts/{fileName}
-    // - Read: ONLY the owning merchant or an admin.
-    // - Create: ONLY the owning merchant account with a validated image (<= 10 MB, jpg/png/webp).
-    // - Update/Delete: Admin only (receipts are immutable once submitted for audit integrity).
-    match /merchants/{merchantId}/subscription_receipts/{fileName} {
-      allow read: if isAuthenticated() && (
-        request.auth.uid == merchantId || isAdmin()
-      );
-      allow create: if isMerchantAccount()
-        && request.auth.uid == merchantId
-        && fileName.matches('^[A-Za-z0-9_\\-]{6,120}\\.(jpg|jpeg|png|webp)$')
-        && isValidImageUpload();
-      allow update, delete: if isAdmin();
-    }
-
     // 1. Captain Profile Photo: captains/{captainId}/profile/profile.jpg
     // - Read: ONLY the owning captain, an admin, or the specific merchant linked to an active order with this captain.
     //   Blanket read access across all captains by arbitrary merchants is DENIED.
@@ -139,8 +141,10 @@ service firebase.storage {
       );
 
       allow create, update: if isAuthenticated()
-        && request.auth.uid == captainId
-        && !isMerchantAccount()
+        && (
+          (request.auth.uid == captainId && !isMerchantAccount()) ||
+          isAdmin()
+        )
         && isValidImageUpload();
 
       allow delete: if isAdmin();
@@ -201,7 +205,77 @@ service firebase.storage {
       allow delete: if isAdmin();
     }
 
-    // 4. Default zero-trust deny for all other paths
+    // 4. Merchant assets: normal merchant media stays available to authenticated users,
+    // but legacy receipts under merchants/{merchantId}/subscription_receipts/** are private.
+    // Receipt access is granted only by the owner-scoped clause or the dedicated receipt match below.
+    match /merchants/{merchantId}/{allFiles=**} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == merchantId ||
+        isAdmin() ||
+        !allFiles.matches('subscription_receipts/.*')
+      );
+      allow create, update: if isAuthenticated()
+        && (request.auth.uid == merchantId || isAdmin())
+        && !allFiles.matches('subscription_receipts/.*')
+        && isValidImageUpload();
+      allow delete: if isAdmin();
+    }
+
+    // Legacy nested merchant receipt path used by the Android merchant app.
+    // Owners can create a new receipt object; existing objects remain immutable to merchants.
+    match /merchants/{merchantId}/subscription_receipts/{fileName} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == merchantId || isAdmin()
+      );
+      allow create: if isAuthenticated()
+        && isMerchantAccount()
+        && request.auth.uid == merchantId
+        && fileName.matches('^[A-Za-z0-9_\\-]{6,120}\\.(jpg|jpeg|png|webp)$')
+        && isValidImageUpload();
+      allow update, delete: if isAdmin();
+    }
+
+    match /restaurants/{merchantId}/{allFiles=**} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated()
+        && (request.auth.uid == merchantId || isAdmin())
+        && isValidImageUpload();
+      allow delete: if isAdmin();
+    }
+
+    match /logos/{allFiles=**} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAdmin() && isValidImageUpload();
+      allow delete: if isAdmin();
+    }
+
+    // 4.5 Manual Vodafone Cash Subscription Receipts:
+    // - Strictly private: ONLY the owning merchant or an admin can read the transfer receipt.
+    // - Upload: ONLY the owning merchant (verified merchant account + valid image MIME & <=10MB).
+    // - Delete: Admin only.
+    match /subscription_receipts/{merchantId}/{allFiles=**} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == merchantId || isAdmin()
+      );
+      allow create, update: if isAuthenticated()
+        && isMerchantAccount()
+        && request.auth.uid == merchantId
+        && isValidImageUpload();
+      allow delete: if isAdmin();
+    }
+
+    match /manual_subscription_receipts/{merchantId}/{allFiles=**} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == merchantId || isAdmin()
+      );
+      allow create, update: if isAuthenticated()
+        && isMerchantAccount()
+        && request.auth.uid == merchantId
+        && isValidImageUpload();
+      allow delete: if isAdmin();
+    }
+
+    // 5. Default zero-trust deny for all other paths
     match /{allPaths=**} {
       allow read, write: if false;
     }

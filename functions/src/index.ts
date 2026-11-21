@@ -267,6 +267,14 @@ export async function runAutoDispatch(
     nowMs?: number;
   } = {}
 ): Promise<boolean> {
+  // Distribution is disabled in the merchant repository. The Dashboard repository
+  // is the sole dispatcher; this opt-in guard exists only for controlled legacy recovery.
+  if (process.env.ENABLE_LEGACY_MERCHANT_DISPATCH !== "true") {
+    console.info(`[LegacyAutoDispatchDisabled] Order ${orderId} must be handled by Dashboard Functions.`);
+    return false;
+  }
+  if (orderData.dispatchAuthority === "dashboard_functions") return false;
+
   const targetDb = options.targetDb || db;
   const triggerSource = options.triggerSource || "onOrderCreated";
   const nowMs = options.nowMs ?? Date.now();
@@ -655,6 +663,9 @@ export const onOrderStatusChanged = functions.firestore
     const orderId = context.params.orderId;
     const afterData = change.after.data() || {};
     const beforeData = change.before.data() || {};
+
+    // Dashboard Functions own capacity release and captain cleanup for canonical orders.
+    if (afterData.dispatchAuthority === "dashboard_functions") return;
 
     const newStatus = String(afterData.status || "").toLowerCase().trim();
     const oldStatus = String(beforeData.status || "").toLowerCase().trim();

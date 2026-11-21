@@ -5,10 +5,10 @@
   "main": "lib/index.js",
   "scripts": {
     "build": "tsc",
-    "serve": "npm run build && firebase emulators:start --only functions",
-    "shell": "npm run build && firebase functions:shell",
-    "start": "npm run shell",
-    "deploy": "firebase deploy --only functions",
+    "serve": "node -e \"console.error(\\'Cloud Functions and Firebase rules are centrally managed in the Dashboard repository. Deployment from the Merchant app repository is disabled.\\'); process.exit(1)\"",
+    "shell": "node -e \"console.error(\\'Cloud Functions and Firebase rules are centrally managed in the Dashboard repository. Deployment from the Merchant app repository is disabled.\\'); process.exit(1)\"",
+    "start": "node -e \"console.error(\\'Cloud Functions and Firebase rules are centrally managed in the Dashboard repository. Deployment from the Merchant app repository is disabled.\\'); process.exit(1)\"",
+    "deploy": "node -e \"console.error(\\'Cloud Functions and Firebase rules are centrally managed in the Dashboard repository. Deployment from the Merchant app repository is disabled.\\'); process.exit(1)\"",
     "logs": "firebase functions:log"
   },
   "engines": {
