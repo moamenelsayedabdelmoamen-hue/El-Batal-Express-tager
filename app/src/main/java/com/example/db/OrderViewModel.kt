@@ -1693,88 +1693,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    @Deprecated("Order lifecycle transitions must use Dashboard Cloud Functions.")
     fun advanceOrderStatus(orderId: Int, currentStatus: String) {
-        val nextStatus = when (currentStatus.trim()) {
-            "جاري البحث", "جاري البحث عن كابتن", "في انتظار كابتن", "قيد التحضير", "Preparing", "pending" -> "في الطريق لك"
-            "في الطريق لك", "الكابتن في الطريق لك", "accepted", "في الطريق إلى المطعم" -> "جاري التوصيل"
-            "جاري التوصيل", "قيد التوصيل", "Out for Delivery", "delivering" -> "تم التسليم"
-            else -> "تم التسليم"
-        }
-
-        viewModelScope.launch {
-            val orders = repository.allOrders.firstOrNull() ?: emptyList()
-            val targetOrder = orders.find { it.id == orderId }
-
-            val currentDriverName = _driverProfile.value.name.trim()
-            val currentDriverPhone = _driverProfile.value.phone.trim()
-            val currentDriverPhoto = _driverProfile.value.photoUrl.trim().takeIf {
-                FirebaseStorageManager.isValidDisplayableCaptainPhoto(it)
-            } ?: ""
-
-            if ((nextStatus == "في الطريق لك" || nextStatus == "جاري التوصيل") &&
-                targetOrder != null &&
-                !FirebaseStorageManager.isValidCaptainName(targetOrder.captainName) &&
-                currentDriverName.isNotBlank()
-            ) {
-                repository.updateOrder(
-                    targetOrder.copy(
-                        status = nextStatus,
-                        captainName = currentDriverName,
-                        captainPhone = currentDriverPhone.ifBlank { targetOrder.captainPhone },
-                        captainPhotoUrl = currentDriverPhoto.ifBlank { targetOrder.captainPhotoUrl },
-                        estimatedArrival = targetOrder.estimatedArrival.ifBlank { "20 دقيقة" }
-                    )
-                )
-            } else {
-                repository.updateOrderStatus(orderId, nextStatus)
-            }
-
-            // Sync status with Firestore without ever overwriting real captain fields with placeholders
-            try {
-                val firestoreStatus = when (nextStatus) {
-                    "في الطريق لك" -> "accepted"
-                    "جاري التوصيل" -> "in_progress"
-                    "تم التسليم" -> "delivered"
-                    else -> nextStatus
-                }
-                val matchedDoc = findMerchantOrderDocument(orderId)
-                val updates = hashMapOf<String, Any>("status" to firestoreStatus)
-                if (currentDriverName.isNotBlank()) {
-                    updates["driver_name"] = currentDriverName
-                    updates["captainName"] = currentDriverName
-                }
-                if (currentDriverPhone.isNotBlank()) {
-                    updates["captainPhone"] = currentDriverPhone
-                }
-                matchedDoc?.reference?.update(updates)?.await()
-            } catch (e: Exception) {
-                Log.w("OrderViewModel", "Could not sync advance status to Firestore: ${e.message}")
-            }
-
-            // Trigger simulated push notification if transitioning from 'Preparing' to 'Out for Delivery'
-            if (nextStatus == "جاري التوصيل") {
-                val destination = targetOrder?.destinationAddress?.ifBlank { "العنوان المتردد" } ?: "العنوان المحدد"
-
-                val title = getApplication<Application>().getString(R.string.notification_out_for_delivery_title)
-                val body = getApplication<Application>().getString(R.string.notification_out_for_delivery_body, destination)
-                val timeSdf = SimpleDateFormat("hh:mm a", Locale("ar"))
-                val timeStr = timeSdf.format(Date())
-
-                // 1. Post actual System Notification
-                try {
-                    NotificationHelper.showOutForDeliveryNotification(getApplication(), destination)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-
-                // 2. Emit simulated push notification banner state
-                _pushNotificationState.value = PushNotificationBanner(
-                    title = title,
-                    body = body,
-                    timestamp = timeStr
-                )
-            }
-        }
+        Log.w(
+            "OrderViewModel",
+            "Ignoring legacy direct status update for order $orderId ($currentStatus). Use the server-authorized merchant confirmation flow."
+        )
+        _snackbarMessage.value = "تحديث حالة الطلب يتم من خلال إجراءات التأكيد المعتمدة على الخادم."
     }
 
     private suspend fun findMerchantOrderDocument(orderId: Any): DocumentSnapshot? {
