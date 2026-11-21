@@ -859,5 +859,36 @@ class SubscriptionSyncTest {
         )
         assertTrue(addressMissingMsg.contains("عنوان العميل"))
     }
-}
 
+    @Test
+    fun \`admin_manual_payment_status_is_preserved_and_does_not_block_captain_requests\`() {
+        val serverMap = mapOf(
+            "status" to "active",
+            "isActive" to true,
+            "isSubscribed" to true,
+            "paymentStatus" to "admin_manual",
+            "paymentMethod" to "admin_manual",
+            "planId" to 2,
+            "planName" to "باقة 4 كابتن",
+            "captainLimit" to 4,
+            "price" to 800,
+            "activatedAt" to nowMs - 1_000L,
+            "expiresAt" to nowMs + thirtyDaysMs,
+            "serverTimeMs" to nowMs,
+            "subscriptionVersion" to 9L
+        )
+        val raw = SubscriptionSyncResolver.fromServerCallableMap(serverMap)
+        assertEquals("admin_manual", raw.paymentStatus)
+
+        val resolved = SubscriptionSyncResolver.resolve(
+            subscriptionDoc = raw,
+            merchantDoc = RawSubscriptionSnapshot(exists = false),
+            isOnline = true,
+            nowMillis = nowMs,
+            hasVerifiedServerOnce = true
+        )
+        assertEquals("admin_manual", resolved.paymentStatus)
+        assertTrue(resolved.canRequestCaptain(nowMs))
+    }
+
+}
