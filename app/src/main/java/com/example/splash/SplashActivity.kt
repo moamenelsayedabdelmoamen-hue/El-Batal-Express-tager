@@ -141,6 +141,8 @@ class SplashActivity : ComponentActivity() {
                 .build()
 
             val player = ExoPlayer.Builder(this).build().apply {
+                // Intro branding video must always be silent; do not change device volume.
+                volume = 0f
                 repeatMode = Player.REPEAT_MODE_OFF
                 addListener(playerListener)
                 setMediaItem(MediaItem.fromUri(rawVideoUri))
