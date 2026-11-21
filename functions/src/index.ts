@@ -267,12 +267,13 @@ export async function runAutoDispatch(
     nowMs?: number;
   } = {}
 ): Promise<boolean> {
-  // Dashboard-owned orders must never enter the legacy merchant dispatcher.
-  // New merchant and admin orders are marked by Dashboard Functions at creation.
-  if (orderData.dispatchAuthority === "dashboard_functions") {
-    console.info(`[LegacyAutoDispatchSkipped] Dashboard Functions owns order ${orderId}.`);
+  // Distribution is disabled in the merchant repository. The Dashboard repository
+  // is the sole dispatcher; this opt-in guard exists only for controlled legacy recovery.
+  if (process.env.ENABLE_LEGACY_MERCHANT_DISPATCH !== "true") {
+    console.info(`[LegacyAutoDispatchDisabled] Order ${orderId} must be handled by Dashboard Functions.`);
     return false;
   }
+  if (orderData.dispatchAuthority === "dashboard_functions") return false;
 
   const targetDb = options.targetDb || db;
   const triggerSource = options.triggerSource || "onOrderCreated";
