@@ -119,6 +119,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import androidx.compose.material3.*
+import com.example.ui.subscription.MerchantPaymentsListContent
+import com.example.ui.subscription.SubscriptionHistoryAndRequestsContent
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
@@ -1613,13 +1615,14 @@ fun RegisterScreen(
 }
 
 data class Plan(
-    val id: Int,
+    val id: String,
     val captains: Int,
     val price: Int,
     val name: String,
     val subtitle: String,
     val isPopular: Boolean = false,
-    val durationDays: Int = 30
+    val durationDays: Int = 30,
+    val features: List<String> = emptyList()
 )
 
 @Composable
@@ -1629,24 +1632,41 @@ fun RegistrationSuccessScreen() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SubscriptionPlansScreen(
     onSkip: () -> Unit = {},
-    onProceedToVodafoneCash: (Int) -> Unit = {},
+    onProceedToVodafoneCash: (String) -> Unit = {},
+    onOpenPayments: () -> Unit = {},
     orderViewModel: OrderViewModel = viewModel()
 ) {
     LaunchedEffect(Unit) {
         orderViewModel.listenToFirestore()
         orderViewModel.loadVodafoneCashSettings()
+        orderViewModel.refreshPaymentsAndRequestsFromServer()
     }
 
     val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
+    val subscriptionPackages by orderViewModel.subscriptionPackages.collectAsStateWithLifecycle()
+    val isLoadingPackages by orderViewModel.isLoadingPackages.collectAsStateWithLifecycle()
+    val packagesError by orderViewModel.packagesError.collectAsStateWithLifecycle()
+    val subscriptionHistory by orderViewModel.subscriptionHistory.collectAsStateWithLifecycle()
+    val manualRequests by orderViewModel.manualSubscriptionRequests.collectAsStateWithLifecycle()
+    val merchantPayments by orderViewModel.merchantPayments.collectAsStateWithLifecycle()
+    val isLoadingPayments by orderViewModel.isLoadingPayments.collectAsStateWithLifecycle()
+    val paymentsError by orderViewModel.paymentsError.collectAsStateWithLifecycle()
     val vodafoneSettings by orderViewModel.vodafoneCashSettings.collectAsStateWithLifecycle()
     val clipboardManager = LocalClipboardManager.current
     val context = LocalContext.current
 
-    val plans = remember(vodafoneSettings.plans) {
-        vodafoneSettings.plans.map { opt ->
+    var selectedTabIndex by remember { mutableStateOf(0) }
+
+    val activePackageOptions = remember(subscriptionPackages, vodafoneSettings.plans) {
+        subscriptionPackages.ifEmpty { vodafoneSettings.plans }
+    }
+
+    val plans = remember(activePackageOptions) {
+        activePackageOptions.map { opt ->
             Plan(
                 id = opt.id,
                 captains = opt.maxCaptains,
@@ -1654,13 +1674,14 @@ fun SubscriptionPlansScreen(
                 name = opt.captainsLabel,
                 subtitle = opt.name,
                 isPopular = opt.isPopular,
-                durationDays = opt.durationDays
+                durationDays = opt.durationDays,
+                features = opt.features
             )
         }
     }
 
     var selectedPlanId by remember(subscriptionStatus.planId) {
-        mutableStateOf<Int?>(subscriptionStatus.planId.takeIf { it > 0 })
+        mutableStateOf<String?>(subscriptionStatus.planId.takeIf { it.isNotBlank() })
     }
 
     val isSubActive = subscriptionStatus.canRequestCaptain()
@@ -1688,10 +1709,79 @@ fun SubscriptionPlansScreen(
             onActionClick = onSkip
         )
 
+        PrimaryTabRow(
+            selectedTabIndex = selectedTabIndex,
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = Primary,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("subscription_section_tabs")
+        ) {
+            Tab(
+                selected = selectedTabIndex == 0,
+                onClick = { selectedTabIndex = 0 },
+                modifier = Modifier.testTag("subscription_tab_plans"),
+                text = {
+                    Text(
+                        text = stringResource(R.string.subscription_tab_plans),
+                        fontWeight = if (selectedTabIndex == 0) FontWeight.ExtraBold else FontWeight.Medium,
+                        maxLines = 1
+                    )
+                }
+            )
+            Tab(
+                selected = selectedTabIndex == 1,
+                onClick = { selectedTabIndex = 1 },
+                modifier = Modifier.testTag("subscription_tab_history"),
+                text = {
+                    Text(
+                        text = stringResource(R.string.subscription_tab_history),
+                        fontWeight = if (selectedTabIndex == 1) FontWeight.ExtraBold else FontWeight.Medium,
+                        maxLines = 1
+                    )
+                }
+            )
+            Tab(
+                selected = selectedTabIndex == 2,
+                onClick = { selectedTabIndex = 2 },
+                modifier = Modifier.testTag("subscription_tab_payments"),
+                text = {
+                    Text(
+                        text = stringResource(R.string.subscription_tab_payments),
+                        fontWeight = if (selectedTabIndex == 2) FontWeight.ExtraBold else FontWeight.Medium,
+                        maxLines = 1
+                    )
+                }
+            )
+        }
+
+        if (selectedTabIndex == 1) {
+            SubscriptionHistoryAndRequestsContent(
+                history = subscriptionHistory,
+                requests = manualRequests,
+                onResubmitPlan = { planId -> onProceedToVodafoneCash(planId) },
+                onRefresh = { orderViewModel.recheckSubscription() },
+                modifier = Modifier.weight(1f)
+            )
+            return@Column
+        }
+
+        if (selectedTabIndex == 2) {
+            MerchantPaymentsListContent(
+                payments = merchantPayments,
+                isLoading = isLoadingPayments,
+                errorMessage = paymentsError,
+                onRefresh = { orderViewModel.refreshPaymentsAndRequestsFromServer() },
+                modifier = Modifier.weight(1f)
+            )
+            return@Column
+        }
+
         LazyVerticalGrid(
             columns = GridCells.Fixed(2),
             modifier = Modifier
-                .fillMaxSize()
+                .weight(1f)
+                .fillMaxWidth()
                 .widthIn(max = 680.dp),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -1700,7 +1790,12 @@ fun SubscriptionPlansScreen(
             item(span = { GridItemSpan(maxLineSpan) }) {
                 SubscriptionStatusOverviewCard(
                     subscriptionStatus = subscriptionStatus,
-                    onRefresh = { orderViewModel.recheckSubscription() }
+                    onRefresh = { orderViewModel.recheckSubscription() },
+                    onViewHistoryClick = { selectedTabIndex = 1 },
+                    onViewPaymentsClick = {
+                        selectedTabIndex = 2
+                        onOpenPayments()
+                    }
                 )
             }
 
@@ -1863,38 +1958,82 @@ fun SubscriptionPlansScreen(
                 }
             }
 
-            items(plans) { plan ->
-                val matchesPlan = (subscriptionStatus.planId == plan.id) ||
-                    (subscriptionStatus.maxCaptains == plan.captains && subscriptionStatus.planName.contains(plan.subtitle))
-                val isCurrentActivePlan = isSubActive && matchesPlan
-                val isPendingThisPlan = isPendingReview && subscriptionStatus.planId == plan.id
-                val lockedMessage = when {
-                    isSubActive -> "لا يمكن تبديل أو تغيير الباقة إلا بعد انتهاء الباقة الحالية ($renewalDateText)"
-                    isPendingReview -> "لديك طلب اشتراك في انتظار مراجعة الإدارة حالياً ولا يمكن إرسال طلب آخر قبل قرار الإدارة."
-                    else -> ""
-                }
-                PlanCard(
-                    plan = plan,
-                    isSelected = isCurrentActivePlan || isPendingThisPlan || (!isSubscriptionLocked && selectedPlanId == plan.id),
-                    isCurrentActivePlan = isCurrentActivePlan,
-                    isPendingReviewPlan = isPendingThisPlan,
-                    isSubscriptionLocked = isSubscriptionLocked,
-                    onSelect = {
-                        if (isSubscriptionLocked) {
-                            Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
-                        } else {
-                            selectedPlanId = plan.id
-                        }
-                    },
-                    onSubscribe = {
-                        if (isSubscriptionLocked) {
-                            Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
-                        } else {
-                            selectedPlanId = plan.id
-                            onProceedToVodafoneCash(plan.id)
+            if (plans.isEmpty()) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("plans_empty_or_loading_card"),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(18.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            if (isLoadingPackages || vodafoneSettings.isLoading) {
+                                CircularProgressIndicator(color = Primary, modifier = Modifier.size(28.dp))
+                                Text(
+                                    text = "جاري تحميل الباقات المتاحة من السيرفر...",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else {
+                                Text(
+                                    text = packagesError ?: vodafoneSettings.loadError ?: "لا توجد باقات متاحة حالياً من الإدارة.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center
+                                )
+                                OutlinedButton(
+                                    onClick = { orderViewModel.loadVodafoneCashSettings() },
+                                    modifier = Modifier.heightIn(min = 48.dp)
+                                ) {
+                                    Text("إعادة تحميل الباقات")
+                                }
+                            }
                         }
                     }
-                )
+                }
+            } else {
+                items(plans, key = { it.id }) { plan ->
+                    val matchesPlan = com.example.db.SubscriptionSyncResolver.planIdsMatch(subscriptionStatus.planId, plan.id) ||
+                        (subscriptionStatus.maxCaptains == plan.captains && subscriptionStatus.planName.contains(plan.subtitle))
+                    val isCurrentActivePlan = isSubActive && matchesPlan
+                    val isPendingThisPlan = isPendingReview &&
+                        com.example.db.SubscriptionSyncResolver.planIdsMatch(subscriptionStatus.planId, plan.id)
+                    val lockedMessage = when {
+                        isSubActive -> "لا يمكن تبديل أو تغيير الباقة إلا بعد انتهاء الباقة الحالية ($renewalDateText)"
+                        isPendingReview -> "لديك طلب اشتراك في انتظار مراجعة الإدارة حالياً ولا يمكن إرسال طلب آخر قبل قرار الإدارة."
+                        else -> ""
+                    }
+                    PlanCard(
+                        plan = plan,
+                        isSelected = isCurrentActivePlan || isPendingThisPlan || (!isSubscriptionLocked && selectedPlanId == plan.id),
+                        isCurrentActivePlan = isCurrentActivePlan,
+                        isPendingReviewPlan = isPendingThisPlan,
+                        isSubscriptionLocked = isSubscriptionLocked,
+                        onSelect = {
+                            if (isSubscriptionLocked) {
+                                Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
+                            } else {
+                                selectedPlanId = plan.id
+                            }
+                        },
+                        onSubscribe = {
+                            if (isSubscriptionLocked) {
+                                Toast.makeText(context, lockedMessage, Toast.LENGTH_LONG).show()
+                            } else {
+                                selectedPlanId = plan.id
+                                onProceedToVodafoneCash(plan.id)
+                            }
+                        }
+                    )
+                }
             }
         }
     }
@@ -2036,16 +2175,31 @@ fun PlanCard(
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Spacer(modifier = Modifier.height(8.dp))
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.Add, contentDescription = null, tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(stringResource(R.string.feature_fast_delivery), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+            val displayedFeatures = if (plan.features.isNotEmpty()) {
+                plan.features.take(4)
+            } else {
+                listOf(
+                    stringResource(R.string.feature_fast_delivery),
+                    stringResource(R.string.feature_tech_support)
+                )
             }
-            Spacer(modifier = Modifier.height(4.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.Add, contentDescription = null, tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(stringResource(R.string.feature_tech_support), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+            displayedFeatures.forEachIndexed { idx, featureText ->
+                if (idx > 0) Spacer(modifier = Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.Add,
+                        contentDescription = null,
+                        tint = if (isLockedOtherPlan) MaterialTheme.colorScheme.onSurfaceVariant else Primary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = featureText,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2
+                    )
+                }
             }
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -2102,6 +2256,7 @@ fun RestaurantDashboardScreen(
     onViewAllOrders: () -> Unit,
     onRestaurantClick: () -> Unit = {},
     onPlansClick: () -> Unit = {},
+    onPaymentsClick: () -> Unit = {},
     onLogout: () -> Unit = {},
     onCaptainDashboardClick: () -> Unit = {},
     onEditOrder: ((Int) -> Unit)? = null,
@@ -2145,6 +2300,10 @@ fun RestaurantDashboardScreen(
                     onPlansClick = {
                         scope.launch { drawerState.close() }
                         onPlansClick()
+                    },
+                    onPaymentsClick = {
+                        scope.launch { drawerState.close() }
+                        onPaymentsClick()
                     },
                     onCaptainDashboardClick = {
                         scope.launch { drawerState.close() }
@@ -2480,6 +2639,7 @@ fun SideMenuContent(
     onRestaurantClick: () -> Unit,
     onViewAllOrders: () -> Unit,
     onPlansClick: () -> Unit,
+    onPaymentsClick: () -> Unit = {},
     onLogoutClick: () -> Unit,
     onCloseMenu: () -> Unit,
     onCaptainDashboardClick: () -> Unit = {}
@@ -2787,7 +2947,7 @@ fun SideMenuContent(
                             baseName
                         }
                     }
-                    subscriptionStatus.isPendingReview && subscriptionStatus.planId > 0 ->
+                    subscriptionStatus.isPendingReview && subscriptionStatus.planId.isNotBlank() ->
                         "${subscriptionStatus.planName} (قيد مراجعة الإدارة)"
                     subscriptionStatus.isResubmissionRequired ->
                         "مطلوب إعادة إرسال الإيصال"
@@ -2859,6 +3019,53 @@ fun SideMenuContent(
                         )
                         Text(
                             text = formattedRenewalDate,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Text(text = "❮", fontWeight = FontWeight.Bold, color = Primary)
+                }
+            }
+
+            // 3b. 🧾 سجل المدفوعات (Payments History)
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onPaymentsClick() }
+                    .testTag("side_menu_payments_button"),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                ),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF1B873F).copy(alpha = 0.14f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(text = "🧾", style = MaterialTheme.typography.titleMedium)
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = stringResource(R.string.menu_payments_history),
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "عرض جميع الدفعات المسجلة لحسابك من الإدارة",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

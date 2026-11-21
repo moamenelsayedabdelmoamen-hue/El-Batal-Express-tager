@@ -31,6 +31,10 @@ class MerchantMessagingService : FirebaseMessagingService() {
     override fun onNewToken(token: String) {
         super.onNewToken(token)
         Log.d(TAG, "FCM token refreshed")
+        if (token.isNotBlank()) {
+            fcmRegistrationHardFailed = false
+            lastKnownToken = token
+        }
         serviceScope.launch {
             persistTokenForCurrentMerchant(token)
         }
@@ -46,6 +50,8 @@ class MerchantMessagingService : FirebaseMessagingService() {
                 "SUBSCRIPTION_ACTIVATED" -> "تم تفعيل اشتراكك"
                 "SUBSCRIPTION_PLAN_CHANGED" -> "تم تحديث باقتك"
                 "SUBSCRIPTION_SUSPENDED" -> "تم إيقاف الاشتراك"
+                "SUBSCRIPTION_REJECTED" -> "تم رفض طلب الاشتراك"
+                "SUBSCRIPTION_RESUBMISSION_REQUIRED" -> "مطلوب إعادة إرسال الإيصال"
                 "SUBSCRIPTION_EXPIRED" -> "انتهت صلاحية اشتراكك"
                 "SUBSCRIPTION_EXPIRING_SOON" -> "تنبيه قرب انتهاء الاشتراك"
                 else -> "البطل إكسبريس"
@@ -71,15 +77,75 @@ class MerchantMessagingService : FirebaseMessagingService() {
         private val _subscriptionRefreshSignals = MutableSharedFlow<String>(extraBufferCapacity = 16)
         val subscriptionRefreshSignals: SharedFlow<String> = _subscriptionRefreshSignals.asSharedFlow()
 
-        suspend fun syncCurrentFcmTokenForMerchant(uid: String) {
-            if (uid.isBlank()) return
-            try {
-                val token = Firebase.messaging.token.await()
-                if (token.isNotBlank()) {
-                    persistToken(uid, token)
+        private val tokenSyncMutex = kotlinx.coroutines.sync.Mutex()
+
+        @Volatile
+        private var fcmRegistrationHardFailed: Boolean = false
+
+        @Volatile
+        private var lastSyncedUid: String? = null
+
+        @Volatile
+        private var lastKnownToken: String? = null
+
+        internal fun isHardRegistrationFailure(throwable: Throwable?): Boolean {
+            var current = throwable
+            while (current != null) {
+                val msg = current.message.orEmpty()
+                if (
+                    msg.contains("TOO_MANY_REGISTRATIONS", ignoreCase = true) ||
+                    msg.contains("MISSING_INSTANCEID_SERVICE", ignoreCase = true) ||
+                    msg.contains("INVALID_SENDER", ignoreCase = true)
+                ) {
+                    return true
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to sync current FCM token: ${e.message}")
+                current = current.cause
+            }
+            return false
+        }
+
+        internal fun resetSyncStateForTests() {
+            fcmRegistrationHardFailed = false
+            lastSyncedUid = null
+            lastKnownToken = null
+        }
+
+        suspend fun syncCurrentFcmTokenForMerchant(uid: String) {
+            val cleanUid = uid.trim()
+            if (cleanUid.isBlank() || fcmRegistrationHardFailed) return
+
+            tokenSyncMutex.lock()
+            try {
+                if (fcmRegistrationHardFailed) return
+                // Avoid hammering FirebaseInstanceId on every screen transition / listener re-attach.
+                if (lastSyncedUid == cleanUid && !lastKnownToken.isNullOrBlank()) {
+                    return
+                }
+
+                val token = try {
+                    Firebase.messaging.token.await()
+                } catch (e: Exception) {
+                    if (isHardRegistrationFailure(e)) {
+                        fcmRegistrationHardFailed = true
+                        runCatching { Firebase.messaging.isAutoInitEnabled = false }
+                        Log.w(
+                            TAG,
+                            "FCM registration hit hard device limit (TOO_MANY_REGISTRATIONS); disabling retries for this session. Firestore real-time sync remains active."
+                        )
+                    } else {
+                        Log.w(TAG, "Failed to sync current FCM token: ${e.message}")
+                    }
+                    return
+                }
+
+                if (token.isNotBlank()) {
+                    lastKnownToken = token
+                    runCatching { Firebase.messaging.isAutoInitEnabled = true }
+                    persistToken(cleanUid, token)
+                    lastSyncedUid = cleanUid
+                }
+            } finally {
+                tokenSyncMutex.unlock()
             }
         }
 
@@ -88,26 +154,48 @@ class MerchantMessagingService : FirebaseMessagingService() {
          * signed-in account cannot receive the previous merchant's notifications.
          */
         suspend fun clearCurrentFcmTokenForMerchant(uid: String) {
-            if (uid.isBlank()) return
+            val cleanUid = uid.trim()
+            if (cleanUid.isBlank()) return
+            val cachedToken = lastKnownToken
+            lastSyncedUid = null
+            if (fcmRegistrationHardFailed && cachedToken.isNullOrBlank()) {
+                return
+            }
+            var resolvedToken = cachedToken
             try {
-                val token = Firebase.messaging.token.await()
-                val merchantRef = Firebase.firestore.collection("merchants").document(uid)
-                val snapshot = merchantRef.get().await()
-                if (snapshot.exists() && snapshot.getString("fcmToken") == token) {
-                    merchantRef.update(
-                        mapOf(
-                            "fcmToken" to FieldValue.delete(),
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                    ).await()
+                if (resolvedToken.isNullOrBlank() && !fcmRegistrationHardFailed) {
+                    resolvedToken = Firebase.messaging.token.await()
+                }
+                if (!resolvedToken.isNullOrBlank()) {
+                    val merchantRef = Firebase.firestore.collection("merchants").document(cleanUid)
+                    val snapshot = merchantRef.get().await()
+                    if (snapshot.exists() && snapshot.getString("fcmToken") == resolvedToken) {
+                        merchantRef.update(
+                            mapOf(
+                                "fcmToken" to FieldValue.delete(),
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        ).await()
+                    }
                 }
             } catch (e: Exception) {
+                if (isHardRegistrationFailure(e)) {
+                    fcmRegistrationHardFailed = true
+                    runCatching { Firebase.messaging.isAutoInitEnabled = false }
+                }
                 Log.w(TAG, "Failed to detach merchant FCM token: ${e.message}")
             } finally {
-                try {
-                    Firebase.messaging.deleteToken().await()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to delete local FCM token: ${e.message}")
+                lastKnownToken = null
+                if (!fcmRegistrationHardFailed && !resolvedToken.isNullOrBlank()) {
+                    try {
+                        Firebase.messaging.deleteToken().await()
+                    } catch (e: Exception) {
+                        if (isHardRegistrationFailure(e)) {
+                            fcmRegistrationHardFailed = true
+                            runCatching { Firebase.messaging.isAutoInitEnabled = false }
+                        }
+                        Log.w(TAG, "Failed to delete local FCM token: ${e.message}")
+                    }
                 }
             }
         }
@@ -116,6 +204,7 @@ class MerchantMessagingService : FirebaseMessagingService() {
             val user = Firebase.auth.currentUser ?: return
             if (!user.isEmailVerified || token.isBlank()) return
             persistToken(user.uid, token)
+            lastSyncedUid = user.uid
         }
 
         private suspend fun persistToken(uid: String, token: String) {

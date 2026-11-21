@@ -87,6 +87,7 @@ import com.example.db.MerchantSubscriptionRepository
 import com.example.db.OrderViewModel
 import com.example.db.SubscriptionPlanOption
 import com.example.db.SubscriptionStatusState
+import com.example.db.SubscriptionSyncResolver
 import com.example.db.VodafoneCashSettings
 import com.example.ui.theme.Primary
 import java.text.SimpleDateFormat
@@ -154,7 +155,7 @@ fun resolveSubscriptionStatusVisual(status: SubscriptionStatusState): Subscripti
             containerColor = Color(0xFFECFDF3),
             isActive = true
         )
-        status.isPendingReview || status.isPending || status.status == "pending_review" || status.status == "pending" -> SubscriptionStatusVisual(
+        status.isPendingReview || status.isPending || status.status == "pending_review" || status.status == "pending" || status.paymentStatus.equals("pending_verification", ignoreCase = true) -> SubscriptionStatusVisual(
             badgeText = "قيد مراجعة الإدارة",
             headline = "قيد مراجعة الإدارة",
             subtitle = status.message ?: "تم استلام طلب الاشتراك وإيصال فودافون كاش. سيتم التفعيل فور موافقة الإدارة.",
@@ -162,7 +163,7 @@ fun resolveSubscriptionStatusVisual(status: SubscriptionStatusState): Subscripti
             containerColor = Color(0xFFFFFBEB),
             isActive = false
         )
-        status.isResubmissionRequired || status.status == "resubmission_required" -> SubscriptionStatusVisual(
+        status.isResubmissionRequired || status.status == "resubmission_required" || status.status == "resubmission_requested" || status.paymentStatus.equals("resubmission_requested", ignoreCase = true) || status.paymentStatus.equals("resubmission_required", ignoreCase = true) -> SubscriptionStatusVisual(
             badgeText = "مطلوب إعادة إرسال الإيصال",
             headline = "مطلوب إعادة إرسال الإيصال",
             subtitle = status.resubmissionReason ?: status.rejectionReason ?: status.message
@@ -228,7 +229,9 @@ private fun formatArabicSubscriptionDate(millis: Long?): String {
 fun SubscriptionStatusOverviewCard(
     subscriptionStatus: SubscriptionStatusState,
     onRefresh: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onViewHistoryClick: (() -> Unit)? = null,
+    onViewPaymentsClick: (() -> Unit)? = null
 ) {
     val visual = remember(subscriptionStatus) { resolveSubscriptionStatusVisual(subscriptionStatus) }
     val isActive = visual.isActive
@@ -396,45 +399,81 @@ fun SubscriptionStatusOverviewCard(
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
 
-            if (isActive || subscriptionStatus.isPendingReview || subscriptionStatus.isResubmissionRequired || subscriptionStatus.isExpired || subscriptionStatus.isSuspended) {
-                val planDisplay = if (subscriptionStatus.planId > 0 || subscriptionStatus.maxCaptains > 0) {
-                    val pricePart = if (subscriptionStatus.price > 0) " (${subscriptionStatus.price} ج.م)" else ""
-                    "${subscriptionStatus.planName}$pricePart"
-                } else {
-                    "لم يتم الاشتراك"
-                }
+            val hasPlanInfo = subscriptionStatus.planId.isNotBlank() || subscriptionStatus.maxCaptains > 0 || subscriptionStatus.planName.isNotBlank()
+            if (isActive || subscriptionStatus.isPendingReview || subscriptionStatus.isResubmissionRequired || subscriptionStatus.isExpired || subscriptionStatus.isSuspended || subscriptionStatus.isRejected || subscriptionStatus.isCancelled || hasPlanInfo) {
                 SubscriptionDetailRow(
                     label = if (subscriptionStatus.isPendingReview) "الباقة المطلوبة:" else "اسم الباقة:",
-                    value = planDisplay,
+                    value = subscriptionStatus.planName.ifBlank { "لم يتم الاشتراك" },
                     valueColor = if (isActive) Primary else MaterialTheme.colorScheme.onSurface
+                )
+            }
+
+            SubscriptionDetailRow(
+                label = "حالة الدفع:",
+                value = SubscriptionSyncResolver.formatPaymentStatusArabic(subscriptionStatus.paymentStatus),
+                valueColor = if (subscriptionStatus.paymentStatus.lowercase(Locale.ROOT) in setOf("paid", "admin_manual", "approved", "completed")) {
+                    StatusActiveGreen
+                } else {
+                    visual.accentColor
+                }
+            )
+
+            if (subscriptionStatus.maxCaptains > 0) {
+                SubscriptionDetailRow(
+                    label = "عدد الكباتن:",
+                    value = if (isActive) {
+                        "${subscriptionStatus.maxCaptains} كابتن (النشط الآن: ${subscriptionStatus.activeCaptainsCount}/${subscriptionStatus.maxCaptains})"
+                    } else {
+                        "${subscriptionStatus.maxCaptains} كابتن"
+                    },
+                    valueColor = MaterialTheme.colorScheme.onSurface
+                )
+            }
+
+            if (subscriptionStatus.durationDays > 0 && hasPlanInfo) {
+                SubscriptionDetailRow(
+                    label = "مدة الباقة:",
+                    value = "${subscriptionStatus.durationDays} يوماً",
+                    valueColor = MaterialTheme.colorScheme.onSurface
+                )
+            }
+
+            if (subscriptionStatus.price > 0) {
+                SubscriptionDetailRow(
+                    label = "السعر:",
+                    value = "${subscriptionStatus.price} ج.م",
+                    valueColor = Primary
+                )
+            }
+
+            if (startDateText != "—") {
+                SubscriptionDetailRow(
+                    label = "تاريخ البداية:",
+                    value = startDateText,
+                    valueColor = MaterialTheme.colorScheme.onSurface
+                )
+            }
+            if (endDateText != "—") {
+                SubscriptionDetailRow(
+                    label = "تاريخ الانتهاء:",
+                    value = endDateText,
+                    valueColor = if (subscriptionStatus.isExpired) StatusDangerRed else MaterialTheme.colorScheme.onSurface
                 )
             }
 
             if (isActive) {
                 SubscriptionDetailRow(
-                    label = "الحد الأقصى للكباتن:",
-                    value = "${subscriptionStatus.maxCaptains} كابتن (النشط الآن: ${subscriptionStatus.activeCaptainsCount}/${subscriptionStatus.maxCaptains})",
-                    valueColor = MaterialTheme.colorScheme.onSurface
-                )
-                if (startDateText != "—") {
-                    SubscriptionDetailRow(
-                        label = "تاريخ البداية:",
-                        value = startDateText,
-                        valueColor = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-                if (endDateText != "—") {
-                    SubscriptionDetailRow(
-                        label = "تاريخ الانتهاء:",
-                        value = endDateText,
-                        valueColor = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-                SubscriptionDetailRow(
                     label = "الأيام المتبقية:",
                     value = remainingText,
                     valueColor = StatusActiveGreen
                 )
+                if (!subscriptionStatus.paymentMethod.isNullOrBlank()) {
+                    SubscriptionDetailRow(
+                        label = "طريقة الدفع:",
+                        value = SubscriptionSyncResolver.formatPaymentMethodArabic(subscriptionStatus.paymentMethod),
+                        valueColor = MaterialTheme.colorScheme.onSurface
+                    )
+                }
             } else if (subscriptionStatus.isPendingReview) {
                 if (!subscriptionStatus.senderPhone.isNullOrBlank()) {
                     SubscriptionDetailRow(
@@ -450,12 +489,29 @@ fun SubscriptionStatusOverviewCard(
                         valueColor = StatusPendingAmber
                     )
                 }
-            } else if (subscriptionStatus.isExpired && endDateText != "—") {
-                SubscriptionDetailRow(
-                    label = "تاريخ الانتهاء:",
-                    value = endDateText,
-                    valueColor = StatusDangerRed
-                )
+            }
+
+            if (subscriptionStatus.features.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("subscription_features_section"),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "مميزات الباقة:",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    subscriptionStatus.features.forEach { feature ->
+                        Text(
+                            text = "• $feature",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
             }
 
             if (subscriptionStatus.isSuspended && !subscriptionStatus.suspensionReason.isNullOrBlank()) {
@@ -464,6 +520,52 @@ fun SubscriptionStatusOverviewCard(
                     value = subscriptionStatus.suspensionReason,
                     valueColor = StatusDangerRed
                 )
+            }
+
+            if (onViewHistoryClick != null || onViewPaymentsClick != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (onViewHistoryClick != null) {
+                        OutlinedButton(
+                            onClick = onViewHistoryClick,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Primary.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .testTag("overview_view_history_button")
+                        ) {
+                            Text(
+                                text = "الاشتراكات والطلبات",
+                                color = Primary,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                    if (onViewPaymentsClick != null) {
+                        OutlinedButton(
+                            onClick = onViewPaymentsClick,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Primary.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .testTag("overview_view_payments_button")
+                        ) {
+                            Text(
+                                text = "سجل المدفوعات",
+                                color = Primary,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
             }
 
             Row(
@@ -531,21 +633,29 @@ private fun SubscriptionDetailRow(
  */
 @Composable
 fun VodafoneCashPaymentScreen(
-    planId: Int,
+    planId: String,
     onBack: () -> Unit,
     onSubmitted: () -> Unit,
-    orderViewModel: OrderViewModel
+    orderViewModel: OrderViewModel,
+    onViewPaymentsClick: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     val vodafoneSettings by orderViewModel.vodafoneCashSettings.collectAsStateWithLifecycle()
+    val subscriptionPackages by orderViewModel.subscriptionPackages.collectAsStateWithLifecycle()
+    val isLoadingPackages by orderViewModel.isLoadingPackages.collectAsStateWithLifecycle()
     val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
     val manualUiState by orderViewModel.manualSubscriptionUiState.collectAsStateWithLifecycle()
 
-    val selectedPlan = remember(planId, vodafoneSettings.plans) {
-        vodafoneSettings.plans.firstOrNull { it.id == planId }
-            ?: VodafoneCashSettings.OFFICIAL_PLANS.firstOrNull { it.id == planId }
-            ?: VodafoneCashSettings.OFFICIAL_PLANS.first()
+    val availablePlans = remember(subscriptionPackages, vodafoneSettings.plans) {
+        subscriptionPackages.ifEmpty { vodafoneSettings.plans }
+    }
+    val selectedPlan = remember(planId, availablePlans) {
+        availablePlans.firstOrNull {
+            SubscriptionSyncResolver.planIdsMatch(it.id, planId) ||
+                SubscriptionSyncResolver.planIdsMatch(it.planKey, planId) ||
+                SubscriptionSyncResolver.planIdsMatch(it.packageId, planId)
+        }
     }
 
     var senderPhone by rememberSaveable(planId) { mutableStateOf("") }
@@ -576,9 +686,63 @@ fun VodafoneCashPaymentScreen(
         }
     }
 
+    if (selectedPlan == null) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            if (isLoadingPackages || vodafoneSettings.isLoading) {
+                CircularProgressIndicator(color = Primary)
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "جاري تحميل بيانات الباقة من السيرفر...",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = StatusPendingAmber,
+                    modifier = Modifier.size(40.dp)
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = "الباقة المطلوبة غير متاحة أو تم تعطيلها من الإدارة.",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.testTag("vodafone_plan_unavailable_text")
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedButton(
+                        onClick = { orderViewModel.loadVodafoneCashSettings() },
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
+                        Text("إعادة التحميل")
+                    }
+                    Button(
+                        onClick = onBack,
+                        colors = ButtonDefaults.buttonColors(containerColor = Primary),
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
+                        Text("رجوع للباقات", color = Color.White)
+                    }
+                }
+            }
+        }
+        return
+    }
+
     VodafoneCashPaymentContent(
         plan = selectedPlan,
-        settings = vodafoneSettings,
+        settings = vodafoneSettings.copy(plans = availablePlans),
         subscriptionStatus = subscriptionStatus,
         uiState = manualUiState,
         senderPhone = senderPhone,
@@ -636,7 +800,8 @@ fun VodafoneCashPaymentScreen(
             )
         },
         onSubmittedDone = onSubmitted,
-        onBack = onBack
+        onBack = onBack,
+        onViewPaymentsClick = onViewPaymentsClick
     )
 }
 
@@ -664,7 +829,8 @@ fun VodafoneCashPaymentContent(
     onBack: () -> Unit,
     notes: String = "",
     onNotesChange: (String) -> Unit = {},
-    onSubmittedDone: () -> Unit = onBack
+    onSubmittedDone: () -> Unit = onBack,
+    onViewPaymentsClick: (() -> Unit)? = null
 ) {
     val isSubmitting = uiState is ManualSubscriptionUiState.Submitting
     val submittedResult = (uiState as? ManualSubscriptionUiState.Submitted)?.result
@@ -672,8 +838,11 @@ fun VodafoneCashPaymentContent(
         subscriptionStatus.isPendingReview ||
         subscriptionStatus.status == "pending_review"
     val isSelectedPlanConfigured = settings.plans.any {
-        it.id == plan.id && it.maxCaptains == plan.maxCaptains &&
-            it.priceEgp == plan.priceEgp && it.durationDays == plan.durationDays
+        it.isActive && (
+            SubscriptionSyncResolver.planIdsMatch(it.id, plan.id) ||
+                SubscriptionSyncResolver.planIdsMatch(it.planKey, plan.planKey) ||
+                SubscriptionSyncResolver.planIdsMatch(it.packageId, plan.packageId)
+            )
     }
     val isPaymentFlowUnavailable = !settings.isConfiguredOnServer ||
         !settings.isAcceptingSubscriptions || !isSelectedPlanConfigured
@@ -807,7 +976,7 @@ fun VodafoneCashPaymentContent(
                                 color = Color(0xFF14532D)
                             )
                             Text(
-                                text = submittedResult.requestId,
+                                text = submittedResult.requestNumber.ifBlank { submittedResult.requestId },
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.ExtraBold,
                                 color = Color(0xFF14532D),
@@ -815,10 +984,20 @@ fun VodafoneCashPaymentContent(
                             )
                         }
 
+                        val submittedAmountStr = if (submittedResult.amount % 1.0 == 0.0) {
+                            "${submittedResult.amount.toInt()} ج.م"
+                        } else {
+                            String.format(Locale.US, "%.2f ج.م", submittedResult.amount)
+                        }
                         SubscriptionDetailRow(
                             label = "الباقة المطلوبة:",
-                            value = "${submittedResult.planName} (${submittedResult.expectedAmount} ج.م)",
+                            value = "${submittedResult.planName} ($submittedAmountStr)",
                             valueColor = Color(0xFF14532D)
+                        )
+                        SubscriptionDetailRow(
+                            label = "حالة الدفع:",
+                            value = SubscriptionSyncResolver.formatPaymentStatusArabic(submittedResult.paymentStatus),
+                            valueColor = StatusPendingAmber
                         )
 
                         Text(
@@ -974,6 +1153,25 @@ fun VodafoneCashPaymentContent(
                                     fontWeight = FontWeight.ExtraBold,
                                     color = Primary,
                                     modifier = Modifier.testTag("vodafone_cash_amount_text")
+                                )
+                            }
+                        }
+                    }
+
+                    if (plan.features.isNotEmpty()) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "مميزات الباقة:",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            plan.features.forEach { feature ->
+                                Text(
+                                    text = "• $feature",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
                                 )
                             }
                         }
@@ -1463,6 +1661,24 @@ fun VodafoneCashPaymentContent(
                         fontWeight = FontWeight.ExtraBold
                     )
                 }
+                }
+            }
+
+            if (onViewPaymentsClick != null) {
+                OutlinedButton(
+                    onClick = onViewPaymentsClick,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, Primary.copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("vodafone_open_payments_button")
+                ) {
+                    Text(
+                        text = "عرض سجل المدفوعات",
+                        color = Primary,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
 

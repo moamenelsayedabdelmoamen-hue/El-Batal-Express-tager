@@ -220,4 +220,16 @@
     <string name="subscription_status_resubmission_required">مطلوب إعادة إرسال الإيصال</string>
     <string name="subscription_status_expired">الاشتراك منتهي</string>
     <string name="subscription_status_suspended">الاشتراك موقوف</string>
+    <string name="subscription_tab_plans">الباقات والاشتراك</string>
+    <string name="subscription_tab_history">السجل والطلبات</string>
+    <string name="subscription_tab_payments">المدفوعات</string>
+    <string name="menu_payments_history">سجل المدفوعات</string>
+    <string name="payments_screen_title">المدفوعات</string>
+    <string name="payments_screen_subtitle">سجل جميع الدفعات المسجلة لحسابك</string>
+    <string name="payments_empty_title">لا توجد مدفوعات مسجلة حتى الآن</string>
+    <string name="payments_empty_subtitle">ستظهر هنا جميع الدفعات المسجلة من الإدارة أو عبر فودافون كاش فور تسجيلها.</string>
+    <string name="subscription_history_section_title">سجل الاشتراكات السابقة والحالية</string>
+    <string name="subscription_history_empty">لا يوجد سجل اشتراكات حتى الآن</string>
+    <string name="manual_requests_section_title">طلبات الاشتراك عبر فودافون كاش</string>
+    <string name="manual_requests_empty">لا توجد طلبات اشتراك مرسلة عبر فودافون كاش حتى الآن</string>
 </resources>

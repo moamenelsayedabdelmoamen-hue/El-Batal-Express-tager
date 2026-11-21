@@ -1,5 +1,6 @@
 package com.example
 
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -14,6 +15,7 @@ import com.example.db.ManualSubscriptionSubmissionResult
 import com.example.db.ManualSubscriptionUiState
 import com.example.db.MerchantSubscriptionRepository
 import com.example.db.RawSubscriptionSnapshot
+import com.example.db.SubscriptionPlanOption
 import com.example.db.SubscriptionStatusState
 import com.example.db.SubscriptionSyncResolver
 import com.example.db.VodafoneCashSettings
@@ -43,17 +45,49 @@ class ManualVodafoneSubscriptionTest {
     private val nowMs = System.currentTimeMillis()
     private val dayMs = 24L * 60L * 60L * 1000L
 
-    // 1. Official 4 plans catalog & prices preserved + Vodafone Cash UI elements
+    private val sampleServerPlans = listOf(
+        SubscriptionPlanOption(
+            id = "plan_2_captains",
+            name = "الباقة الأساسية",
+            captainsLabel = "2 كابتن",
+            maxCaptains = 2,
+            priceEgp = 400,
+            durationDays = 30
+        ),
+        SubscriptionPlanOption(
+            id = "plan_4_captains",
+            name = "الباقة المتوسطة",
+            captainsLabel = "4 كابتن",
+            maxCaptains = 4,
+            priceEgp = 800,
+            durationDays = 30
+        ),
+        SubscriptionPlanOption(
+            id = "plan_6_captains",
+            name = "الباقة المميزة",
+            captainsLabel = "6 كابتن",
+            maxCaptains = 6,
+            priceEgp = 1200,
+            durationDays = 30,
+            isPopular = true
+        ),
+        SubscriptionPlanOption(
+            id = "plan_8_captains",
+            name = "الباقة المتقدمة",
+            captainsLabel = "8 كابتن",
+            maxCaptains = 8,
+            priceEgp = 1600,
+            durationDays = 30
+        )
+    )
+
+    // 1. Dynamic server plans catalog & Vodafone Cash UI elements (no hardcoded plans in VodafoneCashSettings)
     @Test
-    fun scenario01_selectAllFourOfficialPlansAndRenderVodafoneCashElements() {
-        val plans = VodafoneCashSettings.OFFICIAL_PLANS
-        assertEquals(4, plans.size)
-        assertEquals(listOf(2, 4, 6, 8), plans.map { it.maxCaptains })
-        assertEquals(listOf(400, 800, 1200, 1600), plans.map { it.priceEgp })
-        assertTrue(plans.all { it.durationDays == 30 })
+    fun scenario01_selectServerPlansAndRenderVodafoneCashElements() {
+        assertTrue(VodafoneCashSettings().plans.isEmpty())
         assertEquals("", VodafoneCashSettings().walletNumber)
 
-        val chosenPlan = plans[2] // الباقة المميزة - 6 كابتن - 1200 ج.م
+        val chosenPlan = sampleServerPlans[2] // الباقة المميزة - 6 كابتن - 1200 ج.م
         var copiedWallet = ""
 
         composeTestRule.setContent {
@@ -63,6 +97,7 @@ class ManualVodafoneSubscriptionTest {
                     settings = VodafoneCashSettings(
                         walletNumber = "01099887766",
                         walletHolderName = "البطل إكسبريس",
+                        plans = sampleServerPlans,
                         isConfiguredOnServer = true,
                         isAcceptingSubscriptions = true
                     ),
@@ -102,15 +137,16 @@ class ManualVodafoneSubscriptionTest {
         composeTestRule.onNodeWithTag("upload_receipt_button").performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithTag("submit_manual_subscription_button").performScrollTo().assertIsDisplayed().assertIsEnabled()
 
-        // Verify dynamic Firebase plans parsing overrides prices/durations when provided
         val dynamicParsed = MerchantSubscriptionRepository.parseConfiguredPlans(
             listOf(
-                mapOf("id" to 1, "name" to "الباقة الأساسية", "maxCaptains" to 2, "price" to 450, "durationDays" to 30),
-                mapOf("id" to 2, "name" to "الباقة المتوسطة", "maxCaptains" to 4, "price" to 850, "durationDays" to 30)
+                mapOf("id" to "plan_basic", "name" to "الباقة الأساسية", "maxCaptains" to 2, "price" to 450, "durationDays" to 30),
+                mapOf("id" to "plan_pro", "name" to "الباقة المتوسطة", "maxCaptains" to 4, "price" to 850, "durationDays" to 30)
             )
         )
         assertEquals(2, dynamicParsed.size)
+        assertEquals("plan_basic", dynamicParsed[0].id)
         assertEquals(450, dynamicParsed[0].priceEgp)
+        assertEquals("plan_pro", dynamicParsed[1].id)
         assertEquals(850, dynamicParsed[1].priceEgp)
     }
 
@@ -138,11 +174,13 @@ class ManualVodafoneSubscriptionTest {
         composeTestRule.setContent {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
-                    plan = VodafoneCashSettings.OFFICIAL_PLANS[0],
-                    settings = VodafoneCashSettings(walletNumber = "01099887766",
-                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                    plan = sampleServerPlans[0],
+                    settings = VodafoneCashSettings(
+                        walletNumber = "01099887766",
+                        plans = sampleServerPlans,
                         isConfiguredOnServer = true,
-                        isAcceptingSubscriptions = true),
+                        isAcceptingSubscriptions = true
+                    ),
                     subscriptionStatus = SubscriptionStatusState(status = "unsubscribed"),
                     uiState = ManualSubscriptionUiState.Idle,
                     senderPhone = "01012345678",
@@ -169,7 +207,7 @@ class ManualVodafoneSubscriptionTest {
     // 3. Block submission without receipt image (both validation & UI)
     @Test
     fun scenario03_blockSubmissionWithoutReceiptImage() {
-        val plan = VodafoneCashSettings.OFFICIAL_PLANS[1]
+        val plan = sampleServerPlans[1]
         val unsubscribed = SubscriptionStatusState(status = "unsubscribed")
 
         val errMissingReceipt = MerchantSubscriptionRepository.validateManualSubscriptionInput(
@@ -198,16 +236,17 @@ class ManualVodafoneSubscriptionTest {
         assertNull(validResult)
         assertEquals("01012345678", MerchantSubscriptionRepository.normalizeEgyptianMobile("+20 101 234 5678"))
 
-        // Verify UI surfaces inline validation error when submitting without receipt
         var submitted = false
         composeTestRule.setContent {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = plan,
-                    settings = VodafoneCashSettings(walletNumber = "01099887766",
-                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                    settings = VodafoneCashSettings(
+                        walletNumber = "01099887766",
+                        plans = sampleServerPlans,
                         isConfiguredOnServer = true,
-                        isAcceptingSubscriptions = true),
+                        isAcceptingSubscriptions = true
+                    ),
                     subscriptionStatus = unsubscribed,
                     uiState = ManualSubscriptionUiState.Idle,
                     senderPhone = "01012345678",
@@ -233,7 +272,7 @@ class ManualVodafoneSubscriptionTest {
     // 4. Prevent duplicate request when pending_review or active
     @Test
     fun scenario04_preventDuplicateSubmissionWhenPendingReviewOrActive() {
-        val plan = VodafoneCashSettings.OFFICIAL_PLANS[0]
+        val plan = sampleServerPlans[0]
         val pendingState = SubscriptionStatusState(
             isPending = true,
             isPendingReview = true,
@@ -243,7 +282,7 @@ class ManualVodafoneSubscriptionTest {
         val activeState = SubscriptionStatusState(
             isSubscribed = true,
             status = "active",
-            planId = 1,
+            planId = "plan_2_captains",
             planName = "الباقة الأساسية",
             maxCaptains = 2,
             paymentStatus = "paid",
@@ -271,10 +310,12 @@ class ManualVodafoneSubscriptionTest {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
                     plan = plan,
-                    settings = VodafoneCashSettings(walletNumber = "01099887766",
-                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                    settings = VodafoneCashSettings(
+                        walletNumber = "01099887766",
+                        plans = sampleServerPlans,
                         isConfiguredOnServer = true,
-                        isAcceptingSubscriptions = true),
+                        isAcceptingSubscriptions = true
+                    ),
                     subscriptionStatus = pendingState,
                     uiState = ManualSubscriptionUiState.Idle,
                     senderPhone = "01012345678",
@@ -297,32 +338,29 @@ class ManualVodafoneSubscriptionTest {
         composeTestRule.onNodeWithTag("submit_manual_subscription_button").performScrollTo().assertIsNotEnabled()
     }
 
-    // 5. Payload serialization matches Cloud Function `submitManualSubscriptionRequest` contract + Submitted requestId confirmation card
+    // 5. Payload serialization matches Cloud Function `submitManualSubscriptionRequest` contract (no client price override)
     @Test
     fun scenario05_manualSubscriptionPayloadMatchesCloudFunctionContract() {
         val payload = ManualSubscriptionRequestPayload(
             merchantId = "merchant_123",
-            planId = 4,
-            planName = "الباقة المتقدمة",
-            maxCaptains = 8,
-            expectedAmount = 1600,
+            planId = "plan_8_captains",
             senderPhone = "01012345678",
             transactionReference = "VF-990011",
-            receiptStoragePath = "merchants/merchant_123/subscription_receipts/subreq_99.jpg",
-            requestId = "subreq_99",
+            receiptImagePath = "merchants/merchant_123/subscription_receipts/subreq_99.jpg",
+            idempotencyKey = "subreq_99",
             notes = "تحويل من محفظة الفرع الرئيسي"
         )
         val map = payload.toCallableMap()
         assertEquals("merchant_123", map["merchantId"])
-        assertEquals(4, map["planId"])
-        assertEquals(4, map["packageId"])
-        assertEquals("الباقة المتقدمة", map["planName"])
-        assertEquals(8, map["maxCaptains"])
-        assertEquals(1600, map["expectedAmount"])
-        assertEquals(1600, map["amount"])
+        assertEquals("plan_8_captains", map["planId"])
+        assertEquals("plan_8_captains", map["packageId"])
+        assertEquals("plan_8_captains", map["planKey"])
+        assertFalse("Client must not send authoritative amount override", map.containsKey("amount"))
+        assertFalse("Client must not send authoritative expectedAmount override", map.containsKey("expectedAmount"))
         assertEquals("01012345678", map["senderPhone"])
         assertEquals("VF-990011", map["transactionReference"])
         assertEquals("تحويل من محفظة الفرع الرئيسي", map["notes"])
+        assertEquals("merchants/merchant_123/subscription_receipts/subreq_99.jpg", map["receiptImagePath"])
         assertEquals("merchants/merchant_123/subscription_receipts/subreq_99.jpg", map["receiptStoragePath"])
         assertEquals("subreq_99", map["requestId"])
         assertEquals("subreq_99", map["idempotencyKey"])
@@ -331,22 +369,26 @@ class ManualVodafoneSubscriptionTest {
         composeTestRule.setContent {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
                 VodafoneCashPaymentContent(
-                    plan = VodafoneCashSettings.OFFICIAL_PLANS[3],
-                    settings = VodafoneCashSettings(walletNumber = "01099887766",
-                        plans = VodafoneCashSettings.OFFICIAL_PLANS,
+                    plan = sampleServerPlans[3],
+                    settings = VodafoneCashSettings(
+                        walletNumber = "01099887766",
+                        plans = sampleServerPlans,
                         isConfiguredOnServer = true,
-                        isAcceptingSubscriptions = true),
+                        isAcceptingSubscriptions = true
+                    ),
                     subscriptionStatus = SubscriptionStatusState(status = "pending_review", isPendingReview = true),
                     uiState = ManualSubscriptionUiState.Submitted(
                         ManualSubscriptionSubmissionResult(
                             requestId = "subreq_99",
+                            requestNumber = "REQ-2026-0099",
                             status = "pending_review",
-                            planId = 4,
+                            paymentStatus = "pending_verification",
+                            planId = "plan_8_captains",
                             planName = "الباقة المتقدمة",
                             maxCaptains = 8,
-                            expectedAmount = 1600,
+                            amount = 1600.0,
                             durationDays = 30,
-                            receiptStoragePath = "merchants/merchant_123/subscription_receipts/subreq_99.jpg",
+                            receiptImagePath = "merchants/merchant_123/subscription_receipts/subreq_99.jpg",
                             subscriptionVersion = 2L,
                             message = "تم إرسال طلب الاشتراك بنجاح وهو الآن قيد مراجعة الإدارة."
                         )
@@ -371,13 +413,13 @@ class ManualVodafoneSubscriptionTest {
         }
 
         composeTestRule.onNodeWithTag("manual_subscription_submitted_card").assertIsDisplayed()
-        composeTestRule.onNodeWithTag("submitted_request_id_text").assertIsDisplayed().assertTextEquals("subreq_99")
+        composeTestRule.onNodeWithTag("submitted_request_id_text").assertIsDisplayed().assertTextEquals("REQ-2026-0099")
         composeTestRule.onNodeWithTag("submitted_status_text").assertIsDisplayed().assertTextEquals("قيد مراجعة الإدارة")
         composeTestRule.onNodeWithTag("submitted_done_button").performClick()
         assertTrue(doneClicked)
     }
 
-    // 6. Displaying "في انتظار مراجعة الإدارة" state clearly in UI
+    // 6. Displaying "قيد مراجعة الإدارة" state clearly in UI
     @Test
     fun scenario06_displayPendingReviewStateInUi() {
         val resolved = SubscriptionSyncResolver.resolve(
@@ -386,7 +428,7 @@ class ManualVodafoneSubscriptionTest {
                 status = "pending_review",
                 isActive = false,
                 isSubscribed = false,
-                planId = 2,
+                planId = "plan_4_captains",
                 planName = "الباقة المتوسطة",
                 price = 800,
                 maxCaptains = 0,
@@ -429,7 +471,7 @@ class ManualVodafoneSubscriptionTest {
                 status = "pending_review",
                 isActive = false,
                 isSubscribed = false,
-                planId = 3,
+                planId = "plan_6_captains",
                 planName = "الباقة المميزة",
                 price = 1200,
                 subscriptionVersion = 2L
@@ -446,10 +488,12 @@ class ManualVodafoneSubscriptionTest {
                 isActive = true,
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 3,
+                planId = "plan_6_captains",
                 planName = "الباقة المميزة",
                 maxCaptains = 6,
                 price = 1200,
+                durationDays = 30,
+                features = listOf("توصيل سريع", "دعم فني"),
                 startDateMillis = nowMs,
                 approvedAtMillis = nowMs,
                 endDateMillis = nowMs + 30 * dayMs,
@@ -479,15 +523,24 @@ class ManualVodafoneSubscriptionTest {
 
         composeTestRule.setContent {
             ElBatalExpressTheme(darkTheme = false, dynamicColor = false) {
-                SubscriptionStatusOverviewCard(
-                    subscriptionStatus = after,
-                    onRefresh = {}
-                )
+                androidx.compose.foundation.layout.Column(
+                    modifier = androidx.compose.ui.Modifier.verticalScroll(
+                        androidx.compose.foundation.rememberScrollState()
+                    )
+                ) {
+                    SubscriptionStatusOverviewCard(
+                        subscriptionStatus = after,
+                        onRefresh = {}
+                    )
+                }
             }
         }
 
-        composeTestRule.onNodeWithText("الباقة المميزة (1200 ج.م)").assertIsDisplayed()
-        composeTestRule.onNodeWithText("6 كابتن (النشط الآن: 1/6)").assertIsDisplayed()
+        composeTestRule.onNodeWithText("الباقة المميزة").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithText("1200 ج.م").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithText("30 يوماً").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithText("6 كابتن (النشط الآن: 1/6)").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("subscription_features_section").performScrollTo().assertIsDisplayed()
     }
 
     // 8. Immediate Admin rejection -> rejected UI + rejectionReason displayed + transition notification
@@ -497,7 +550,7 @@ class ManualVodafoneSubscriptionTest {
             isPending = true,
             isPendingReview = true,
             status = "pending_review",
-            planId = 2
+            planId = "plan_4_captains"
         )
         val rejectionText = "المبلغ المحول أقل من قيمة الباقة المختارة"
         val after = SubscriptionSyncResolver.resolve(
@@ -507,7 +560,7 @@ class ManualVodafoneSubscriptionTest {
                 isActive = false,
                 isSubscribed = false,
                 paymentStatus = "rejected",
-                planId = 2,
+                planId = "plan_4_captains",
                 planName = "الباقة المتوسطة",
                 maxCaptains = 0,
                 price = 800,
@@ -568,7 +621,7 @@ class ManualVodafoneSubscriptionTest {
                     status = st,
                     isActive = false,
                     isSubscribed = false,
-                    planId = 1,
+                    planId = "plan_2_captains",
                     maxCaptains = 2,
                     endDateMillis = if (st == "expired") nowMs - dayMs else nowMs + 10 * dayMs,
                     subscriptionVersion = 1L
@@ -581,14 +634,13 @@ class ManualVodafoneSubscriptionTest {
             assertFalse("Status $st must NEVER allow requesting captains", resolved.canRequestCaptain(nowMs))
         }
 
-        // Also ensure unverified offline cache can never grant access
         val offlineActiveCache = SubscriptionSyncResolver.resolve(
             subscriptionDoc = RawSubscriptionSnapshot(
                 exists = true,
                 status = "active",
                 isActive = true,
                 isSubscribed = true,
-                planId = 2,
+                planId = "plan_4_captains",
                 maxCaptains = 4,
                 endDateMillis = nowMs + 15 * dayMs,
                 isFromCache = true
@@ -619,7 +671,7 @@ class ManualVodafoneSubscriptionTest {
                 isActive = true,
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 1,
+                planId = "plan_2_captains",
                 planName = "الباقة الأساسية",
                 maxCaptains = 2,
                 price = 400,
@@ -646,7 +698,7 @@ class ManualVodafoneSubscriptionTest {
             isPending = true,
             isPendingReview = true,
             status = "pending_review",
-            planId = 2
+            planId = "plan_4_captains"
         )
         val resubReason = "صورة إيصال فودافون كاش غير واضحة، يرجى رفع صورة كاملة تظهر رقم العملية"
         val after = SubscriptionSyncResolver.resolve(
@@ -656,10 +708,11 @@ class ManualVodafoneSubscriptionTest {
                 isActive = false,
                 isSubscribed = false,
                 paymentStatus = "resubmission_required",
-                planId = 2,
+                planId = "plan_4_captains",
                 planName = "الباقة المتوسطة",
                 maxCaptains = 0,
                 price = 800,
+                pendingRequestId = "subreq_resubmit_001",
                 resubmissionReason = resubReason,
                 subscriptionVersion = 5L
             ),
@@ -675,9 +728,8 @@ class ManualVodafoneSubscriptionTest {
         assertFalse(after.canRequestCaptain(nowMs))
         assertEquals("مطلوب إعادة إرسال الإيصال", resolveSubscriptionStatusVisual(after).badgeText)
 
-        // Merchant MUST be allowed to validate & submit a new receipt while in resubmission_required
         val validationErr = MerchantSubscriptionRepository.validateManualSubscriptionInput(
-            plan = VodafoneCashSettings.OFFICIAL_PLANS[1],
+            plan = sampleServerPlans[1],
             senderPhone = "01012345678",
             receiptLocalUri = "content://media/picker/0/new_receipt",
             currentSubscription = after
@@ -706,8 +758,10 @@ class ManualVodafoneSubscriptionTest {
         composeTestRule.onNodeWithTag("subscription_resubmission_reason_box").assertIsDisplayed()
         composeTestRule.onNodeWithTag("subscription_resubmission_reason_text").assertIsDisplayed().assertTextEquals(resubReason)
     }
+
+    // 12. Dynamic arbitrary server planIds & captain limits (including > 8 captains) + resubmission keeps original request
     @Test
-    fun scenario12_serverPlanIdsAndReceiptResubmissionKeepTheOriginalRequest() {
+    fun scenario12_serverPlanIdsAndArbitraryCaptainLimitsAndReceiptResubmission() {
         val configuredPlans = MerchantSubscriptionRepository.parseConfiguredPlans(
             listOf(
                 mapOf(
@@ -720,18 +774,22 @@ class ManualVodafoneSubscriptionTest {
                 ),
                 mapOf(
                     "planId" to "plan_12_captains",
-                    "planName" to "باقة غير مدعومة بالتطبيق",
+                    "planName" to "باقة 12 كابتن للشركات",
                     "maxCaptains" to 12,
-                    "price" to 900,
-                    "durationDays" to 30,
+                    "price" to 2400,
+                    "durationDays" to 60,
                     "isActive" to true
                 )
             )
         )
-        assertEquals(1, configuredPlans.size)
-        assertEquals(1, configuredPlans.single().id)
-        assertEquals(2, configuredPlans.single().maxCaptains)
-        assertEquals(425, configuredPlans.single().priceEgp)
+        assertEquals(2, configuredPlans.size)
+        assertEquals("plan_2_captains", configuredPlans[0].id)
+        assertEquals(2, configuredPlans[0].maxCaptains)
+        assertEquals(425, configuredPlans[0].priceEgp)
+        assertEquals("plan_12_captains", configuredPlans[1].id)
+        assertEquals(12, configuredPlans[1].maxCaptains)
+        assertEquals(2400, configuredPlans[1].priceEgp)
+        assertEquals(60, configuredPlans[1].durationDays)
         assertTrue(MerchantSubscriptionRepository.parseConfiguredPlans(emptyList<Any>()).isEmpty())
 
         val requestId = "subreq_existing_resubmission_01"
@@ -741,7 +799,7 @@ class ManualVodafoneSubscriptionTest {
                 status = "resubmission_required",
                 isActive = false,
                 isSubscribed = false,
-                planId = 2,
+                planId = "plan_4_captains",
                 planName = "الباقة المتوسطة",
                 paymentMethod = "vodafone_cash_manual",
                 pendingRequestId = requestId,
@@ -755,7 +813,7 @@ class ManualVodafoneSubscriptionTest {
         assertTrue(resubmissionState.isResubmissionRequired)
         assertEquals(requestId, resubmissionState.pendingRequestId)
 
-        val plan = VodafoneCashSettings.OFFICIAL_PLANS[1]
+        val plan = sampleServerPlans[1]
         assertNotNull(
             MerchantSubscriptionRepository.validateManualSubscriptionInput(
                 plan = plan,
@@ -773,6 +831,4 @@ class ManualVodafoneSubscriptionTest {
             )
         )
     }
-
-
 }

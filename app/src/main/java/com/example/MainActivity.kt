@@ -53,6 +53,7 @@ import androidx.navigation.toRoute
 import com.example.db.OrderViewModel
 import com.example.network.NetworkHelper
 import com.example.notification.MerchantMessagingService
+import com.example.ui.subscription.MerchantPaymentsScreen
 import com.example.ui.subscription.VodafoneCashPaymentScreen
 import com.example.ui.theme.ElBatalExpressTheme
 import com.example.ui.theme.ThemeManager
@@ -84,7 +85,10 @@ object RegistrationSuccessRoute
 object SubscriptionRoute
 
 @Serializable
-data class VodafoneCashPaymentRoute(val planId: Int)
+object PaymentsRoute
+
+@Serializable
+data class VodafoneCashPaymentRoute(val planId: String)
 
 @Serializable
 object RestaurantDashboardRoute
@@ -178,7 +182,8 @@ class MainActivity : ComponentActivity() {
         val navBackStackEntry by navController.currentBackStackEntryAsState()
         val currentRouteString = navBackStackEntry?.destination?.route.orEmpty()
         val isOnSubscriptionRoute = currentRouteString.contains("SubscriptionRoute") ||
-          currentRouteString.contains("VodafoneCashPaymentRoute")
+          currentRouteString.contains("VodafoneCashPaymentRoute") ||
+          currentRouteString.contains("PaymentsRoute")
         val context = LocalContext.current
 
         Box(modifier = Modifier.fillMaxSize()) {
@@ -256,8 +261,25 @@ class MainActivity : ComponentActivity() {
                   onProceedToVodafoneCash = { planId ->
                     navController.navigate(VodafoneCashPaymentRoute(planId))
                   },
+                  onOpenPayments = { navController.navigate(PaymentsRoute) },
                   orderViewModel = orderViewModel
                 )
+              }
+              composable<PaymentsRoute> {
+                androidx.compose.runtime.LaunchedEffect(Unit) {
+                  val authUser = Firebase.auth.currentUser
+                  if (authUser == null || !authUser.isEmailVerified) {
+                    navController.navigate(LoginRoute) {
+                      popUpTo(0) { inclusive = true }
+                    }
+                  }
+                }
+                if (Firebase.auth.currentUser?.isEmailVerified == true) {
+                  MerchantPaymentsScreen(
+                    onBack = { navController.popBackStack() },
+                    orderViewModel = orderViewModel
+                  )
+                }
               }
               composable<VodafoneCashPaymentRoute> { backStackEntry ->
                 androidx.compose.runtime.LaunchedEffect(Unit) {
@@ -274,7 +296,8 @@ class MainActivity : ComponentActivity() {
                     planId = route.planId,
                     onBack = { navController.popBackStack() },
                     onSubmitted = { navController.popBackStack() },
-                    orderViewModel = orderViewModel
+                    orderViewModel = orderViewModel,
+                    onViewPaymentsClick = { navController.navigate(PaymentsRoute) }
                   )
                 }
               }
@@ -309,6 +332,7 @@ class MainActivity : ComponentActivity() {
                     onViewAllOrders = { navController.navigate(OrderHistoryRoute) },
                     onRestaurantClick = { navController.navigate(RestaurantDetailsRoute) },
                     onPlansClick = { navController.navigate(SubscriptionRoute) },
+                    onPaymentsClick = { navController.navigate(PaymentsRoute) },
                     onCaptainDashboardClick = {
                       android.widget.Toast.makeText(context, "لوحة الكابتن مخصصة لتطبيق الكباتن فقط", android.widget.Toast.LENGTH_SHORT).show()
                     },

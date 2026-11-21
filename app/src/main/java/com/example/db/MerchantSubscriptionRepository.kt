@@ -13,21 +13,28 @@ import com.google.firebase.firestore.firestore
 import com.google.firebase.functions.FirebaseFunctionsException
 import com.google.firebase.functions.functions
 import kotlinx.coroutines.tasks.await
+import java.util.concurrent.atomic.AtomicBoolean
+
+fun interface CloudFunctionInvoker {
+    suspend fun call(region: String, functionName: String, payload: Any): Any?
+}
 
 data class CaptainRequestResult(
     val orderId: String,
     val orderCode: String,
-    val planId: Int = 0,
+    val planId: String = "",
     val planName: String = "",
     val captainLimit: Int = 0,
     val activeCaptainsCount: Int = 0,
     val remainingCaptains: Int = 0,
     val subscriptionVersion: Long = 1L,
-    val message: String = "تم إنشاء طلب التوصيل بنجاح"
+    val message: String = "تم إنشاء طلب التوصيل بنجاح",
+    val isReplay: Boolean = false
 )
 
 data class ServerSubscriptionFetchResult(
     val subscriptionSnapshot: RawSubscriptionSnapshot? = null,
+    val subscriptionHistoryDocs: List<RawSubscriptionSnapshot> = emptyList(),
     val merchantDocument: DocumentSnapshot? = null,
     val activeCaptainsCount: Int? = null,
     val verifiedFromServer: Boolean = false,
@@ -42,14 +49,23 @@ data class ServerSubscriptionValidationResult(
 )
 
 data class SubscriptionPlanOption(
-    val id: Int,
+    val id: String,
     val name: String,
     val captainsLabel: String,
     val maxCaptains: Int,
     val priceEgp: Int,
     val durationDays: Int = 30,
-    val isPopular: Boolean = false
-)
+    val isPopular: Boolean = false,
+    val planKey: String = id,
+    val packageId: String = id,
+    val features: List<String> = emptyList(),
+    val description: String = "",
+    val isActive: Boolean = true,
+    val displayOrder: Int = Int.MAX_VALUE
+) {
+    val planId: String get() = id
+    val captainLimit: Int get() = maxCaptains
+}
 
 data class VodafoneCashSettings(
     val walletNumber: String = "",
@@ -61,92 +77,60 @@ data class VodafoneCashSettings(
     val pauseMessage: String? = null,
     val isLoading: Boolean = false,
     val loadError: String? = null
-) {
-    companion object {
-        // Official 4 subscription plans matching server OFFICIAL_SUBSCRIPTION_PLANS (prices preserved untouched)
-        val OFFICIAL_PLANS: List<SubscriptionPlanOption> = listOf(
-            SubscriptionPlanOption(
-                id = 1,
-                name = "الباقة الأساسية",
-                captainsLabel = "2 كابتن",
-                maxCaptains = 2,
-                priceEgp = 400,
-                durationDays = 30,
-                isPopular = false
-            ),
-            SubscriptionPlanOption(
-                id = 2,
-                name = "الباقة المتوسطة",
-                captainsLabel = "4 كابتن",
-                maxCaptains = 4,
-                priceEgp = 800,
-                durationDays = 30,
-                isPopular = false
-            ),
-            SubscriptionPlanOption(
-                id = 3,
-                name = "الباقة المميزة",
-                captainsLabel = "6 كابتن",
-                maxCaptains = 6,
-                priceEgp = 1200,
-                durationDays = 30,
-                isPopular = true
-            ),
-            SubscriptionPlanOption(
-                id = 4,
-                name = "الباقة المتقدمة",
-                captainsLabel = "8 كابتن",
-                maxCaptains = 8,
-                priceEgp = 1600,
-                durationDays = 30,
-                isPopular = false
-            )
-        )
-    }
-}
+)
 
+/**
+ * Manual Vodafone Cash subscription request payload sent to `submitManualSubscriptionRequest`.
+ * The server authoritatively determines package price, captain limit, and duration from `planId`
+ * in `subscription_packages` — the client NEVER dictates the authoritative price.
+ */
 data class ManualSubscriptionRequestPayload(
     val merchantId: String,
-    val planId: Int,
-    val planName: String,
-    val maxCaptains: Int,
-    val expectedAmount: Int,
+    val planId: String,
+    val planKey: String = planId,
+    val packageId: String = planId,
     val senderPhone: String,
     val transactionReference: String,
-    val receiptStoragePath: String,
-    val requestId: String,
+    val receiptImagePath: String,
+    val idempotencyKey: String,
     val notes: String = ""
 ) {
+    val requestId: String get() = idempotencyKey
+    val receiptStoragePath: String get() = receiptImagePath
+
     fun toCallableMap(): HashMap<String, Any> = hashMapOf(
         "merchantId" to merchantId,
         "planId" to planId,
-        "packageId" to planId,
-        "planName" to planName,
-        "maxCaptains" to maxCaptains,
-        "expectedAmount" to expectedAmount,
-        "amount" to expectedAmount,
+        "planKey" to planKey.ifBlank { planId },
+        "packageId" to packageId.ifBlank { planId },
         "senderPhone" to senderPhone,
         "transactionReference" to transactionReference,
-        "notes" to notes,
-        "receiptStoragePath" to receiptStoragePath,
-        "requestId" to requestId,
-        "idempotencyKey" to requestId
+        "receiptImagePath" to receiptImagePath,
+        "receiptStoragePath" to receiptImagePath,
+        "idempotencyKey" to idempotencyKey,
+        "requestId" to idempotencyKey,
+        "notes" to notes
     )
 }
 
 data class ManualSubscriptionSubmissionResult(
     val requestId: String,
+    val requestNumber: String,
     val status: String,
-    val planId: Int,
+    val paymentStatus: String,
+    val planId: String,
     val planName: String,
     val maxCaptains: Int,
-    val expectedAmount: Int,
+    val amount: Double,
     val durationDays: Int,
-    val receiptStoragePath: String,
+    val receiptImagePath: String,
     val subscriptionVersion: Long,
     val message: String,
     val isReplay: Boolean = false
-)
+) {
+    val expectedAmount: Int get() = amount.toInt()
+    val receiptStoragePath: String get() = receiptImagePath
+}
 
 sealed class ManualSubscriptionUiState {
     data object Idle : ManualSubscriptionUiState()
@@ -157,18 +141,33 @@ sealed class ManualSubscriptionUiState {
 
 /**
  * Central repository bridging the Merchant Android App with:
- * 1. Real-time Firestore snapshot listeners (`subscriptions/{uid}` and `merchants/{uid}`) with MetadataChanges.INCLUDE.
- * 2. Initial & on-demand `Source.SERVER` verification + Firebase Cloud Functions (`getMerchantSubscription`, `validateMerchantSubscription`, `requestCaptains`).
+ * 1. Real-time Firestore snapshot listeners (`subscriptions`, `subscription_packages`, `subscription_history`,
+ *    `manual_subscription_requests`, `payments`, `settings/manual_subscription_config`, `merchants/{uid}`).
+ * 2. Initial & on-demand `Source.SERVER` verification + authoritative Cloud Functions
+ *    (`merchantCreateOrder`, `submitManualSubscriptionRequest`, `getMerchantSubscription`, `validateMerchantSubscription`).
  * 3. FCM device token persistence for instant subscription sync push signals.
  */
-class MerchantSubscriptionRepository {
+class MerchantSubscriptionRepository(
+    private val callableInvoker: CloudFunctionInvoker = defaultFirebaseCallableInvoker()
+) {
+
+    private val orderRequestInFlight = AtomicBoolean(false)
+    private val inFlightIdempotencyKeys = mutableSetOf<String>()
 
     companion object {
         private const val TAG = "MerchantSubRepo"
         const val FUNCTIONS_REGION = "us-central1"
-        const val PRIMARY_ORDER_FUNCTION = "requestCaptains"
-        const val LEGACY_SERVER_ORDER_FUNCTION = "createOrderWithCode"
+        const val PRIMARY_ORDER_FUNCTION = "merchantCreateOrder"
         const val MANUAL_SUBSCRIPTION_FUNCTION = "submitManualSubscriptionRequest"
+
+        private fun defaultFirebaseCallableInvoker(): CloudFunctionInvoker =
+            CloudFunctionInvoker { region, functionName, payload ->
+                Firebase.functions(region)
+                    .getHttpsCallable(functionName)
+                    .call(payload)
+                    .await()
+                    .getData()
+            }
 
         fun normalizeEgyptianMobile(rawPhone: String?): String? {
             val cleaned = rawPhone?.trim()?.replace(Regex("[\\s\\-()]"), "").orEmpty()
@@ -183,58 +182,167 @@ class MerchantSubscriptionRepository {
         }
 
         /**
-         * Parses the server-authored plan catalog by captain limit and excludes inactive or
-         * unsupported plans. No local price catalog is used as a payment fallback.
+         * Builds the official `merchantCreateOrder` callable payload matching Dashboard validators.ts.
+         */
+        fun buildMerchantCreateOrderPayload(
+            merchantId: String,
+            destinationAddress: String,
+            deliveryFeeAmount: Int,
+            formattedServiceFee: String,
+            customerName: String,
+            customerPhone: String,
+            orderDetails: String,
+            deliveryNotes: String,
+            merchantName: String,
+            merchantPhone: String,
+            merchantLatitude: Double?,
+            merchantLongitude: Double?,
+            customerLatitude: Double?,
+            customerLongitude: Double?,
+            idempotencyKey: String,
+            requestedCaptains: Int = 1
+        ): HashMap<String, Any?> {
+            val trimmedAddress = destinationAddress.trim()
+            val trimmedKey = idempotencyKey.trim()
+            return hashMapOf(
+                "merchantId" to merchantId.trim(),
+                "destinationAddress" to trimmedAddress,
+                "address" to trimmedAddress,
+                "serviceFee" to formattedServiceFee,
+                "deliveryFee" to deliveryFeeAmount,
+                "price" to formattedServiceFee,
+                "customerName" to customerName.trim(),
+                "customerPhone" to customerPhone.trim(),
+                "orderDetails" to orderDetails.trim(),
+                "deliveryNotes" to deliveryNotes.trim(),
+                "notes" to deliveryNotes.trim(),
+                "merchantName" to merchantName.trim(),
+                "merchantPhone" to merchantPhone.trim(),
+                "merchantLatitude" to merchantLatitude,
+                "merchantLongitude" to merchantLongitude,
+                "customerLatitude" to customerLatitude,
+                "customerLongitude" to customerLongitude,
+                "requestedCaptains" to requestedCaptains.coerceAtLeast(1),
+                "captainsCount" to requestedCaptains.coerceAtLeast(1),
+                "idempotencyKey" to trimmedKey,
+                "requestId" to trimmedKey
+            )
+        }
+
+        /**
+         * Parses a single package map from Firestore `subscription_packages` or settings config.
+         * Supports arbitrary string planIds (no forced numeric conversion) and any positive captain limit.
+         * Excludes inactive packages (`isActive == false`).
+         */
+        fun parseSubscriptionPackageMap(
+            docId: String,
+            map: Map<*, *>
+        ): SubscriptionPlanOption? {
+            if (map["isActive"] == false) return null
+            if (map["enabled"] == false) return null
+
+            val resolvedPlanId = SubscriptionSyncResolver.parsePlanIdString(
+                rawPlanId = map["planId"],
+                rawPlanKey = map["planKey"],
+                rawPackageId = map["packageId"]
+            ) ?: docId.trim().takeIf { it.isNotBlank() } ?: return null
+
+            val resolvedPlanKey = SubscriptionSyncResolver.parsePlanIdString(
+                rawPlanId = map["planKey"],
+                rawPlanKey = map["planId"],
+                rawPackageId = map["packageId"]
+            ) ?: resolvedPlanId
+
+            val resolvedPackageId = SubscriptionSyncResolver.parsePlanIdString(
+                rawPlanId = map["packageId"],
+                rawPlanKey = map["planId"],
+                rawPackageId = map["planKey"]
+            ) ?: resolvedPlanId
+
+            val configuredLimit = (map["maxCaptains"] as? Number)?.toInt()
+                ?: (map["captainLimit"] as? Number)?.toInt()
+                ?: (map["captainsLimit"] as? Number)?.toInt()
+                ?: map["maxCaptains"]?.toString()?.toIntOrNull()
+                ?: map["captainLimit"]?.toString()?.toIntOrNull()
+                ?: return null
+            if (configuredLimit <= 0) return null
+
+            val price = (map["price"] as? Number)?.toInt()
+                ?: (map["priceEgp"] as? Number)?.toInt()
+                ?: (map["amount"] as? Number)?.toInt()
+                ?: map["price"]?.toString()?.toDoubleOrNull()?.toInt()
+                ?: return null
+            if (price <= 0) return null
+
+            val durationDays = (map["durationDays"] as? Number)?.toInt()
+                ?: (map["duration"] as? Number)?.toInt()
+                ?: map["durationDays"]?.toString()?.toIntOrNull()
+                ?: 30
+            if (durationDays !in 1..3650) return null
+
+            val name = (map["planName"] ?: map["packageName"] ?: map["name"] ?: map["title"])
+                ?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: "باقة $configuredLimit كابتن"
+
+            val featuresList = SubscriptionSyncResolver.parseFeaturesList(map["features"])
+            val description = (map["description"] ?: map["subtitle"])
+                ?.toString()?.trim().orEmpty()
+            val displayOrder = (map["sortOrder"] as? Number)?.toInt()
+                ?: (map["order"] as? Number)?.toInt()
+                ?: (map["displayOrder"] as? Number)?.toInt()
+                ?: Int.MAX_VALUE
+
+            return SubscriptionPlanOption(
+                id = resolvedPlanId,
+                name = name,
+                captainsLabel = "$configuredLimit كابتن",
+                maxCaptains = configuredLimit,
+                priceEgp = price,
+                durationDays = durationDays,
+                isPopular = (map["isPopular"] as? Boolean) == true,
+                planKey = resolvedPlanKey,
+                packageId = resolvedPackageId,
+                features = featuresList,
+                description = description,
+                isActive = true,
+                displayOrder = displayOrder
+            )
+        }
+
+        /**
+         * Parses a list of `subscription_packages` entries `(docId to dataMap)`, filtering out
+         * disabled/invalid packages and sorting cleanly without hardcoded captain-count limits.
+         */
+        fun parseSubscriptionPackages(
+            entries: List<Pair<String, Map<*, *>>>
+        ): List<SubscriptionPlanOption> {
+            return entries.mapNotNull { (docId, map) ->
+                parseSubscriptionPackageMap(docId, map)
+            }.distinctBy { it.id }
+                .sortedWith(
+                    compareBy<SubscriptionPlanOption>(
+                        { it.displayOrder },
+                        { it.maxCaptains },
+                        { it.priceEgp },
+                        { it.name }
+                    )
+                )
+        }
+
+        /**
+         * Parses dynamic plans array from `settings/manual_subscription_config` (legacy compatibility
+         * if `subscription_packages` is empty), supporting arbitrary string planIds and captain limits.
          */
         fun parseConfiguredPlans(rawPlans: Any?): List<SubscriptionPlanOption> {
             val list = rawPlans as? List<*> ?: return emptyList()
-            return list.mapNotNull { entry ->
-                val map = entry as? Map<*, *> ?: return@mapNotNull null
-                if (map["isActive"] == false) return@mapNotNull null
-
-                val legacyId = (map["id"] as? Number)?.toInt()
-                    ?: (map["packageId"] as? Number)?.toInt()
-                    ?: (map["planId"] as? Number)?.toInt()
-                val configuredLimit = (map["maxCaptains"] as? Number)?.toInt()
-                    ?: (map["captainLimit"] as? Number)?.toInt()
-                    ?: when (legacyId) {
-                        1 -> 2
-                        2 -> 4
-                        3 -> 6
-                        4 -> 8
-                        else -> null
-                    }
-                    ?: return@mapNotNull null
-
-                val canonicalId = when (configuredLimit) {
-                    2 -> 1
-                    4 -> 2
-                    6 -> 3
-                    8 -> 4
-                    else -> return@mapNotNull null
-                }
-                val defaults = VodafoneCashSettings.OFFICIAL_PLANS.first { it.id == canonicalId }
-                val price = (map["price"] as? Number)?.toInt()
-                    ?: (map["priceEgp"] as? Number)?.toInt()
-                    ?: (map["amount"] as? Number)?.toInt()
-                    ?: return@mapNotNull null
-                if (price <= 0) return@mapNotNull null
-
-                val durationDays = (map["durationDays"] as? Number)?.toInt()
-                    ?.takeIf { it in 1..365 } ?: return@mapNotNull null
-                val name = (map["planName"] ?: map["name"] ?: map["title"])
+            val pairs = list.mapIndexedNotNull { idx, entry ->
+                val map = entry as? Map<*, *> ?: return@mapIndexedNotNull null
+                val fallbackId = (map["planId"] ?: map["planKey"] ?: map["packageId"] ?: map["id"])
                     ?.toString()?.trim()?.takeIf { it.isNotBlank() }
-                    ?: defaults.name
-                SubscriptionPlanOption(
-                    id = canonicalId,
-                    name = name,
-                    captainsLabel = "$configuredLimit كابتن",
-                    maxCaptains = configuredLimit,
-                    priceEgp = price,
-                    durationDays = durationDays,
-                    isPopular = (map["isPopular"] as? Boolean) ?: defaults.isPopular
-                )
-            }.distinctBy { it.maxCaptains }.sortedBy { it.id }
+                    ?: "plan_$idx"
+                fallbackId to map
+            }
+            return parseSubscriptionPackages(pairs)
         }
 
         /**
@@ -250,14 +358,17 @@ class MerchantSubscriptionRepository {
             if (currentSubscription.canRequestCaptain()) {
                 return "لديك باقة نشطة وسارية حالياً ولا يمكن إرسال طلب اشتراك جديد قبل انتهائها."
             }
-            if (currentSubscription.isPendingReview || currentSubscription.status == "pending_review") {
+            if (currentSubscription.isPendingReview ||
+                currentSubscription.status == "pending_review" ||
+                SubscriptionSyncResolver.normalizePaymentStatus(currentSubscription.paymentStatus) == "pending_verification"
+            ) {
                 return "لديك بالفعل طلب اشتراك قيد مراجعة الإدارة حالياً. يرجى انتظار قرار الإدارة."
             }
             if (currentSubscription.isResubmissionRequired && currentSubscription.pendingRequestId.isNullOrBlank()) {
                 return "تعذر العثور على رقم طلب الاشتراك المطلوب إعادة إرساله. حدّث حالة الاشتراك من السيرفر ثم حاول مرة أخرى."
             }
-            if (plan == null || plan.id !in 1..4 || plan.maxCaptains !in listOf(2, 4, 6, 8) || plan.priceEgp <= 0) {
-                return "يرجى اختيار إحدى الباقات الرسمية المتاحة."
+            if (plan == null || !plan.isActive || plan.id.isBlank() || plan.maxCaptains <= 0 || plan.priceEgp <= 0) {
+                return "يرجى اختيار إحدى الباقات المتاحة والنشطة حالياً."
             }
             if (normalizeEgyptianMobile(senderPhone) == null) {
                 return "يرجى إدخال رقم هاتف مصري صحيح المحوَّل منه (يبدأ بـ 01 ومكون من 11 رقم)."
@@ -266,6 +377,105 @@ class MerchantSubscriptionRepository {
                 return "يجب رفع صورة إيصال التحويل عبر فودافون كاش قبل إرسال الطلب للمراجعة."
             }
             return null
+        }
+
+        /**
+         * Parses `submitManualSubscriptionRequest` response strictly from server values
+         * (`amount`, `requestNumber`, `paymentStatus`, `planId`, `planName`, `maxCaptains`).
+         */
+        fun parseManualSubscriptionResponse(
+            data: Map<*, *>,
+            payload: ManualSubscriptionRequestPayload,
+            fallbackPlanName: String = "",
+            fallbackMaxCaptains: Int = 0,
+            fallbackDurationDays: Int = 30
+        ): ManualSubscriptionSubmissionResult {
+            val requestId = (data["requestId"] ?: data["id"])
+                ?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: payload.idempotencyKey
+            val requestNumber = data["requestNumber"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: requestId
+            val status = data["status"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: "pending_review"
+            val paymentStatus = SubscriptionSyncResolver.normalizePaymentStatus(
+                data["paymentStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                    ?: "pending_verification"
+            )
+            val planId = SubscriptionSyncResolver.parsePlanIdString(
+                rawPlanId = data["planId"],
+                rawPlanKey = data["planKey"],
+                rawPackageId = data["packageId"]
+            ) ?: payload.planId
+            val planName = (data["planName"] ?: data["packageName"])
+                ?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: fallbackPlanName.ifBlank { "باقة اشتراك" }
+            val maxCaptains = (data["maxCaptains"] as? Number)?.toInt()
+                ?: (data["captainLimit"] as? Number)?.toInt()
+                ?: fallbackMaxCaptains
+            // Server is the sole authority for the amount — read `amount` first, then `expectedAmount`/`price`
+            val serverAmount = (data["amount"] as? Number)?.toDouble()
+                ?: (data["expectedAmount"] as? Number)?.toDouble()
+                ?: (data["price"] as? Number)?.toDouble()
+                ?: data["amount"]?.toString()?.toDoubleOrNull()
+                ?: data["expectedAmount"]?.toString()?.toDoubleOrNull()
+                ?: 0.0
+            val durationDays = (data["durationDays"] as? Number)?.toInt()
+                ?: fallbackDurationDays
+            val receiptPath = (data["receiptImagePath"] ?: data["receiptStoragePath"] ?: data["receiptUrl"])
+                ?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: payload.receiptImagePath
+            val version = (data["subscriptionVersion"] as? Number)?.toLong() ?: 1L
+            val isReplay = (data["isReplay"] as? Boolean) == true || (data["duplicate"] as? Boolean) == true
+            val message = data["message"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: "تم إرسال طلب الاشتراك بنجاح وهو الآن في انتظار مراجعة الإدارة."
+
+            return ManualSubscriptionSubmissionResult(
+                requestId = requestId,
+                requestNumber = requestNumber,
+                status = status,
+                paymentStatus = paymentStatus,
+                planId = planId,
+                planName = planName,
+                maxCaptains = maxCaptains,
+                amount = serverAmount,
+                durationDays = durationDays,
+                receiptImagePath = receiptPath,
+                subscriptionVersion = version,
+                message = message,
+                isReplay = isReplay
+            )
+        }
+
+        /**
+         * Parses `merchantCreateOrder` response cleanly.
+         */
+        fun parseMerchantCreateOrderResponse(data: Map<*, *>): CaptainRequestResult {
+            val orderId = (data["orderId"] ?: data["id"])?.toString()?.trim().orEmpty()
+            val orderCode = (data["orderCode"] ?: data["code"])?.toString()?.trim().orEmpty()
+            if (orderId.isBlank() || orderCode.isBlank()) {
+                throw IllegalStateException("تعذر استلام بيانات وكود الطلب من السيرفر.")
+            }
+            val planId = SubscriptionSyncResolver.parsePlanIdString(
+                rawPlanId = data["planId"],
+                rawPlanKey = data["planKey"],
+                rawPackageId = data["packageId"]
+            ).orEmpty()
+            return CaptainRequestResult(
+                orderId = orderId,
+                orderCode = orderCode,
+                planId = planId,
+                planName = (data["planName"] ?: data["packageName"])?.toString().orEmpty(),
+                captainLimit = (data["captainLimit"] as? Number)?.toInt()
+                    ?: (data["maxCaptains"] as? Number)?.toInt()
+                    ?: 0,
+                activeCaptainsCount = (data["activeCaptainsCount"] as? Number)?.toInt() ?: 0,
+                remainingCaptains = (data["remainingCaptains"] as? Number)?.toInt()
+                    ?: (data["availableCaptainSlots"] as? Number)?.toInt()
+                    ?: 0,
+                subscriptionVersion = (data["subscriptionVersion"] as? Number)?.toLong() ?: 1L,
+                message = data["message"]?.toString().orEmpty().ifBlank { "تم إنشاء طلب التوصيل بنجاح" },
+                isReplay = (data["isReplay"] as? Boolean) == true || (data["duplicate"] as? Boolean) == true
+            )
         }
 
         fun mapManualSubscriptionError(
@@ -303,7 +513,7 @@ class MerchantSubscriptionRepository {
 
         /**
          * Distinguishes HTTP 404 endpoint-missing `NOT_FOUND` (undeployed Cloud Function or wrong region)
-         * from an application-level `HttpsError("not-found", ...)` returned by our Cloud Function code.
+         * from an application-level `HttpsError("not-found", ...)` returned by Cloud Function code.
          */
         fun isEndpointNotFoundError(
             code: FirebaseFunctionsException.Code,
@@ -319,8 +529,7 @@ class MerchantSubscriptionRepository {
         }
 
         /**
-         * Maps Cloud Function errors to clear, accurate Arabic messages matching the true root cause.
-         * Never leaks raw technical codes like literal "NOT_FOUND" to the merchant UI.
+         * Maps Cloud Function errors for `merchantCreateOrder` to clear Arabic messages.
          */
         fun mapRequestCaptainsError(
             code: FirebaseFunctionsException.Code,
@@ -347,6 +556,8 @@ class MerchantSubscriptionRepository {
                 "MISSING_CUSTOMER_ADDRESS" -> return "بيانات عنوان العميل غير مكتملة. يرجى إدخال عنوان التوصيل."
                 "MERCHANT_PENDING_APPROVAL" -> return "حساب التاجر في انتظار موافقة الإدارة."
                 "EMAIL_NOT_VERIFIED" -> return "يجب تأكيد البريد الإلكتروني أولاً قبل طلب كابتن."
+                "PAYMENT_NOT_VERIFIED", "SUBSCRIPTION_UNPAID", "PAYMENT_PENDING_VERIFICATION" ->
+                    return cleanedMsg ?: "لا يمكن طلب كابتن قبل تأكيد دفع وتفعيل الاشتراك من الإدارة."
                 "CAPTAIN_LIMIT_REACHED" -> return cleanedMsg ?: "وصلت إلى الحد الأقصى لعدد الكباتن المتزامنين في باقتك الحالية."
             }
 
@@ -361,7 +572,7 @@ class MerchantSubscriptionRepository {
                 FirebaseFunctionsException.Code.PERMISSION_DENIED,
                 FirebaseFunctionsException.Code.RESOURCE_EXHAUSTED ->
                     cleanedMsg
-                        ?: "تم رفض الطلب من السيرفر: يرجى التحقق من حالة الاشتراك والحد الأقصى للكباتن."
+                        ?: "تم رفض الطلب من السيرفر: يرجى التحقق من حالة الاشتراك والدفع والحد الأقصى للكباتن."
                 FirebaseFunctionsException.Code.UNAVAILABLE,
                 FirebaseFunctionsException.Code.DEADLINE_EXCEEDED ->
                     "تعذر الاتصال بسيرفر الطلبات حالياً. يرجى التحقق من اتصال الإنترنت والمحاولة مرة أخرى."
@@ -372,8 +583,6 @@ class MerchantSubscriptionRepository {
             }
         }
     }
-
-    private fun functionsClient() = Firebase.functions(FUNCTIONS_REGION)
 
     fun observeSubscriptionDocument(
         uid: String,
@@ -394,11 +603,206 @@ class MerchantSubscriptionRepository {
     }
 
     /**
-     * Verifies subscription state directly against BOTH:
+     * Real-time listener for ALL subscription documents linked to this merchant (`subscriptions` where `merchantId == uid`).
+     */
+    fun observeMerchantSubscriptionsQuery(
+        uid: String,
+        onSnapshots: (docs: List<RawSubscriptionSnapshot>, fromServer: Boolean) -> Unit,
+        onError: (FirebaseFirestoreException) -> Unit
+    ): ListenerRegistration {
+        return Firebase.firestore.collection("subscriptions")
+            .whereEqualTo("merchantId", uid)
+            .addSnapshotListener(MetadataChanges.INCLUDE) { querySnap, err ->
+                if (err != null) {
+                    onError(err)
+                    return@addSnapshotListener
+                }
+                val docs = querySnap?.documents
+                    ?.map { SubscriptionSyncResolver.fromFirestoreSnapshot(it) }
+                    .orEmpty()
+                val fromServer = querySnap != null && !querySnap.metadata.isFromCache
+                onSnapshots(docs, fromServer)
+            }
+    }
+
+    /**
+     * Real-time listener for active subscription packages in `subscription_packages` where `isActive == true`.
+     * Allows Admin to add/edit/disable packages dynamically without updating the APK.
+     */
+    fun observeSubscriptionPackages(
+        onPackages: (List<SubscriptionPlanOption>) -> Unit,
+        onError: (FirebaseFirestoreException) -> Unit
+    ): ListenerRegistration {
+        return Firebase.firestore.collection("subscription_packages")
+            .whereEqualTo("isActive", true)
+            .addSnapshotListener { querySnap, err ->
+                if (err != null) {
+                    onError(err)
+                    return@addSnapshotListener
+                }
+                val entries = querySnap?.documents
+                    ?.map { doc -> doc.id to (doc.data ?: emptyMap<String, Any?>()) }
+                    .orEmpty()
+                onPackages(parseSubscriptionPackages(entries))
+            }
+    }
+
+    suspend fun fetchSubscriptionPackagesFromServer(): Result<List<SubscriptionPlanOption>> {
+        return try {
+            val snap = Firebase.firestore.collection("subscription_packages")
+                .whereEqualTo("isActive", true)
+                .get(Source.SERVER)
+                .await()
+            val entries = snap.documents.map { doc -> doc.id to (doc.data ?: emptyMap<String, Any?>()) }
+            Result.success(parseSubscriptionPackages(entries))
+        } catch (e: Exception) {
+            Log.w(TAG, "Source.SERVER read subscription_packages failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Real-time listener for archived past subscription periods in `subscription_history`
+     * where `merchantId == uid`. Sorted locally descending by `archivedAtMs` or `endDate`
+     * (no Firestore `orderBy` composite index required).
+     */
+    fun observeSubscriptionHistory(
+        uid: String,
+        onHistory: (List<SubscriptionHistoryItem>) -> Unit,
+        onError: (FirebaseFirestoreException) -> Unit
+    ): ListenerRegistration {
+        return Firebase.firestore.collection("subscription_history")
+            .whereEqualTo("merchantId", uid)
+            .addSnapshotListener { querySnap, err ->
+                if (err != null) {
+                    onError(err)
+                    return@addSnapshotListener
+                }
+                val parsed = querySnap?.documents
+                    ?.map { SubscriptionSyncResolver.parseSubscriptionHistorySnapshot(it) }
+                    .orEmpty()
+                onHistory(SubscriptionSyncResolver.sortArchivedSubscriptionHistory(parsed))
+            }
+    }
+
+    suspend fun fetchSubscriptionHistoryFromServer(uid: String): Result<List<SubscriptionHistoryItem>> {
+        if (uid.isBlank()) return Result.success(emptyList())
+        return try {
+            val snap = Firebase.firestore.collection("subscription_history")
+                .whereEqualTo("merchantId", uid)
+                .get(Source.SERVER)
+                .await()
+            val parsed = snap.documents.map { SubscriptionSyncResolver.parseSubscriptionHistorySnapshot(it) }
+            Result.success(SubscriptionSyncResolver.sortArchivedSubscriptionHistory(parsed))
+        } catch (e: Exception) {
+            Log.w(TAG, "Source.SERVER read subscription_history for $uid failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Real-time listener for manual Vodafone Cash subscription requests belonging to this merchant.
+     */
+    fun observeManualSubscriptionRequests(
+        uid: String,
+        onRequests: (List<ManualSubscriptionRequestRecord>) -> Unit,
+        onError: (FirebaseFirestoreException) -> Unit
+    ): ListenerRegistration {
+        return Firebase.firestore.collection("manual_subscription_requests")
+            .whereEqualTo("merchantId", uid)
+            .addSnapshotListener { querySnap, err ->
+                if (err != null) {
+                    onError(err)
+                    return@addSnapshotListener
+                }
+                val parsed = querySnap?.documents
+                    ?.map { SubscriptionSyncResolver.parseManualRequestSnapshot(it) }
+                    ?.sortedByDescending { it.createdAtMillis ?: it.updatedAtMillis ?: 0L }
+                    .orEmpty()
+                onRequests(parsed)
+            }
+    }
+
+    /**
+     * Real-time read-only listener for payment records in `payments` where `merchantId == uid`.
+     */
+    fun observeMerchantPayments(
+        uid: String,
+        onPayments: (List<MerchantPaymentRecord>) -> Unit,
+        onError: (FirebaseFirestoreException) -> Unit
+    ): ListenerRegistration {
+        return Firebase.firestore.collection("payments")
+            .whereEqualTo("merchantId", uid)
+            .addSnapshotListener { querySnap, err ->
+                if (err != null) {
+                    onError(err)
+                    return@addSnapshotListener
+                }
+                val parsed = querySnap?.documents
+                    ?.map { SubscriptionSyncResolver.parsePaymentSnapshot(it) }
+                    ?.sortedByDescending { it.paymentDateMillis ?: it.createdAtMillis ?: 0L }
+                    .orEmpty()
+                onPayments(parsed)
+            }
+    }
+
+    /**
+     * Real-time listener for Vodafone Cash wallet settings & transfer instructions (`settings/manual_subscription_config`).
+     */
+    fun observeVodafoneCashSettings(
+        onSettings: (VodafoneCashSettings) -> Unit,
+        onError: (FirebaseFirestoreException) -> Unit
+    ): ListenerRegistration {
+        return Firebase.firestore.collection("settings")
+            .document("manual_subscription_config")
+            .addSnapshotListener { snap, err ->
+                if (err != null) {
+                    onError(err)
+                    return@addSnapshotListener
+                }
+                onSettings(parseVodafoneCashSettingsSnapshot(snap))
+            }
+    }
+
+    suspend fun fetchMerchantPaymentsFromServer(uid: String): Result<List<MerchantPaymentRecord>> {
+        if (uid.isBlank()) return Result.success(emptyList())
+        return try {
+            val snap = Firebase.firestore.collection("payments")
+                .whereEqualTo("merchantId", uid)
+                .get(Source.SERVER)
+                .await()
+            val list = snap.documents
+                .map { SubscriptionSyncResolver.parsePaymentSnapshot(it) }
+                .sortedByDescending { it.paymentDateMillis ?: it.createdAtMillis ?: 0L }
+            Result.success(list)
+        } catch (e: Exception) {
+            Log.w(TAG, "Source.SERVER read payments for $uid failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun fetchManualSubscriptionRequestsFromServer(uid: String): Result<List<ManualSubscriptionRequestRecord>> {
+        if (uid.isBlank()) return Result.success(emptyList())
+        return try {
+            val snap = Firebase.firestore.collection("manual_subscription_requests")
+                .whereEqualTo("merchantId", uid)
+                .get(Source.SERVER)
+                .await()
+            val list = snap.documents
+                .map { SubscriptionSyncResolver.parseManualRequestSnapshot(it) }
+                .sortedByDescending { it.createdAtMillis ?: it.updatedAtMillis ?: 0L }
+            Result.success(list)
+        } catch (e: Exception) {
+            Log.w(TAG, "Source.SERVER read manual_subscription_requests for $uid failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Verifies subscription state directly against:
      * 1. Cloud Function `getMerchantSubscription` (pinned to us-central1)
-     * 2. Firestore `Source.SERVER` on `subscriptions/{uid}` and `merchants/{uid}`
-     * Reconciles by highest `subscriptionVersion` so stale data never overrides fresh Admin activations,
-     * and returns a clear `errorMessage` on failure rather than falsely flipping to `inactive`.
+     * 2. Firestore `Source.SERVER` on `subscriptions/{uid}`, `subscriptions.whereEqualTo("merchantId", uid)`, and `merchants/{uid}`
+     * Reconciles canonical + auto-ID subscriptions ensuring an expired doc never beats a valid active subscription.
      */
     suspend fun fetchAuthoritativeSubscription(uid: String): ServerSubscriptionFetchResult {
         if (uid.isBlank()) return ServerSubscriptionFetchResult()
@@ -411,12 +815,12 @@ class MerchantSubscriptionRepository {
         val currentUser = Firebase.auth.currentUser
         if (currentUser != null && currentUser.uid == uid && currentUser.isEmailVerified) {
             try {
-                val callableResult = functionsClient()
-                    .getHttpsCallable("getMerchantSubscription")
-                    .call(hashMapOf("merchantId" to uid))
-                    .await()
-
-                val dataMap = callableResult.getData() as? Map<*, *>
+                val rawData = callableInvoker.call(
+                    region = FUNCTIONS_REGION,
+                    functionName = "getMerchantSubscription",
+                    payload = hashMapOf("merchantId" to uid)
+                )
+                val dataMap = rawData as? Map<*, *>
                 if (dataMap != null) {
                     callableSnapshot = SubscriptionSyncResolver.fromServerCallableMap(dataMap)
                     callableActiveCount = (dataMap["activeCaptainsCount"] as? Number)?.toInt()
@@ -428,8 +832,8 @@ class MerchantSubscriptionRepository {
             }
         }
 
-        // Fetch fresh Firestore Source.SERVER documents directly so profile and dual-doc snapshots stay aligned
         var serverSubSnap: DocumentSnapshot? = null
+        var serverSubQueryDocs: List<RawSubscriptionSnapshot> = emptyList()
         var serverMerchSnap: DocumentSnapshot? = null
         try {
             serverSubSnap = try {
@@ -439,6 +843,18 @@ class MerchantSubscriptionRepository {
                 if (lastError == null) lastError = e.localizedMessage ?: e.message
                 null
             }
+            serverSubQueryDocs = try {
+                Firebase.firestore.collection("subscriptions")
+                    .whereEqualTo("merchantId", uid)
+                    .get(Source.SERVER)
+                    .await()
+                    .documents
+                    .map { SubscriptionSyncResolver.fromFirestoreSnapshot(it) }
+            } catch (e: Exception) {
+                Log.w(TAG, "Source.SERVER query subscriptions where merchantId=$uid failed: ${e.message}")
+                if (lastError == null) lastError = e.localizedMessage ?: e.message
+                emptyList()
+            }
             serverMerchSnap = try {
                 Firebase.firestore.collection("merchants").document(uid).get(Source.SERVER).await()
             } catch (e: Exception) {
@@ -446,7 +862,7 @@ class MerchantSubscriptionRepository {
                 if (lastError == null) lastError = e.localizedMessage ?: e.message
                 null
             }
-            if (serverSubSnap != null || serverMerchSnap != null) {
+            if (serverSubSnap != null || serverSubQueryDocs.isNotEmpty() || serverMerchSnap != null) {
                 verified = true
             }
         } catch (e: Exception) {
@@ -454,29 +870,30 @@ class MerchantSubscriptionRepository {
             if (lastError == null) lastError = e.localizedMessage ?: e.message
         }
 
-        val firestoreSubSnapshot = serverSubSnap?.let {
+        val canonicalFirestoreSub = serverSubSnap?.let {
             SubscriptionSyncResolver.fromFirestoreSnapshot(it)
-        }
+        } ?: RawSubscriptionSnapshot(exists = false)
 
-        val finalSubSnapshot = when {
-            callableSnapshot != null && firestoreSubSnapshot != null -> {
-                val callableVer = callableSnapshot.subscriptionVersion ?: 0L
-                val fsVer = firestoreSubSnapshot.subscriptionVersion ?: 0L
-                val callableNorm = SubscriptionSyncResolver.normalizeStatus(callableSnapshot.status)
-                val fsNorm = SubscriptionSyncResolver.normalizeStatus(firestoreSubSnapshot.status ?: firestoreSubSnapshot.subscriptionStatus)
-                when {
-                    fsVer > callableVer -> firestoreSubSnapshot
-                    callableVer > fsVer -> callableSnapshot
-                    callableNorm == "unsubscribed" && fsNorm != "unsubscribed" && firestoreSubSnapshot.exists -> firestoreSubSnapshot
-                    else -> callableSnapshot
-                }
-            }
-            callableSnapshot != null -> callableSnapshot
-            else -> firestoreSubSnapshot
+        val candidates = buildList {
+            if (canonicalFirestoreSub.exists) add(canonicalFirestoreSub)
+            addAll(serverSubQueryDocs)
+            if (callableSnapshot != null && callableSnapshot.exists) add(callableSnapshot)
+        }
+        val finalSubSnapshot = if (candidates.isNotEmpty()) {
+            SubscriptionSyncResolver.selectEffectiveSubscriptionSnapshot(
+                canonicalDoc = canonicalFirestoreSub,
+                queryDocs = candidates
+            )
+        } else {
+            callableSnapshot ?: serverSubSnap?.let { SubscriptionSyncResolver.fromFirestoreSnapshot(it) }
         }
 
         return ServerSubscriptionFetchResult(
             subscriptionSnapshot = finalSubSnapshot,
+            subscriptionHistoryDocs = buildList {
+                if (canonicalFirestoreSub.exists) add(canonicalFirestoreSub)
+                addAll(serverSubQueryDocs)
+            },
             merchantDocument = serverMerchSnap,
             activeCaptainsCount = callableActiveCount,
             verifiedFromServer = verified,
@@ -495,11 +912,12 @@ class MerchantSubscriptionRepository {
         val user = Firebase.auth.currentUser ?: return null
         if (!user.isEmailVerified) return null
         return try {
-            val res = functionsClient()
-                .getHttpsCallable("validateMerchantSubscription")
-                .call(hashMapOf("requestedCaptains" to requestedCaptains))
-                .await()
-            val map = res.getData() as? Map<*, *> ?: return null
+            val rawData = callableInvoker.call(
+                region = FUNCTIONS_REGION,
+                functionName = "validateMerchantSubscription",
+                payload = hashMapOf("requestedCaptains" to requestedCaptains)
+            )
+            val map = rawData as? Map<*, *> ?: return null
             val allowed = (map["allowed"] as? Boolean) == true || (map["isValid"] as? Boolean) == true
             val activeCount = (map["activeCaptainsCount"] as? Number)?.toInt() ?: 0
             val snapshot = SubscriptionSyncResolver.fromServerCallableMap(map)
@@ -517,106 +935,59 @@ class MerchantSubscriptionRepository {
         }
     }
 
-    private suspend fun invokeServerOrderCallable(
-        functionName: String,
-        payload: Map<String, Any?>
-    ): CaptainRequestResult {
-        val result = functionsClient()
-            .getHttpsCallable(functionName)
-            .call(payload)
-            .await()
+    /**
+     * Authoritative Cloud Function order creation & captain request (`merchantCreateOrder`).
+     * - No fallback to `createOrderWithCode` (prevents incompatible contract & duplicate dispatch).
+     * - Prevents duplicate concurrent calls via atomic in-flight guard + `idempotencyKey`.
+     */
+    suspend fun createMerchantOrder(payload: Map<String, Any?>): Result<CaptainRequestResult> {
+        val merchantUid = payload["merchantId"]?.toString()?.trim().orEmpty()
+        val idempotencyKey = (payload["idempotencyKey"] ?: payload["requestId"])?.toString()?.trim().orEmpty()
+            .ifBlank { "req_${System.currentTimeMillis()}" }
 
-        val data = result.getData() as? Map<*, *>
-            ?: throw IllegalStateException("استجابة غير صالحة من السيرفر عند إنشاء الطلب.")
-
-        val orderId = data["orderId"]?.toString()?.trim().orEmpty()
-        val orderCode = data["orderCode"]?.toString()?.trim().orEmpty()
-        if (orderId.isBlank() || orderCode.isBlank()) {
-            throw IllegalStateException("تعذر استلام بيانات وكود الطلب من السيرفر.")
+        val acquiredKey = synchronized(inFlightIdempotencyKeys) {
+            if (inFlightIdempotencyKeys.contains(idempotencyKey)) {
+                false
+            } else {
+                inFlightIdempotencyKeys.add(idempotencyKey)
+                true
+            }
+        }
+        if (!acquiredKey || !orderRequestInFlight.compareAndSet(false, true)) {
+            if (acquiredKey) {
+                synchronized(inFlightIdempotencyKeys) { inFlightIdempotencyKeys.remove(idempotencyKey) }
+            }
+            return Result.failure(
+                IllegalStateException("جاري إرسال طلب كابتن حالياً، يرجى الانتظار وعدم تكرار الضغط.")
+            )
         }
 
-        return CaptainRequestResult(
-            orderId = orderId,
-            orderCode = orderCode,
-            planId = (data["planId"] as? Number)?.toInt() ?: 0,
-            planName = data["planName"]?.toString().orEmpty(),
-            captainLimit = (data["captainLimit"] as? Number)?.toInt() ?: 0,
-            activeCaptainsCount = (data["activeCaptainsCount"] as? Number)?.toInt() ?: 0,
-            remainingCaptains = (data["remainingCaptains"] as? Number)?.toInt() ?: 0,
-            subscriptionVersion = (data["subscriptionVersion"] as? Number)?.toLong() ?: 1L,
-            message = data["message"]?.toString().orEmpty().ifBlank { "تم إنشاء طلب التوصيل بنجاح" }
-        )
-    }
-
-    /**
-     * Authoritative Cloud Function order creation & captain dispatch request (`requestCaptains`).
-     * Enforces auth, verified email, active server subscription, non-expired date, and captain limit atomically.
-     * If `requestCaptains` returns HTTP 404 (not yet deployed on the project), seamlessly falls back ONLY to
-     * the server-enforced callable `createOrderWithCode` with the exact same `idempotencyKey` — NEVER writes
-     * directly to Firestore from the client.
-     */
-    suspend fun requestCaptains(payload: Map<String, Any?>): Result<CaptainRequestResult> {
-        val merchantUid = Firebase.auth.currentUser?.uid.orEmpty()
-        val requestId = payload["requestId"]?.toString()
-            ?: payload["idempotencyKey"]?.toString()
-            ?: "unknown"
-
         return try {
-            Result.success(invokeServerOrderCallable(PRIMARY_ORDER_FUNCTION, payload))
+            val rawData = callableInvoker.call(
+                region = FUNCTIONS_REGION,
+                functionName = PRIMARY_ORDER_FUNCTION,
+                payload = payload
+            )
+            val data = rawData as? Map<*, *>
+                ?: throw IllegalStateException("استجابة غير صالحة من السيرفر عند إنشاء الطلب.")
+            Result.success(parseMerchantCreateOrderResponse(data))
         } catch (primaryErr: FirebaseFunctionsException) {
-            if (isEndpointNotFoundError(primaryErr.code, primaryErr.message, primaryErr.details)) {
-                Log.w(
-                    TAG,
-                    "Cloud Function endpoint NOT_FOUND | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${primaryErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()} -> attempting server callable $LEGACY_SERVER_ORDER_FUNCTION"
-                )
-                return try {
-                    Result.success(invokeServerOrderCallable(LEGACY_SERVER_ORDER_FUNCTION, payload))
-                } catch (fallbackErr: FirebaseFunctionsException) {
-                    val bothMissing = isEndpointNotFoundError(
-                        fallbackErr.code,
-                        fallbackErr.message,
-                        fallbackErr.details
-                    )
-                    Log.e(
-                        TAG,
-                        "Server order callable failed | functionName=$LEGACY_SERVER_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${fallbackErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}"
-                    )
-                    val mapped = mapRequestCaptainsError(
-                        code = fallbackErr.code,
-                        rawMessage = fallbackErr.message,
-                        details = fallbackErr.details,
-                        endpointUnavailableOnServer = bothMissing
-                    )
-                    Result.failure(IllegalStateException(mapped, fallbackErr))
-                } catch (fallbackUnexpected: Exception) {
-                    Log.e(
-                        TAG,
-                        "Unexpected error on $LEGACY_SERVER_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}: ${fallbackUnexpected.message}"
-                    )
-                    Result.failure(
-                        IllegalStateException(
-                            fallbackUnexpected.localizedMessage ?: "تعذر إنشاء الطلب عبر السيرفر، يرجى المحاولة مرة أخرى.",
-                            fallbackUnexpected
-                        )
-                    )
-                }
-            }
-
+            val endpointMissing = isEndpointNotFoundError(primaryErr.code, primaryErr.message, primaryErr.details)
             Log.e(
                 TAG,
-                "Server order callable rejected | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${primaryErr.code} merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}"
+                "Server order callable rejected | functionName=$PRIMARY_ORDER_FUNCTION region=$FUNCTIONS_REGION errorCode=${primaryErr.code} merchantId=$merchantUid requestId=$idempotencyKey timestamp=${System.currentTimeMillis()}"
             )
             val msg = mapRequestCaptainsError(
                 code = primaryErr.code,
                 rawMessage = primaryErr.message,
                 details = primaryErr.details,
-                endpointUnavailableOnServer = false
+                endpointUnavailableOnServer = endpointMissing
             )
             Result.failure(IllegalStateException(msg, primaryErr))
         } catch (e: Exception) {
             Log.e(
                 TAG,
-                "Unexpected error calling $PRIMARY_ORDER_FUNCTION | merchantId=$merchantUid requestId=$requestId timestamp=${System.currentTimeMillis()}: ${e.message}"
+                "Unexpected error calling $PRIMARY_ORDER_FUNCTION | merchantId=$merchantUid requestId=$idempotencyKey timestamp=${System.currentTimeMillis()}: ${e.message}"
             )
             Result.failure(
                 IllegalStateException(
@@ -624,23 +995,27 @@ class MerchantSubscriptionRepository {
                     e
                 )
             )
+        } finally {
+            orderRequestInFlight.set(false)
+            synchronized(inFlightIdempotencyKeys) { inFlightIdempotencyKeys.remove(idempotencyKey) }
         }
     }
 
     /**
      * Executes all merchant order lifecycle mutations through the authoritative Dashboard
-     * Cloud Functions. The merchant client must never write dispatch/status transitions directly.
+     * Cloud Functions.
      */
     private suspend fun executeMerchantOrderMutation(
         functionName: String,
         payload: Map<String, Any?>
     ): Result<Unit> {
         return try {
-            val result = functionsClient()
-                .getHttpsCallable(functionName)
-                .call(payload)
-                .await()
-            val data = result.getData() as? Map<*, *>
+            val rawData = callableInvoker.call(
+                region = FUNCTIONS_REGION,
+                functionName = functionName,
+                payload = payload
+            )
+            val data = rawData as? Map<*, *>
                 ?: throw IllegalStateException("استجابة غير صالحة من خادم الطلبات.")
             if (data["success"] == false) {
                 throw IllegalStateException(
@@ -702,58 +1077,77 @@ class MerchantSubscriptionRepository {
         )
     )
 
+    fun parseVodafoneCashSettingsSnapshot(
+        snapshot: DocumentSnapshot?,
+        activePackages: List<SubscriptionPlanOption> = emptyList()
+    ): VodafoneCashSettings {
+        if (snapshot == null || !snapshot.exists()) {
+            return VodafoneCashSettings(
+                plans = activePackages,
+                loadError = "إعدادات الاشتراك غير موجودة على السيرفر. يرجى التواصل مع الإدارة."
+            )
+        }
+        val wallet = snapshot.getAnyString(
+            "vodafoneCashNumber",
+            "vodafoneWalletNumber",
+            "walletNumber",
+            "walletPhone",
+            "officialWalletNumber",
+            "phoneNumber"
+        )?.trim().orEmpty()
+        val normalizedWallet = normalizeEgyptianMobile(wallet).orEmpty()
+        val walletIsValid = normalizedWallet.isNotEmpty()
+        val configPlans = parseConfiguredPlans(snapshot.get("plans"))
+        val effectivePlans = if (activePackages.isNotEmpty()) activePackages else configPlans
+        val accepting = snapshot.getBoolean("isAcceptingSubscriptions")
+            ?: snapshot.getBoolean("enabled")
+            ?: snapshot.getBoolean("isActive")
+            ?: true
+        val pauseMessage = snapshot.getAnyString("pauseMessage")?.trim()
+            ?.takeIf { it.isNotBlank() }
+        val configured = walletIsValid && effectivePlans.isNotEmpty()
+
+        return VodafoneCashSettings(
+            walletNumber = normalizedWallet,
+            walletHolderName = snapshot.getAnyString("walletHolderName", "accountName", "holderName")
+                ?.trim().orEmpty(),
+            instructions = snapshot.getAnyString(
+                "vodafoneCashInstructions",
+                "paymentInstructions",
+                "instructions"
+            )?.trim()?.takeIf { it.isNotBlank() } ?: VodafoneCashSettings().instructions,
+            plans = effectivePlans,
+            isConfiguredOnServer = configured,
+            isAcceptingSubscriptions = accepting,
+            pauseMessage = pauseMessage,
+            isLoading = false,
+            loadError = when {
+                !walletIsValid -> "رقم محفظة فودافون كاش غير مضبوط أو غير صالح في إعدادات الإدارة."
+                effectivePlans.isEmpty() -> "لا توجد باقات نشطة حالياً في إعدادات الإدارة."
+                !accepting -> pauseMessage ?: "استقبال طلبات الاشتراك متوقف مؤقتاً من الإدارة."
+                else -> null
+            }
+        )
+    }
+
     /**
-     * Fetches the official Vodafone Cash wallet number, optional wallet holder name, dynamic plans,
-     * and instructions configured by Admin in Firebase Firestore (`settings/subscription_config`).
+     * Fetches wallet settings from `settings/manual_subscription_config` and active packages
+     * from `subscription_packages` (`isActive == true`).
      */
-    suspend fun fetchVodafoneCashSettings(): VodafoneCashSettings {
+    suspend fun fetchVodafoneCashSettings(
+        knownPackages: List<SubscriptionPlanOption> = emptyList()
+    ): VodafoneCashSettings {
         return try {
-            // This is the canonical settings document written by the Dashboard Cloud Function.
-            // Never fall back to a hard-coded wallet or stale legacy settings documents.
+            val packages = fetchSubscriptionPackagesFromServer().getOrElse { knownPackages }
             val snapshot = Firebase.firestore.collection("settings")
                 .document("manual_subscription_config")
                 .get(Source.SERVER)
                 .await()
-
-            if (!snapshot.exists()) {
-                VodafoneCashSettings(
-                    loadError = "إعدادات الاشتراك غير موجودة على السيرفر. يرجى التواصل مع الإدارة."
-                )
-            } else {
-                val wallet = snapshot.getAnyString("vodafoneCashNumber", "walletNumber")
-                    ?.trim().orEmpty()
-                val walletIsValid = Regex("^01[0125][0-9]{8}$").matches(wallet)
-                val plans = parseConfiguredPlans(snapshot.get("plans"))
-                val accepting = snapshot.getBoolean("isAcceptingSubscriptions") == true
-                val pauseMessage = snapshot.getAnyString("pauseMessage")?.trim()
-                    ?.takeIf { it.isNotBlank() }
-                val configured = walletIsValid && plans.isNotEmpty()
-
-                VodafoneCashSettings(
-                    walletNumber = if (walletIsValid) wallet else "",
-                    walletHolderName = snapshot.getAnyString("walletHolderName", "accountName")
-                        ?.trim().orEmpty(),
-                    instructions = snapshot.getAnyString(
-                        "vodafoneCashInstructions",
-                        "paymentInstructions",
-                        "instructions"
-                    )?.trim()?.takeIf { it.isNotBlank() } ?: VodafoneCashSettings().instructions,
-                    plans = plans,
-                    isConfiguredOnServer = configured,
-                    isAcceptingSubscriptions = accepting,
-                    pauseMessage = pauseMessage,
-                    isLoading = false,
-                    loadError = when {
-                        !walletIsValid -> "رقم محفظة فودافون كاش غير مضبوط أو غير صالح في إعدادات الإدارة."
-                        plans.isEmpty() -> "لا توجد باقات نشطة ومدعومة في إعدادات الاشتراك على السيرفر."
-                        !accepting -> pauseMessage ?: "استقبال طلبات الاشتراك متوقف مؤقتاً من الإدارة."
-                        else -> null
-                    }
-                )
-            }
+            parseVodafoneCashSettingsSnapshot(snapshot, activePackages = packages)
         } catch (e: Exception) {
             Log.e(TAG, "Reading settings/manual_subscription_config from server failed: ${e.message}", e)
             VodafoneCashSettings(
+                plans = knownPackages,
                 loadError = "تعذر تحميل إعدادات الاشتراك من السيرفر. تحقق من الاتصال والصلاحيات ثم أعد المحاولة."
             )
         }
@@ -761,52 +1155,38 @@ class MerchantSubscriptionRepository {
 
     /**
      * Calls the trusted Cloud Function `submitManualSubscriptionRequest` (region us-central1).
-     * Never activates the subscription locally — only registers a `pending_review` request for Admin review.
+     * Sends String `planId`, `receiptImagePath`, `senderPhone`, `transactionReference`, `idempotencyKey`
+     * without letting the client override the server price.
+     * Reads `amount`, `requestNumber`, `paymentStatus` directly from server response.
      */
     suspend fun submitManualSubscriptionRequest(
-        payload: ManualSubscriptionRequestPayload
+        payload: ManualSubscriptionRequestPayload,
+        fallbackPlanName: String = "",
+        fallbackMaxCaptains: Int = 0,
+        fallbackDurationDays: Int = 30
     ): Result<ManualSubscriptionSubmissionResult> {
         return try {
-            val result = functionsClient()
-                .getHttpsCallable(MANUAL_SUBSCRIPTION_FUNCTION)
-                .call(payload.toCallableMap())
-                .await()
-
-            val data = result.getData() as? Map<*, *>
+            val rawData = callableInvoker.call(
+                region = FUNCTIONS_REGION,
+                functionName = MANUAL_SUBSCRIPTION_FUNCTION,
+                payload = payload.toCallableMap()
+            )
+            val data = rawData as? Map<*, *>
                 ?: throw IllegalStateException("استجابة غير صالحة من السيرفر عند إرسال طلب الاشتراك.")
 
-            val requestId = data["requestId"]?.toString()?.trim().orEmpty().ifBlank { payload.requestId }
-            val status = data["status"]?.toString()?.trim().orEmpty().ifBlank { "pending_review" }
-            val planId = (data["planId"] as? Number)?.toInt() ?: payload.planId
-            val planName = data["planName"]?.toString()?.trim().orEmpty().ifBlank { payload.planName }
-            val maxCaptains = (data["maxCaptains"] as? Number)?.toInt() ?: payload.maxCaptains
-            val expectedAmount = (data["expectedAmount"] as? Number)?.toInt() ?: payload.expectedAmount
-            val durationDays = (data["durationDays"] as? Number)?.toInt() ?: 30
-            val receiptPath = data["receiptStoragePath"]?.toString()?.trim().orEmpty().ifBlank { payload.receiptStoragePath }
-            val version = (data["subscriptionVersion"] as? Number)?.toLong() ?: 1L
-            val isReplay = (data["isReplay"] as? Boolean) == true
-            val message = data["message"]?.toString()?.trim().orEmpty()
-                .ifBlank { "تم إرسال طلب الاشتراك بنجاح وهو الآن في انتظار مراجعة الإدارة." }
-
             Result.success(
-                ManualSubscriptionSubmissionResult(
-                    requestId = requestId,
-                    status = status,
-                    planId = planId,
-                    planName = planName,
-                    maxCaptains = maxCaptains,
-                    expectedAmount = expectedAmount,
-                    durationDays = durationDays,
-                    receiptStoragePath = receiptPath,
-                    subscriptionVersion = version,
-                    message = message,
-                    isReplay = isReplay
+                parseManualSubscriptionResponse(
+                    data = data,
+                    payload = payload,
+                    fallbackPlanName = fallbackPlanName,
+                    fallbackMaxCaptains = fallbackMaxCaptains,
+                    fallbackDurationDays = fallbackDurationDays
                 )
             )
         } catch (fnEx: FirebaseFunctionsException) {
             Log.e(
                 TAG,
-                "submitManualSubscriptionRequest failed | code=${fnEx.code} requestId=${payload.requestId} msg=${fnEx.message}"
+                "submitManualSubscriptionRequest failed | code=${fnEx.code} requestId=${payload.idempotencyKey} msg=${fnEx.message}"
             )
             Result.failure(
                 IllegalStateException(

@@ -50,7 +50,7 @@ class SubscriptionSyncTest {
                 subscriptionStatus = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 planName = "الباقة المتوسطة",
                 maxCaptains = 4,
                 price = 800,
@@ -68,7 +68,7 @@ class SubscriptionSyncTest {
 
         assertTrue(activated.isSubscribed)
         assertEquals("active", activated.status)
-        assertEquals(2, activated.planId)
+        assertEquals("2", activated.planId)
         assertEquals(4, activated.maxCaptains)
         assertEquals(3, activated.availableCaptainSlots)
         assertTrue(activated.canRequestCaptain(nowMs))
@@ -92,7 +92,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 3,
+                planId = "3",
                 maxCaptains = 6,
                 startDateMillis = nowMs - 5000L,
                 endDateMillis = nowMs + thirtyDaysMs,
@@ -113,7 +113,7 @@ class SubscriptionSyncTest {
                 subscriptionStatus = "suspended",
                 isSubscribed = false,
                 paymentStatus = "paid",
-                planId = 3,
+                planId = "3",
                 maxCaptains = 6,
                 endDateMillis = nowMs + thirtyDaysMs,
                 updatedAtMillis = nowMs + 1000L,
@@ -160,7 +160,7 @@ class SubscriptionSyncTest {
                 status = "cancelled",
                 isSubscribed = false,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 maxCaptains = 0,
                 updatedAtMillis = nowMs + 2000L,
                 reason = "إلغاء بناءً على طلب الإدارة",
@@ -203,7 +203,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 4,
+                planId = "4",
                 planName = "الباقة المتقدمة",
                 maxCaptains = 8,
                 price = 1600,
@@ -244,7 +244,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 maxCaptains = 4,
                 endDateMillis = nowMs + thirtyDaysMs,
                 isFromCache = true
@@ -266,7 +266,7 @@ class SubscriptionSyncTest {
                 status = "suspended",
                 isSubscribed = false,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 maxCaptains = 4,
                 endDateMillis = nowMs + thirtyDaysMs,
                 isFromCache = false
@@ -291,7 +291,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 1,
+                planId = "1",
                 maxCaptains = 2,
                 endDateMillis = nowMs + thirtyDaysMs,
                 isFromCache = true
@@ -316,7 +316,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 maxCaptains = 4,
                 endDateMillis = nowMs + thirtyDaysMs,
                 updatedAtMillis = nowMs - 10_000L,
@@ -348,7 +348,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 1,
+                planId = "1",
                 maxCaptains = 2,
                 startDateMillis = nowMs - thirtyDaysMs - 1000L,
                 endDateMillis = nowMs - 1L,
@@ -407,7 +407,7 @@ class SubscriptionSyncTest {
                 status = "inactive",
                 isSubscribed = false,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 maxCaptains = 4,
                 endDateMillis = nowMs + thirtyDaysMs,
                 reason = "إيقاف إداري مؤقت",
@@ -437,7 +437,7 @@ class SubscriptionSyncTest {
                 status = "pending",
                 isSubscribed = false,
                 paymentStatus = "paid",
-                planId = 1,
+                planId = "1",
                 maxCaptains = 2,
                 isFromCache = false
             ),
@@ -471,7 +471,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 1,
+                planId = "1",
                 planName = "الباقة الأساسية",
                 maxCaptains = 2,
                 startDateMillis = nowMs - thirtyDaysMs / 2,
@@ -494,7 +494,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 3,
+                planId = "3",
                 planName = "الباقة المميزة",
                 maxCaptains = 6,
                 startDateMillis = nowMs,
@@ -574,7 +574,7 @@ class SubscriptionSyncTest {
                 status = "active",
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 maxCaptains = 4,
                 endDateMillis = nowMs + thirtyDaysMs,
                 subscriptionVersion = 5L,
@@ -601,16 +601,39 @@ class SubscriptionSyncTest {
     }
 
     @Test
-    fun `16_admin_activation_with_stale_isSubscribed_false_and_unpaid_paymentStatus_succeeds`() {
-        val state = SubscriptionSyncResolver.resolve(
+    fun `16_unpaid_paymentStatus_is_blocked_while_paid_admin_activation_succeeds`() {
+        val unpaidBlocked = SubscriptionSyncResolver.resolve(
+            subscriptionDoc = RawSubscriptionSnapshot(
+                exists = true,
+                status = "active",
+                subscriptionStatus = "active",
+                isActive = true,
+                isSubscribed = false,
+                paymentStatus = "unpaid",
+                planId = "2",
+                planName = "الباقة المتوسطة",
+                maxCaptains = 4,
+                endDateMillis = nowMs + thirtyDaysMs,
+                subscriptionVersion = 2L,
+                isFromCache = false
+            ),
+            merchantDoc = RawSubscriptionSnapshot(exists = false),
+            isOnline = true,
+            nowMillis = nowMs,
+            hasVerifiedServerOnce = true
+        )
+        assertFalse(unpaidBlocked.canRequestCaptain(nowMs))
+        assertEquals("unpaid", unpaidBlocked.paymentStatus)
+
+        val paidActivated = SubscriptionSyncResolver.resolve(
             subscriptionDoc = RawSubscriptionSnapshot(
                 exists = true,
                 status = "active",
                 subscriptionStatus = "active",
                 isActive = true,
                 isSubscribed = false, // stale signup value
-                paymentStatus = "unpaid", // stale value not cleared by dashboard
-                planId = 2,
+                paymentStatus = "paid",
+                planId = "2",
                 planName = "الباقة المتوسطة",
                 maxCaptains = 4,
                 endDateMillis = nowMs + thirtyDaysMs,
@@ -630,12 +653,12 @@ class SubscriptionSyncTest {
             hasVerifiedServerOnce = true
         )
 
-        assertTrue(state.isSubscribed)
-        assertFalse(state.isSuspended)
-        assertEquals("active", state.status)
-        assertEquals("paid", state.paymentStatus)
-        assertEquals(4, state.maxCaptains)
-        assertTrue(state.canRequestCaptain(nowMs))
+        assertTrue(paidActivated.isSubscribed)
+        assertFalse(paidActivated.isSuspended)
+        assertEquals("active", paidActivated.status)
+        assertEquals("paid", paidActivated.paymentStatus)
+        assertEquals(4, paidActivated.maxCaptains)
+        assertTrue(paidActivated.canRequestCaptain(nowMs))
     }
 
     @Test
@@ -647,7 +670,7 @@ class SubscriptionSyncTest {
                 isActive = true,
                 isSubscribed = true,
                 paymentStatus = "paid",
-                planId = 2,
+                planId = "2",
                 planName = "الباقة المتوسطة",
                 maxCaptains = 4,
                 endDateMillis = nowMs + thirtyDaysMs,
@@ -749,7 +772,7 @@ class SubscriptionSyncTest {
             isActive = true,
             isSubscribed = true,
             paymentStatus = "paid",
-            planId = 2,
+            planId = "2",
             planName = "الباقة المتوسطة",
             maxCaptains = 4,
             price = 800,
@@ -835,7 +858,7 @@ class SubscriptionSyncTest {
             endpointUnavailableOnServer = true
         )
         assertFalse(undeployedMsg.equals("NOT_FOUND", ignoreCase = true))
-        assertTrue(undeployedMsg.contains("requestCaptains"))
+        assertTrue(undeployedMsg.contains("merchantCreateOrder"))
         assertTrue(undeployedMsg.contains("us-central1"))
 
         val merchantMissingMsg = com.example.db.MerchantSubscriptionRepository.mapRequestCaptainsError(
@@ -861,7 +884,7 @@ class SubscriptionSyncTest {
     }
 
     @Test
-    fun \`admin_manual_payment_status_is_preserved_and_does_not_block_captain_requests\`() {
+    fun `admin_manual_payment_status_is_preserved_and_does_not_block_captain_requests`() {
         val serverMap = mapOf(
             "status" to "active",
             "isActive" to true,
@@ -889,6 +912,17 @@ class SubscriptionSyncTest {
         )
         assertEquals("admin_manual", resolved.paymentStatus)
         assertTrue(resolved.canRequestCaptain(nowMs))
+    }
+
+    @Test
+    fun `fcm_too_many_registrations_is_detected_as_hard_failure`() {
+        val direct = java.io.IOException("TOO_MANY_REGISTRATIONS")
+        val nested = IllegalStateException("Token fetch failed", direct)
+        val transient = java.io.IOException("SERVICE_NOT_AVAILABLE")
+
+        assertTrue(com.example.notification.MerchantMessagingService.isHardRegistrationFailure(direct))
+        assertTrue(com.example.notification.MerchantMessagingService.isHardRegistrationFailure(nested))
+        assertFalse(com.example.notification.MerchantMessagingService.isHardRegistrationFailure(transient))
     }
 
 }

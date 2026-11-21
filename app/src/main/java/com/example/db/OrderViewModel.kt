@@ -44,6 +44,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.tasks.await
 
 object OrderCountdownTracker {
@@ -305,11 +306,40 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private val _subscriptionStatus = MutableStateFlow(SubscriptionStatusState())
     val subscriptionStatus: StateFlow<SubscriptionStatusState> = _subscriptionStatus.asStateFlow()
 
+    private val _subscriptionPackages = MutableStateFlow<List<SubscriptionPlanOption>>(emptyList())
+    val subscriptionPackages: StateFlow<List<SubscriptionPlanOption>> = _subscriptionPackages.asStateFlow()
+
+    private val _isLoadingPackages = MutableStateFlow(false)
+    val isLoadingPackages: StateFlow<Boolean> = _isLoadingPackages.asStateFlow()
+
+    private val _packagesError = MutableStateFlow<String?>(null)
+    val packagesError: StateFlow<String?> = _packagesError.asStateFlow()
+
+    private val _subscriptionHistory = MutableStateFlow<List<SubscriptionHistoryItem>>(emptyList())
+    val subscriptionHistory: StateFlow<List<SubscriptionHistoryItem>> = _subscriptionHistory.asStateFlow()
+
+    private val _manualSubscriptionRequests = MutableStateFlow<List<ManualSubscriptionRequestRecord>>(emptyList())
+    val manualSubscriptionRequests: StateFlow<List<ManualSubscriptionRequestRecord>> = _manualSubscriptionRequests.asStateFlow()
+
+    private val _merchantPayments = MutableStateFlow<List<MerchantPaymentRecord>>(emptyList())
+    val merchantPayments: StateFlow<List<MerchantPaymentRecord>> = _merchantPayments.asStateFlow()
+
+    private val _isLoadingPayments = MutableStateFlow(false)
+    val isLoadingPayments: StateFlow<Boolean> = _isLoadingPayments.asStateFlow()
+
+    private val _paymentsError = MutableStateFlow<String?>(null)
+    val paymentsError: StateFlow<String?> = _paymentsError.asStateFlow()
+
     private val _vodafoneCashSettings = MutableStateFlow(VodafoneCashSettings(isLoading = true))
     val vodafoneCashSettings: StateFlow<VodafoneCashSettings> = _vodafoneCashSettings.asStateFlow()
 
     private val _manualSubscriptionUiState = MutableStateFlow<ManualSubscriptionUiState>(ManualSubscriptionUiState.Idle)
     val manualSubscriptionUiState: StateFlow<ManualSubscriptionUiState> = _manualSubscriptionUiState.asStateFlow()
+
+    private val _isSubmittingOrder = MutableStateFlow(false)
+    val isSubmittingOrder: StateFlow<Boolean> = _isSubmittingOrder.asStateFlow()
+
+    private val orderSubmissionInFlight = AtomicBoolean(false)
 
     private val _pushNotificationState = MutableStateFlow<PushNotificationBanner?>(null)
     val pushNotificationState: StateFlow<PushNotificationBanner?> = _pushNotificationState.asStateFlow()
@@ -378,12 +408,26 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private var captainOrdersListener: ListenerRegistration? = null
     private var driverListener: ListenerRegistration? = null
     private var restaurantSubListener: ListenerRegistration? = null
+    private var merchantSubscriptionsQueryListener: ListenerRegistration? = null
+    private var subscriptionPackagesListener: ListenerRegistration? = null
+    private var subscriptionHistoryListener: ListenerRegistration? = null
+    private var manualRequestsListener: ListenerRegistration? = null
+    private var merchantPaymentsListener: ListenerRegistration? = null
+    private var vodafoneSettingsListener: ListenerRegistration? = null
     private var orderTrackingListener: ListenerRegistration? = null
     private var captainTrackingListener: ListenerRegistration? = null
     private var currentTrackedCaptainId: String? = null
+    @Volatile
+    private var activeListenersUid: String? = null
 
     @Volatile
     private var latestSubscriptionSnapshot: RawSubscriptionSnapshot = RawSubscriptionSnapshot()
+    @Volatile
+    private var latestQuerySubscriptionSnapshots: List<RawSubscriptionSnapshot> = emptyList()
+    @Volatile
+    private var latestArchivedHistoryItems: List<SubscriptionHistoryItem> = emptyList()
+    @Volatile
+    private var latestRawVodafoneSettings: VodafoneCashSettings = VodafoneCashSettings(isLoading = true)
     @Volatile
     private var latestMerchantSubSnapshot: RawSubscriptionSnapshot = RawSubscriptionSnapshot()
     @Volatile
@@ -394,6 +438,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private var latestSubscriptionServerError: String? = null
     @Volatile
     private var hasEmittedSubscriptionOnce: Boolean = false
+    @Volatile
+    private var hasLoadedPaymentsOnce: Boolean = false
+    @Volatile
+    private var hasLoadedManualRequestsOnce: Boolean = false
+    private val knownPaymentIds = ConcurrentHashMap.newKeySet<String>()
+    private val knownRequestStatuses = ConcurrentHashMap<String, String>()
+    private val notifiedExpiringSoonKeys = ConcurrentHashMap.newKeySet<String>()
     @Volatile
     private var lastObservedOnlineState: Boolean = NetworkHelper.isOnline.value
 
@@ -672,6 +723,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                         hasVerifiedServerSubscriptionOnce = false
                         recomputeSubscriptionState()
                         refreshSubscriptionFromServer(uid)
+                        refreshPaymentsAndRequestsFromServer(uid)
+                        loadVodafoneCashSettings()
                     }
                 }
             }
@@ -682,6 +735,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 val uid = Firebase.auth.currentUser?.takeIf { it.isEmailVerified }?.uid
                 if (uid != null && NetworkHelper.isOnline.value) {
                     refreshSubscriptionFromServer(uid)
+                    refreshPaymentsAndRequestsFromServer(uid)
                 }
             }
         }
@@ -811,6 +865,22 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val uid = currentUser.uid
+
+        // Prevent cross-merchant data leakage when switching accounts
+        if (activeListenersUid != null && activeListenersUid != uid) {
+            clearListeners()
+        }
+
+        // Prevent duplicate listeners when listenToFirestore() is triggered repeatedly for the same active merchant
+        if (activeListenersUid == uid &&
+            merchantProfileListener != null &&
+            restaurantSubListener != null &&
+            subscriptionPackagesListener != null &&
+            subscriptionHistoryListener != null
+        ) {
+            return
+        }
+        activeListenersUid = uid
 
         checkAndListenToRestaurantSubscription()
         viewModelScope.launch(Dispatchers.IO) {
@@ -1510,180 +1580,198 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         onSuccess: (orderCode: String) -> Unit,
         onError: ((String) -> Unit)? = null
     ) {
+        if (!orderSubmissionInFlight.compareAndSet(false, true)) {
+            val dupMsg = "جاري إرسال طلب كابتن حالياً، يرجى الانتظار وعدم تكرار الضغط."
+            _snackbarMessage.value = dupMsg
+            onError?.invoke(dupMsg)
+            return
+        }
+        _isSubmittingOrder.value = true
+
         viewModelScope.launch {
-            if (!NetworkHelper.isNetworkAvailable(getApplication()) || !NetworkHelper.isOnline.value) {
-                val noNetMsg = "لا يمكن إجراء طلب كابتن: أنت غير متصل بالإنترنت! يرجى الاتصال لمزامنة الاشتراك مع السيرفر."
-                _snackbarMessage.value = noNetMsg
-                NetworkHelper.notifyNoInternet(getApplication(), "إجراء طلب كابتن جديد")
-                onError?.invoke(noNetMsg)
-                return@launch
-            }
-
-            val currentUser = Firebase.auth.currentUser
-            if (currentUser == null || !currentUser.isEmailVerified) {
-                val authMsg = if (currentUser == null) {
-                    "يرجى تسجيل الدخول أولاً لطلب كابتن"
-                } else {
-                    "يجب تأكيد البريد الإلكتروني أولاً قبل طلب كابتن."
-                }
-                _snackbarMessage.value = authMsg
-                onError?.invoke(authMsg)
-                return@launch
-            }
-
-            val currentSub = _subscriptionStatus.value
-
-            // Fast client guard (Server Cloud Function `requestCaptains` enforces authoritatively inside transaction)
-            if (!currentSub.canRequestCaptain()) {
-                val subMsg = when {
-                    currentSub.isSuspended || currentSub.status == "suspended" || currentSub.status == "inactive" ->
-                        currentSub.message ?: "لا يمكن طلب كابتن: اشتراكك موقوف حالياً من قبل الإدارة. يرجى التواصل مع الإدارة أو تجديد الاشتراك."
-                    currentSub.isCancelled || currentSub.status == "cancelled" ->
-                        currentSub.message ?: "لا يمكن طلب كابتن: تم إلغاء اشتراكك. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة."
-                    currentSub.isPending || currentSub.status == "pending" ->
-                        currentSub.message ?: "اشتراكك قيد المراجعة من الإدارة. سيتم تفعيل طلب الكباتن فور الموافقة."
-                    currentSub.isOfflineUnverified ->
-                        currentSub.message ?: "جاري التحقق من حالة الاشتراك مع السيرفر. يرجى المحاولة بعد ثوانٍ أو التحقق من اتصال الإنترنت."
-                    currentSub.paymentStatus == "failed" || currentSub.status == "payment_failed" ->
-                        "لا يمكن عمل طلب كابتن: فشلت عملية الدفع للباقة ولم يتم تأكيد الاشتراك من السيرفر. يرجى إتمام الدفع بنجاح أولاً."
-                    currentSub.isExpired || currentSub.status == "expired" ->
-                        "لا يمكن إنشاء الطلب: باقة اشتراك المطعم منتهية. يرجى تجديد الاشتراك."
-                    else ->
-                        "لا يمكن عمل طلب كابتن: أنت غير مشترك في أي باقة حالياً. يرجى الاشتراك في باقة أولاً."
-                }
-                _snackbarMessage.value = subMsg
-                onError?.invoke(subMsg)
-                return@launch
-            }
-
-            // Client capacity pre-check (also enforced atomically on Cloud Functions server)
-            val allowedCaptains = currentSub.maxCaptains
-            val liveActiveOrdersCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) }
-            val activeCaptains = maxOf(currentSub.activeCaptainsCount, liveActiveOrdersCount)
-            if (activeCaptains >= allowedCaptains && allowedCaptains > 0) {
-                val nextCaptainNumber = allowedCaptains + 1
-                val limitMsg = "لا يمكنك طلب الكابتن رقم $nextCaptainNumber حالياً لأنك مشترك في باقة $allowedCaptains كابتن ولديك $activeCaptains طلبات نشطة في نفس الوقت. يمكنك طلب كابتن جديد فور انتهاء أي طلب من الطلبات النشطة."
-                _snackbarMessage.value = limitMsg
-                onError?.invoke(limitMsg)
-                return@launch
-            }
-
-            val trimmedAddress = destinationAddress.trim()
-            if (trimmedAddress.isBlank()) {
-                val addrMsg = "بيانات عنوان العميل غير مكتملة. يرجى إدخال عنوان التوصيل."
-                _snackbarMessage.value = addrMsg
-                onError?.invoke(addrMsg)
-                return@launch
-            }
-
-            val sdf = SimpleDateFormat("dd MMMM yyyy - hh:mm a", Locale("ar"))
-            val currentDate = sdf.format(Date())
-            // Delivery fee must be entered by the merchant; never invent a default.
-            val normalizedFeeInput = serviceFee.trim()
-                .replace("جنيه", "")
-                .replace("EGP", "", ignoreCase = true)
-                .replace(",", "")
-                .replace("٬", "")
-                .trim()
-                .map { ch ->
-                    when (ch) {
-                        in '٠'..'٩' -> ('0'.code + (ch.code - '٠'.code)).toChar()
-                        in '۰'..'۹' -> ('0'.code + (ch.code - '۰'.code)).toChar()
-                        else -> ch
-                    }
-                }.joinToString("")
-            val feeAmount = normalizedFeeInput.toIntOrNull()
-            if (feeAmount == null || feeAmount <= 0 || feeAmount > 100000) {
-                val feeMsg = "يرجى إدخال رسوم توصيل صحيحة من تطبيق التاجر (أكبر من صفر)."
-                _snackbarMessage.value = feeMsg
-                onError?.invoke(feeMsg)
-                return@launch
-            }
-            val formattedFee = "${feeAmount} جنيه"
-            val uid = currentUser.uid
-            val idempotencyKey = UUID.randomUUID().toString()
-            val profile = _restaurantProfile.value
-            val currentRestaurantName = profile.name.ifBlank {
-                currentUser.displayName
-                    ?: currentUser.email?.substringBefore("@")
-                    ?: "مطعم"
-            }
-
-            val requestPayload = hashMapOf<String, Any?>(
-                "merchantId" to uid,
-                "restaurantId" to uid,
-                "destinationAddress" to trimmedAddress,
-                "address" to trimmedAddress,
-                "serviceFee" to formattedFee,
-                "price" to formattedFee,
-                "customerName" to customerName.trim(),
-                "customerPhone" to customerPhone.trim(),
-                "orderDetails" to orderDetails.trim(),
-                "deliveryNotes" to deliveryNotes.trim(),
-                "merchantName" to currentRestaurantName,
-                "merchantPhone" to profile.phone.trim(),
-                "merchantLatitude" to (profile.latitude ?: profile.location?.latitude),
-                "merchantLongitude" to (profile.longitude ?: profile.location?.longitude),
-                "idempotencyKey" to idempotencyKey,
-                "requestId" to idempotencyKey,
-                "requestedCaptains" to 1,
-                "customerLatitude" to customerLatitude,
-                "customerLongitude" to customerLongitude
-            )
-
-            val serverValidation = subscriptionRepository.validateSubscriptionOnServer(requestedCaptains = 1)
-            if (serverValidation != null) {
-                latestSubscriptionSnapshot = serverValidation.snapshot
-                lastServerActiveCaptainsCount = serverValidation.activeCaptainsCount
-                hasVerifiedServerSubscriptionOnce = true
-                isInitialSubscriptionCheckInProgress = false
-                latestSubscriptionServerError = null
-                recomputeSubscriptionState()
-                if (!serverValidation.allowed) {
-                    val deniedMsg = serverValidation.message
-                        ?: "تم رفض طلب الكابتن من السيرفر: يرجى التأكد من أن اشتراكك فعال ومتاح."
-                    _snackbarMessage.value = deniedMsg
-                    onError?.invoke(deniedMsg)
+            try {
+                if (!NetworkHelper.isNetworkAvailable(getApplication()) || !NetworkHelper.isOnline.value) {
+                    val noNetMsg = "لا يمكن إجراء طلب كابتن: أنت غير متصل بالإنترنت! يرجى الاتصال لمزامنة الاشتراك مع السيرفر."
+                    _snackbarMessage.value = noNetMsg
+                    NetworkHelper.notifyNoInternet(getApplication(), "إجراء طلب كابتن جديد")
+                    onError?.invoke(noNetMsg)
                     return@launch
                 }
+
+                val currentUser = Firebase.auth.currentUser
+                if (currentUser == null || !currentUser.isEmailVerified) {
+                    val authMsg = if (currentUser == null) {
+                        "يرجى تسجيل الدخول أولاً لطلب كابتن"
+                    } else {
+                        "يجب تأكيد البريد الإلكتروني أولاً قبل طلب كابتن."
+                    }
+                    _snackbarMessage.value = authMsg
+                    onError?.invoke(authMsg)
+                    return@launch
+                }
+
+                val currentSub = _subscriptionStatus.value
+
+                // Fast client guard (Server Cloud Function `merchantCreateOrder` enforces authoritatively inside transaction)
+                if (!currentSub.canRequestCaptain()) {
+                    val normalizedPayStatus = currentSub.paymentStatus.trim().lowercase(Locale.ROOT)
+                    val subMsg = when {
+                        currentSub.isSuspended || currentSub.status == "suspended" || currentSub.status == "inactive" ->
+                            currentSub.message ?: "لا يمكن طلب كابتن: اشتراكك موقوف حالياً من قبل الإدارة. يرجى التواصل مع الإدارة أو تجديد الاشتراك."
+                        currentSub.isCancelled || currentSub.status == "cancelled" ->
+                            currentSub.message ?: "لا يمكن طلب كابتن: تم إلغاء اشتراكك. يرجى التواصل مع الإدارة أو الاشتراك في باقة جديدة."
+                        currentSub.isResubmissionRequired || normalizedPayStatus == "resubmission_requested" || normalizedPayStatus == "resubmission_required" ->
+                            currentSub.resubmissionReason ?: currentSub.message ?: "لا يمكن طلب كابتن: مطلوب إعادة رفع إيصال التحويل وموافقة الإدارة أولاً."
+                        currentSub.isRejected || normalizedPayStatus == "rejected" ->
+                            currentSub.rejectionReason ?: currentSub.message ?: "لا يمكن طلب كابتن: تم رفض طلب الاشتراك أو الدفع. يرجى تقديم طلب جديد."
+                        normalizedPayStatus == "pending_verification" || normalizedPayStatus == "pending_review" || normalizedPayStatus == "pending" ||
+                            currentSub.isPending || currentSub.isPendingReview || currentSub.status == "pending" || currentSub.status == "pending_review" ->
+                            currentSub.message ?: "لا يمكن طلب كابتن: دفعة الاشتراك قيد المراجعة والتحقق من الإدارة. سيتم التفعيل فور الموافقة."
+                        currentSub.isOfflineUnverified ->
+                            currentSub.message ?: "جاري التحقق من حالة الاشتراك مع السيرفر. يرجى المحاولة بعد ثوانٍ أو التحقق من اتصال الإنترنت."
+                        normalizedPayStatus == "failed" || currentSub.status == "payment_failed" ->
+                            "لا يمكن عمل طلب كابتن: فشلت عملية الدفع للباقة ولم يتم تأكيد الاشتراك من السيرفر. يرجى إتمام الدفع بنجاح أولاً."
+                        normalizedPayStatus == "unpaid" ->
+                            "لا يمكن عمل طلب كابتن: لم يتم سداد قيمة الباقة بعد. يرجى سداد الاشتراك وتأكيده من الإدارة أولاً."
+                        currentSub.isExpired || currentSub.status == "expired" ->
+                            "لا يمكن إنشاء الطلب: باقة اشتراك المطعم منتهية. يرجى تجديد الاشتراك."
+                        else ->
+                            "لا يمكن عمل طلب كابتن: أنت غير مشترك في أي باقة حالياً. يرجى الاشتراك في باقة أولاً."
+                    }
+                    _snackbarMessage.value = subMsg
+                    onError?.invoke(subMsg)
+                    return@launch
+                }
+
+                // Client capacity pre-check (also enforced atomically on Cloud Functions server)
+                val allowedCaptains = currentSub.maxCaptains
+                val liveActiveOrdersCount = _firestoreOrders.value.count { isOrderActiveForCaptainLimit(it.status) }
+                val activeCaptains = maxOf(currentSub.activeCaptainsCount, liveActiveOrdersCount)
+                if (activeCaptains >= allowedCaptains && allowedCaptains > 0) {
+                    val nextCaptainNumber = allowedCaptains + 1
+                    val limitMsg = "لا يمكنك طلب الكابتن رقم $nextCaptainNumber حالياً لأنك مشترك في باقة $allowedCaptains كابتن ولديك $activeCaptains طلبات نشطة في نفس الوقت. يمكنك طلب كابتن جديد فور انتهاء أي طلب من الطلبات النشطة."
+                    _snackbarMessage.value = limitMsg
+                    onError?.invoke(limitMsg)
+                    return@launch
+                }
+
+                val trimmedAddress = destinationAddress.trim()
+                if (trimmedAddress.isBlank()) {
+                    val addrMsg = "بيانات عنوان العميل غير مكتملة. يرجى إدخال عنوان التوصيل."
+                    _snackbarMessage.value = addrMsg
+                    onError?.invoke(addrMsg)
+                    return@launch
+                }
+
+                val sdf = SimpleDateFormat("dd MMMM yyyy - hh:mm a", Locale("ar"))
+                val currentDate = sdf.format(Date())
+                // Delivery fee must be entered by the merchant; never invent a default.
+                val normalizedFeeInput = serviceFee.trim()
+                    .replace("جنيه", "")
+                    .replace("EGP", "", ignoreCase = true)
+                    .replace(",", "")
+                    .replace("٬", "")
+                    .trim()
+                    .map { ch ->
+                        when (ch) {
+                            in '٠'..'٩' -> ('0'.code + (ch.code - '٠'.code)).toChar()
+                            in '۰'..'۹' -> ('0'.code + (ch.code - '۰'.code)).toChar()
+                            else -> ch
+                        }
+                    }.joinToString("")
+                val feeAmount = normalizedFeeInput.toIntOrNull()
+                if (feeAmount == null || feeAmount <= 0 || feeAmount > 100000) {
+                    val feeMsg = "يرجى إدخال رسوم توصيل صحيحة من تطبيق التاجر (أكبر من صفر)."
+                    _snackbarMessage.value = feeMsg
+                    onError?.invoke(feeMsg)
+                    return@launch
+                }
+                val formattedFee = "${feeAmount} جنيه"
+                val uid = currentUser.uid
+                val idempotencyKey = UUID.randomUUID().toString()
+                val profile = _restaurantProfile.value
+                val currentRestaurantName = profile.name.ifBlank {
+                    currentUser.displayName
+                        ?: currentUser.email?.substringBefore("@")
+                        ?: "مطعم"
+                }
+
+                val requestPayload = MerchantSubscriptionRepository.buildMerchantCreateOrderPayload(
+                    merchantId = uid,
+                    destinationAddress = trimmedAddress,
+                    deliveryFeeAmount = feeAmount,
+                    formattedServiceFee = formattedFee,
+                    customerName = customerName,
+                    customerPhone = customerPhone,
+                    orderDetails = orderDetails,
+                    deliveryNotes = deliveryNotes,
+                    merchantName = currentRestaurantName,
+                    merchantPhone = profile.phone,
+                    merchantLatitude = profile.latitude ?: profile.location?.latitude,
+                    merchantLongitude = profile.longitude ?: profile.location?.longitude,
+                    customerLatitude = customerLatitude,
+                    customerLongitude = customerLongitude,
+                    idempotencyKey = idempotencyKey,
+                    requestedCaptains = 1
+                )
+
+                val serverValidation = subscriptionRepository.validateSubscriptionOnServer(requestedCaptains = 1)
+                if (serverValidation != null) {
+                    latestSubscriptionSnapshot = serverValidation.snapshot
+                    lastServerActiveCaptainsCount = serverValidation.activeCaptainsCount
+                    hasVerifiedServerSubscriptionOnce = true
+                    isInitialSubscriptionCheckInProgress = false
+                    latestSubscriptionServerError = null
+                    recomputeSubscriptionState()
+                    if (!serverValidation.allowed) {
+                        val deniedMsg = serverValidation.message
+                            ?: "تم رفض طلب الكابتن من السيرفر: يرجى التأكد من أن اشتراكك فعال ومتاح."
+                        _snackbarMessage.value = deniedMsg
+                        onError?.invoke(deniedMsg)
+                        return@launch
+                    }
+                }
+
+                val serverResult = subscriptionRepository.createMerchantOrder(requestPayload)
+                if (serverResult.isFailure) {
+                    val errorMsg = serverResult.exceptionOrNull()?.message
+                        ?: "تم رفض إنشاء الطلب من السيرفر: يرجى التأكد من أن اشتراكك نشط وغير موقوف."
+                    Log.w("OrderViewModel", "merchantCreateOrder Cloud Function rejected order: $errorMsg")
+                    refreshSubscriptionFromServer(uid)
+                    _snackbarMessage.value = errorMsg
+                    onError?.invoke(errorMsg)
+                    return@launch
+                }
+
+                val created = serverResult.getOrThrow()
+                lastServerActiveCaptainsCount = created.activeCaptainsCount
+                recomputeSubscriptionState()
+
+                // Save to local Room database so immediate UI state reflects server-allocated order & 6-digit code
+                val newOrder = DeliveryOrderEntity(
+                    firestoreOrderId = created.orderId,
+                    orderCode = created.orderCode,
+                    orderDate = currentDate,
+                    destinationAddress = destinationAddress,
+                    serviceFee = formattedFee,
+                    customerName = customerName,
+                    customerPhone = customerPhone,
+                    orderDetails = orderDetails,
+                    deliveryNotes = deliveryNotes,
+                    customerLatitude = customerLatitude,
+                    customerLongitude = customerLongitude,
+                    status = "جاري البحث",
+                    captainName = "في انتظار كابتن",
+                    captainPhone = "",
+                    captainPhotoUrl = ""
+                )
+                repository.insertOrder(newOrder)
+                _latestCreatedOrderCode.value = created.orderCode
+                onSuccess(created.orderCode)
+            } finally {
+                _isSubmittingOrder.value = false
+                orderSubmissionInFlight.set(false)
             }
-
-            val serverResult = subscriptionRepository.requestCaptains(requestPayload)
-            if (serverResult.isFailure) {
-                val errorMsg = serverResult.exceptionOrNull()?.message
-                    ?: "تم رفض إنشاء الطلب من السيرفر: يرجى التأكد من أن اشتراكك نشط وغير موقوف."
-                Log.w("OrderViewModel", "requestCaptains Cloud Function rejected order: $errorMsg")
-                refreshSubscriptionFromServer(uid)
-                _snackbarMessage.value = errorMsg
-                onError?.invoke(errorMsg)
-                return@launch
-            }
-
-            val created = serverResult.getOrThrow()
-            lastServerActiveCaptainsCount = created.activeCaptainsCount
-            recomputeSubscriptionState()
-
-            // Save to local Room database so immediate UI state reflects server-allocated order & 6-digit code
-            val newOrder = DeliveryOrderEntity(
-                firestoreOrderId = created.orderId,
-                orderCode = created.orderCode,
-                orderDate = currentDate,
-                destinationAddress = destinationAddress,
-                serviceFee = formattedFee,
-                customerName = customerName,
-                customerPhone = customerPhone,
-                orderDetails = orderDetails,
-                deliveryNotes = deliveryNotes,
-                customerLatitude = customerLatitude,
-                customerLongitude = customerLongitude,
-                status = "جاري البحث",
-                captainName = "في انتظار كابتن",
-                captainPhone = "",
-                captainPhotoUrl = ""
-            )
-            repository.insertOrder(newOrder)
-            _latestCreatedOrderCode.value = created.orderCode
-            onSuccess(created.orderCode)
         }
     }
 
@@ -2185,6 +2273,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val currentUser = Firebase.auth.currentUser
         val uid = currentUser?.uid ?: run {
             latestSubscriptionSnapshot = RawSubscriptionSnapshot()
+            latestQuerySubscriptionSnapshots = emptyList()
             latestMerchantSubSnapshot = RawSubscriptionSnapshot()
             lastServerActiveCaptainsCount = null
             hasVerifiedServerSubscriptionOnce = false
@@ -2192,6 +2281,9 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             latestSubscriptionServerError = null
             hasEmittedSubscriptionOnce = false
             _subscriptionStatus.value = SubscriptionStatusState(isChecking = false, isExpired = false)
+            _subscriptionHistory.value = emptyList()
+            _manualSubscriptionRequests.value = emptyList()
+            _merchantPayments.value = emptyList()
             return
         }
 
@@ -2205,17 +2297,23 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             serverError = null
         )
         restaurantSubListener?.remove()
+        merchantSubscriptionsQueryListener?.remove()
+        subscriptionPackagesListener?.remove()
+        subscriptionHistoryListener?.remove()
+        manualRequestsListener?.remove()
+        merchantPaymentsListener?.remove()
+        vodafoneSettingsListener?.remove()
 
-        // Continuous real-time snapshot listener on canonical subscriptions/{uid} with MetadataChanges.INCLUDE.
-        // Backed simultaneously by merchants/{uid} real-time listener, Source.SERVER check, and Cloud Functions `getMerchantSubscription`.
+        // 1. Real-time snapshot listener on canonical subscriptions/{uid}
         restaurantSubListener = subscriptionRepository.observeSubscriptionDocument(
             uid = uid,
             onSnapshot = { raw, fromServer ->
                 val currentVer = latestSubscriptionSnapshot.subscriptionVersion ?: 0L
                 val incomingVer = raw.subscriptionVersion ?: 0L
-                val shouldAccept = !latestSubscriptionSnapshot.exists ||
+                // Always trust live server snapshots so Admin creations/cancellations without version bumps apply immediately
+                val shouldAccept = fromServer ||
+                    !latestSubscriptionSnapshot.exists ||
                     latestSubscriptionSnapshot.isFromCache ||
-                    fromServer ||
                     incomingVer >= currentVer
                 if (shouldAccept) {
                     latestSubscriptionSnapshot = raw
@@ -2242,8 +2340,252 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
         )
 
+        // 2. Real-time query listener on subscriptions where merchantId == uid
+        // Captures Admin-created auto-ID subscriptions AND preserves full renewal history.
+        merchantSubscriptionsQueryListener = subscriptionRepository.observeMerchantSubscriptionsQuery(
+            uid = uid,
+            onSnapshots = { docs, fromServer ->
+                latestQuerySubscriptionSnapshots = docs
+                if (fromServer && NetworkHelper.isOnline.value) {
+                    hasVerifiedServerSubscriptionOnce = true
+                    isInitialSubscriptionCheckInProgress = false
+                    latestSubscriptionServerError = null
+                }
+                recomputeSubscriptionState()
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to subscriptions query for $uid: ${error.message}")
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    merchantSubscriptionsQueryListener?.remove()
+                    merchantSubscriptionsQueryListener = null
+                }
+            }
+        )
+
+        // 2b. Real-time listener on subscription_packages where isActive == true (dynamic plans from Dashboard)
+        _isLoadingPackages.value = _subscriptionPackages.value.isEmpty()
+        subscriptionPackagesListener = subscriptionRepository.observeSubscriptionPackages(
+            onPackages = { packages ->
+                _isLoadingPackages.value = false
+                _packagesError.value = null
+                _subscriptionPackages.value = packages
+                publishMergedVodafoneSettings()
+                recomputeSubscriptionState()
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to subscription_packages: ${error.message}")
+                _isLoadingPackages.value = false
+                _packagesError.value = "تعذر تحميل الباقات المتاحة (${error.localizedMessage ?: "خطأ في الاتصال"})."
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    subscriptionPackagesListener?.remove()
+                    subscriptionPackagesListener = null
+                }
+            }
+        )
+
+        // 2c. Real-time listener on subscription_history where merchantId == uid (archived past periods, local sort)
+        subscriptionHistoryListener = subscriptionRepository.observeSubscriptionHistory(
+            uid = uid,
+            onHistory = { archivedHistory ->
+                latestArchivedHistoryItems = archivedHistory
+                recomputeSubscriptionState()
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to subscription_history for $uid: ${error.message}")
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    subscriptionHistoryListener?.remove()
+                    subscriptionHistoryListener = null
+                }
+            }
+        )
+
+        // 3. Real-time listener on manual_subscription_requests where merchantId == uid
+        manualRequestsListener = subscriptionRepository.observeManualSubscriptionRequests(
+            uid = uid,
+            onRequests = { requests ->
+                handleManualRequestsUpdated(requests)
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to manual_subscription_requests for $uid: ${error.message}")
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    manualRequestsListener?.remove()
+                    manualRequestsListener = null
+                }
+            }
+        )
+
+        // 4. Real-time listener on payments where merchantId == uid
+        _isLoadingPayments.value = _merchantPayments.value.isEmpty()
+        merchantPaymentsListener = subscriptionRepository.observeMerchantPayments(
+            uid = uid,
+            onPayments = { payments ->
+                _isLoadingPayments.value = false
+                _paymentsError.value = null
+                handleMerchantPaymentsUpdated(payments)
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to payments for $uid: ${error.message}")
+                _isLoadingPayments.value = false
+                _paymentsError.value = "تعذر تحميل سجل المدفوعات (${error.localizedMessage ?: "خطأ في الاتصال"})."
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    merchantPaymentsListener?.remove()
+                    merchantPaymentsListener = null
+                }
+            }
+        )
+
+        // 5. Real-time listener on settings/manual_subscription_config so Admin edits to wallet/instructions reflect live
+        vodafoneSettingsListener = subscriptionRepository.observeVodafoneCashSettings(
+            onSettings = { settings ->
+                latestRawVodafoneSettings = settings
+                publishMergedVodafoneSettings()
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to settings/manual_subscription_config: ${error.message}")
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    vodafoneSettingsListener?.remove()
+                    vodafoneSettingsListener = null
+                }
+            }
+        )
+
         if (isOnlineNow) {
             refreshSubscriptionFromServer(uid)
+            refreshPaymentsAndRequestsFromServer(uid)
+        }
+    }
+
+    private fun publishMergedVodafoneSettings() {
+        val raw = latestRawVodafoneSettings
+        val livePackages = _subscriptionPackages.value
+        val effectivePlans = if (livePackages.isNotEmpty()) livePackages else raw.plans
+        val walletValid = raw.walletNumber.isNotBlank()
+        val configured = walletValid && effectivePlans.isNotEmpty()
+        _vodafoneCashSettings.value = raw.copy(
+            plans = effectivePlans,
+            isConfiguredOnServer = configured,
+            isLoading = raw.isLoading && effectivePlans.isEmpty(),
+            loadError = when {
+                !walletValid && !raw.isLoading -> raw.loadError ?: "رقم محفظة فودافون كاش غير مضبوط في إعدادات الإدارة."
+                effectivePlans.isEmpty() && !_isLoadingPackages.value && !raw.isLoading ->
+                    _packagesError.value ?: "لا توجد باقات نشطة حالياً في إعدادات الإدارة."
+                !raw.isAcceptingSubscriptions && configured ->
+                    raw.pauseMessage ?: "استقبال طلبات الاشتراك متوقف مؤقتاً من الإدارة."
+                else -> null
+            }
+        )
+    }
+
+    private fun handleManualRequestsUpdated(requests: List<ManualSubscriptionRequestRecord>) {
+        _manualSubscriptionRequests.value = requests
+        if (!hasLoadedManualRequestsOnce) {
+            requests.forEach { knownRequestStatuses[it.requestId] = it.status }
+            hasLoadedManualRequestsOnce = true
+            return
+        }
+        for (req in requests) {
+            val prevStatus = knownRequestStatuses[req.requestId]
+            knownRequestStatuses[req.requestId] = req.status
+            if (prevStatus != null && prevStatus != req.status) {
+                when (req.status) {
+                    "approved" -> emitSubscriptionNotification(
+                        title = "تمت الموافقة على طلب الاشتراك ✓",
+                        body = "تم قبول طلبك لـ ${req.planName} (${req.expectedAmount} ج.م) وتفعيل اشتراكك.",
+                        notificationId = ("req_approved_${req.requestId}").hashCode()
+                    )
+                    "rejected" -> emitSubscriptionNotification(
+                        title = "تم رفض طلب الاشتراك ❌",
+                        body = req.rejectionReason?.let { "تم رفض طلب ${req.planName}: $it" }
+                            ?: "تم رفض طلب ${req.planName} من الإدارة. يمكنك مراجعة التفاصيل وإعادة الإرسال.",
+                        notificationId = ("req_rejected_${req.requestId}").hashCode()
+                    )
+                    "resubmission_required" -> emitSubscriptionNotification(
+                        title = "مطلوب إعادة رفع إيصال التحويل 📄",
+                        body = req.resubmissionReason ?: "يرجى إعادة رفع صورة واضحة لإيصال تحويل ${req.planName}.",
+                        notificationId = ("req_resubmit_${req.requestId}").hashCode()
+                    )
+                }
+            }
+        }
+    }
+
+    private fun handleMerchantPaymentsUpdated(payments: List<MerchantPaymentRecord>) {
+        // NOTE: Unlinked payments in `payments` NEVER auto-activate subscriptions.
+        // Only authoritative subscription documents control subscription activation.
+        _merchantPayments.value = payments
+        if (!hasLoadedPaymentsOnce) {
+            payments.forEach { knownPaymentIds.add(it.paymentId) }
+            hasLoadedPaymentsOnce = true
+            return
+        }
+        for (payment in payments) {
+            if (knownPaymentIds.add(payment.paymentId)) {
+                val amountFormatted = if (payment.amount % 1.0 == 0.0) {
+                    payment.amount.toInt().toString()
+                } else {
+                    String.format(Locale.US, "%.2f", payment.amount)
+                }
+                val pkgPart = payment.packageName?.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()
+                emitSubscriptionNotification(
+                    title = "تم تسجيل دفعة جديدة 💳",
+                    body = "تم تسجيل دفعة بقيمة $amountFormatted ج.م$pkgPart (${SubscriptionSyncResolver.formatPaymentMethodArabic(payment.paymentMethod)}).",
+                    notificationId = ("payment_${payment.paymentId}").hashCode()
+                )
+            }
+        }
+    }
+
+    private fun emitSubscriptionNotification(
+        title: String,
+        body: String,
+        notificationId: Int = System.currentTimeMillis().toInt()
+    ) {
+        _snackbarMessage.value = body
+        val timeStr = SimpleDateFormat("hh:mm a", Locale("ar")).format(Date())
+        _pushNotificationState.value = PushNotificationBanner(
+            title = title,
+            body = body,
+            timestamp = timeStr
+        )
+        NotificationHelper.showSubscriptionSyncNotification(
+            context = getApplication(),
+            title = title,
+            body = body,
+            notificationId = notificationId
+        )
+    }
+
+    fun refreshPaymentsAndRequestsFromServer(uid: String = Firebase.auth.currentUser?.uid.orEmpty()) {
+        if (uid.isBlank() || !NetworkHelper.isOnline.value) return
+        viewModelScope.launch {
+            _isLoadingPayments.value = true
+            _paymentsError.value = null
+            val payRes = subscriptionRepository.fetchMerchantPaymentsFromServer(uid)
+            payRes.onSuccess { list ->
+                handleMerchantPaymentsUpdated(list)
+                _paymentsError.value = null
+            }.onFailure { err ->
+                if (_merchantPayments.value.isEmpty()) {
+                    _paymentsError.value = "تعذر تحديث سجل المدفوعات (${err.localizedMessage ?: "خطأ في الاتصال"})."
+                }
+            }
+            _isLoadingPayments.value = false
+
+            subscriptionRepository.fetchManualSubscriptionRequestsFromServer(uid).onSuccess { reqs ->
+                handleManualRequestsUpdated(reqs)
+            }
+
+            subscriptionRepository.fetchSubscriptionHistoryFromServer(uid).onSuccess { archived ->
+                latestArchivedHistoryItems = archived
+                recomputeSubscriptionState()
+            }
+
+            subscriptionRepository.fetchSubscriptionPackagesFromServer().onSuccess { pkgs ->
+                _isLoadingPackages.value = false
+                _packagesError.value = null
+                _subscriptionPackages.value = pkgs
+                publishMergedVodafoneSettings()
+            }
         }
     }
 
@@ -2257,11 +2599,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val result = subscriptionRepository.fetchAuthoritativeSubscription(uid)
                 if (result.subscriptionSnapshot != null) {
-                    val existingVer = latestSubscriptionSnapshot.subscriptionVersion ?: 0L
-                    val fetchedVer = result.subscriptionSnapshot.subscriptionVersion ?: 0L
-                    if (!latestSubscriptionSnapshot.exists || latestSubscriptionSnapshot.isFromCache || fetchedVer >= existingVer) {
-                        latestSubscriptionSnapshot = result.subscriptionSnapshot
-                    }
+                    // Authoritative Source.SERVER result always replaces potentially stale state
+                    latestSubscriptionSnapshot = result.subscriptionSnapshot
+                } else if (result.verifiedFromServer) {
+                    latestSubscriptionSnapshot = RawSubscriptionSnapshot(exists = false, isFromCache = false)
+                }
+                if (result.subscriptionHistoryDocs.isNotEmpty() || result.verifiedFromServer) {
+                    latestQuerySubscriptionSnapshots = result.subscriptionHistoryDocs
                 }
                 val merchSnap = result.merchantDocument
                 if (merchSnap != null && merchSnap.exists()) {
@@ -2300,38 +2644,76 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private fun recomputeSubscriptionState(orders: List<DeliveryOrderEntity> = _firestoreOrders.value) {
         val liveCount = orders.count { isOrderActiveForCaptainLimit(it.status) }
         val activeOrdersCount = maxOf(liveCount, lastServerActiveCaptainsCount ?: 0)
+        val nowMillis = System.currentTimeMillis()
         val previous = _subscriptionStatus.value
-        val resolved = SubscriptionSyncResolver.resolve(
-            subscriptionDoc = latestSubscriptionSnapshot,
+
+        // Reconcile canonical subscriptions/{uid} + auto-ID subscriptions where merchantId == uid
+        val effectiveSubSnapshot = SubscriptionSyncResolver.selectEffectiveSubscriptionSnapshot(
+            canonicalDoc = latestSubscriptionSnapshot,
+            queryDocs = latestQuerySubscriptionSnapshots,
+            nowMillis = nowMillis
+        )
+        _subscriptionHistory.value = SubscriptionSyncResolver.buildSubscriptionHistory(
+            canonicalDoc = latestSubscriptionSnapshot,
+            queryDocs = latestQuerySubscriptionSnapshots,
+            archivedHistoryDocs = latestArchivedHistoryItems,
+            nowMillis = nowMillis
+        )
+
+        val baseResolved = SubscriptionSyncResolver.resolve(
+            subscriptionDoc = effectiveSubSnapshot,
             merchantDoc = latestMerchantSubSnapshot,
             isOnline = NetworkHelper.isOnline.value,
-            nowMillis = System.currentTimeMillis(),
+            nowMillis = nowMillis,
             activeCaptainsCount = activeOrdersCount,
             hasVerifiedServerOnce = hasVerifiedServerSubscriptionOnce,
             isInitialServerCheckInProgress = isInitialSubscriptionCheckInProgress,
             serverError = latestSubscriptionServerError
         )
+        val matchedPackage = _subscriptionPackages.value.firstOrNull { pkg ->
+            SubscriptionSyncResolver.planIdsMatch(pkg.id, baseResolved.planId) ||
+                SubscriptionSyncResolver.planIdsMatch(pkg.planKey, baseResolved.planId) ||
+                SubscriptionSyncResolver.planIdsMatch(pkg.packageId, baseResolved.planId)
+        }
+        val resolved = if (matchedPackage != null) {
+            baseResolved.copy(
+                durationDays = if (baseResolved.durationDays > 0) baseResolved.durationDays else matchedPackage.durationDays,
+                features = baseResolved.features.ifEmpty { matchedPackage.features },
+                price = if (baseResolved.price > 0) baseResolved.price else matchedPackage.priceEgp
+            )
+        } else {
+            baseResolved
+        }
         _subscriptionStatus.value = resolved
 
-        if (resolved.canRequestCaptain()) {
+        if (resolved.canRequestCaptain(nowMillis)) {
             _errorMessage.value = null
+            // Notify once per subscription expiry cycle when <= 3 days remain
+            val expiringNotice = SubscriptionSyncResolver.buildExpiringSoonNotification(resolved, nowMillis)
+            val expiryKey = "${resolved.subscriptionId ?: resolved.planId}_${resolved.endDateMillis ?: 0L}"
+            if (expiringNotice != null && notifiedExpiringSoonKeys.add(expiryKey)) {
+                emitSubscriptionNotification(
+                    title = expiringNotice.title,
+                    body = expiringNotice.body,
+                    notificationId = ("expiring_soon_$expiryKey").hashCode()
+                )
+            }
         }
 
         val transition = SubscriptionSyncResolver.detectTransitionNotification(
             previous = previous,
             current = resolved,
-            hadPreviousState = hasEmittedSubscriptionOnce
+            hadPreviousState = hasEmittedSubscriptionOnce,
+            nowMillis = nowMillis
         )
         if (!resolved.isChecking && resolved.status != "checking") {
             hasEmittedSubscriptionOnce = true
         }
         if (transition != null) {
-            _snackbarMessage.value = transition.body
-            val timeStr = SimpleDateFormat("hh:mm a", Locale("ar")).format(Date())
-            _pushNotificationState.value = PushNotificationBanner(
+            emitSubscriptionNotification(
                 title = transition.title,
                 body = transition.body,
-                timestamp = timeStr
+                notificationId = ("sub_transition_${resolved.status}_${resolved.subscriptionVersion}").hashCode()
             )
         }
     }
@@ -2339,8 +2721,23 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     fun loadVodafoneCashSettings() {
         viewModelScope.launch {
             _vodafoneCashSettings.value = _vodafoneCashSettings.value.copy(isLoading = true, loadError = null)
-            val fetched = subscriptionRepository.fetchVodafoneCashSettings()
-            _vodafoneCashSettings.value = fetched
+            _isLoadingPackages.value = _subscriptionPackages.value.isEmpty()
+            val pkgsResult = subscriptionRepository.fetchSubscriptionPackagesFromServer()
+            pkgsResult.onSuccess { pkgs ->
+                _isLoadingPackages.value = false
+                _packagesError.value = null
+                _subscriptionPackages.value = pkgs
+            }.onFailure { err ->
+                _isLoadingPackages.value = false
+                if (_subscriptionPackages.value.isEmpty()) {
+                    _packagesError.value = "تعذر تحميل الباقات المتاحة (${err.localizedMessage ?: "خطأ في الاتصال"})."
+                }
+            }
+            val fetched = subscriptionRepository.fetchVodafoneCashSettings(
+                knownPackages = _subscriptionPackages.value
+            )
+            latestRawVodafoneSettings = fetched
+            publishMergedVodafoneSettings()
         }
     }
 
@@ -2410,11 +2807,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             onError(pausedError)
             return
         }
-        val trustedPlan = paymentSettings.plans.firstOrNull { it.id == plan.id }
-        if (trustedPlan == null || trustedPlan.maxCaptains != plan.maxCaptains ||
-            trustedPlan.priceEgp != plan.priceEgp || trustedPlan.durationDays != plan.durationDays
-        ) {
-            val planError = "الباقة المختارة لم تعد مطابقة لإعدادات الإدارة الحالية. أعد تحميل الباقات ثم اختر الباقة من جديد."
+        val activePackages = _subscriptionPackages.value.ifEmpty { paymentSettings.plans }
+        val trustedPlan = activePackages.firstOrNull {
+            SubscriptionSyncResolver.planIdsMatch(it.id, plan.id) ||
+                SubscriptionSyncResolver.planIdsMatch(it.planKey, plan.planKey) ||
+                SubscriptionSyncResolver.planIdsMatch(it.packageId, plan.packageId)
+        }
+        if (trustedPlan == null || !trustedPlan.isActive) {
+            val planError = "الباقة المختارة لم تعد متاحة أو مفعّلة في إعدادات الإدارة الحالية. أعد تحميل الباقات ثم اختر الباقة من جديد."
             _manualSubscriptionUiState.value = ManualSubscriptionUiState.Error(planError)
             _snackbarMessage.value = planError
             onError(planError)
@@ -2430,8 +2830,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val normalizedPhone = MerchantSubscriptionRepository.normalizeEgyptianMobile(senderPhone)!!
         val uid = currentUser.uid
         val currentSubscription = _subscriptionStatus.value
-        val requestId = if (currentSubscription.isResubmissionRequired) {
-            currentSubscription.pendingRequestId!!.trim()
+        val idempotencyKey = if (currentSubscription.isResubmissionRequired && !currentSubscription.pendingRequestId.isNullOrBlank()) {
+            currentSubscription.pendingRequestId.trim()
         } else {
             "subreq_${System.currentTimeMillis()}_${UUID.randomUUID().toString().replace("-", "").take(10)}"
         }
@@ -2442,7 +2842,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             val uploadResult = FirebaseStorageManager.uploadSubscriptionReceiptImage(
                 context = getApplication(),
                 uid = uid,
-                requestId = requestId,
+                requestId = idempotencyKey,
                 localUriString = receiptLocalUri!!
             )
             if (uploadResult.isFailure) {
@@ -2457,20 +2857,25 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             val uploadedReceipt = uploadResult.getOrThrow()
             _manualSubscriptionUiState.value = ManualSubscriptionUiState.Submitting("جاري إرسال طلب الاشتراك للمراجعة...")
 
+            // Server authoritatively computes amount, captain limit, and duration from `planId`
             val payload = ManualSubscriptionRequestPayload(
                 merchantId = uid,
-                planId = plan.id,
-                planName = plan.name,
-                maxCaptains = plan.maxCaptains,
-                expectedAmount = plan.priceEgp,
+                planId = trustedPlan.id,
+                planKey = trustedPlan.planKey,
+                packageId = trustedPlan.packageId,
                 senderPhone = normalizedPhone,
                 transactionReference = transactionReference.trim(),
-                receiptStoragePath = uploadedReceipt.storagePath,
-                requestId = requestId,
+                receiptImagePath = uploadedReceipt.storagePath,
+                idempotencyKey = idempotencyKey,
                 notes = notes.trim().take(500)
             )
 
-            val submitResult = subscriptionRepository.submitManualSubscriptionRequest(payload)
+            val submitResult = subscriptionRepository.submitManualSubscriptionRequest(
+                payload = payload,
+                fallbackPlanName = trustedPlan.name,
+                fallbackMaxCaptains = trustedPlan.maxCaptains,
+                fallbackDurationDays = trustedPlan.durationDays
+            )
             if (submitResult.isFailure) {
                 val submitErr = submitResult.exceptionOrNull()?.message
                     ?: "تعذر إرسال طلب الاشتراك للمراجعة. يرجى المحاولة مرة أخرى."
@@ -2482,8 +2887,18 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
             val submitted = submitResult.getOrThrow()
             _manualSubscriptionUiState.value = ManualSubscriptionUiState.Submitted(submitted)
-            _snackbarMessage.value = submitted.message
+            val amountLabel = if (submitted.amount % 1.0 == 0.0) {
+                submitted.amount.toInt().toString()
+            } else {
+                String.format(Locale.US, "%.2f", submitted.amount)
+            }
+            emitSubscriptionNotification(
+                title = "تم إرسال طلب الاشتراك للمراجعة ⏳",
+                body = "تم إرسال طلب ${submitted.planName} ($amountLabel ج.م) برقم ${submitted.requestNumber} وبانتظار مراجعة الإدارة.",
+                notificationId = ("sub_submitted_${submitted.requestId}").hashCode()
+            )
             refreshSubscriptionFromServer(uid)
+            refreshPaymentsAndRequestsFromServer(uid)
             onSuccess(submitted)
         }
     }
@@ -2492,6 +2907,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         hasVerifiedServerSubscriptionOnce = false
         checkAndListenToRestaurantSubscription()
         refreshSubscriptionFromServer()
+        refreshPaymentsAndRequestsFromServer()
+        loadVodafoneCashSettings()
     }
 
     fun clearListeners() {
@@ -2506,22 +2923,46 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         merchantOrdersListener?.remove()
         merchantOrdersListener = null
         pendingListener?.remove()
+        pendingListener = null
         captainOrdersListener?.remove()
+        captainOrdersListener = null
         driverListener?.remove()
+        driverListener = null
         restaurantSubListener?.remove()
         restaurantSubListener = null
+        merchantSubscriptionsQueryListener?.remove()
+        merchantSubscriptionsQueryListener = null
+        subscriptionPackagesListener?.remove()
+        subscriptionPackagesListener = null
+        subscriptionHistoryListener?.remove()
+        subscriptionHistoryListener = null
+        manualRequestsListener?.remove()
+        manualRequestsListener = null
+        merchantPaymentsListener?.remove()
+        merchantPaymentsListener = null
+        vodafoneSettingsListener?.remove()
+        vodafoneSettingsListener = null
         orderTrackingListener?.remove()
         orderTrackingListener = null
         captainTrackingListener?.remove()
         captainTrackingListener = null
         currentTrackedCaptainId = null
+        activeListenersUid = null
         latestSubscriptionSnapshot = RawSubscriptionSnapshot()
+        latestQuerySubscriptionSnapshots = emptyList()
+        latestArchivedHistoryItems = emptyList()
+        latestRawVodafoneSettings = VodafoneCashSettings()
         latestMerchantSubSnapshot = RawSubscriptionSnapshot()
         lastServerActiveCaptainsCount = null
         hasVerifiedServerSubscriptionOnce = false
         isInitialSubscriptionCheckInProgress = false
         latestSubscriptionServerError = null
         hasEmittedSubscriptionOnce = false
+        hasLoadedPaymentsOnce = false
+        hasLoadedManualRequestsOnce = false
+        knownPaymentIds.clear()
+        knownRequestStatuses.clear()
+        notifiedExpiringSoonKeys.clear()
         userOrdersDocs.clear()
         restaurantOrdersDocs.clear()
         merchantOrdersDocs.clear()
@@ -2529,10 +2970,26 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         captainInfoByPhoneCache.clear()
         captainLookupTimestampMs.clear()
         resolvedOrderStoragePhotoCache.clear()
+        orderSubmissionInFlight.set(false)
+        _isSubmittingOrder.value = false
         _firestoreOrders.value = emptyList()
         _restaurantProfile.value = RestaurantProfile()
         _trackedCaptainInfo.value = null
         _subscriptionStatus.value = SubscriptionStatusState(isChecking = false, isExpired = false)
+        _subscriptionPackages.value = emptyList()
+        _isLoadingPackages.value = false
+        _packagesError.value = null
+        _subscriptionHistory.value = emptyList()
+        _manualSubscriptionRequests.value = emptyList()
+        _merchantPayments.value = emptyList()
+        _vodafoneCashSettings.value = VodafoneCashSettings()
+        _manualSubscriptionUiState.value = ManualSubscriptionUiState.Idle
+        _isLoadingPayments.value = false
+        _paymentsError.value = null
+        _snackbarMessage.value = null
+        _errorMessage.value = null
+        _pushNotificationState.value = null
+        _latestCreatedOrderCode.value = null
     }
 }
 
