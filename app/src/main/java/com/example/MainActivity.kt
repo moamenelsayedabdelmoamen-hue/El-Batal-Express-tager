@@ -314,8 +314,17 @@ class MainActivity : ComponentActivity() {
                     },
                     onLogout = {
                       kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-                        com.example.auth.MerchantAuthManager.signOutMerchant(context)
+                        val merchantUid = Firebase.auth.currentUser?.uid.orEmpty()
+                        com.example.notification.MerchantMessagingService.clearCurrentFcmTokenForMerchant(merchantUid)
                         orderViewModel.clearListeners()
+                        try {
+                          kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            com.example.db.AppDatabase.getInstance(context).clearAllTables()
+                          }
+                        } catch (e: Exception) {
+                          android.util.Log.w("MerchantLogout", "Failed to clear local merchant database: ${e.message}")
+                        }
+                        com.example.auth.MerchantAuthManager.signOutMerchant(context)
                         navController.navigate(LoginRoute) {
                           popUpTo(0) { inclusive = true }
                         }
@@ -446,8 +455,17 @@ class MainActivity : ComponentActivity() {
               },
               onLogout = {
                 CoroutineScope(Dispatchers.Main).launch {
-                  com.example.auth.MerchantAuthManager.signOutMerchant(context)
+                  val merchantUid = Firebase.auth.currentUser?.uid.orEmpty()
+                  MerchantMessagingService.clearCurrentFcmTokenForMerchant(merchantUid)
                   orderViewModel.clearListeners()
+                  try {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                      com.example.db.AppDatabase.getInstance(context).clearAllTables()
+                    }
+                  } catch (e: Exception) {
+                    android.util.Log.w("MerchantLogout", "Failed to clear local merchant database: ${e.message}")
+                  }
+                  com.example.auth.MerchantAuthManager.signOutMerchant(context)
                   navController.navigate(LoginRoute) {
                     popUpTo(0) { inclusive = true }
                   }
