@@ -267,10 +267,12 @@ export async function runAutoDispatch(
     nowMs?: number;
   } = {}
 ): Promise<boolean> {
-  // Legacy merchant-app distribution is disabled. Dashboard Cloud Functions are the
-  // single authoritative dispatcher for every new order and captain offer.
-  console.warn(`[LegacyAutoDispatchDisabled] Order ${orderId} must be dispatched by Dashboard Functions.`);
-  return false;
+  // Dashboard-owned orders must never enter the legacy merchant dispatcher.
+  // New merchant and admin orders are marked by Dashboard Functions at creation.
+  if (orderData.dispatchAuthority === "dashboard_functions") {
+    console.info(`[LegacyAutoDispatchSkipped] Dashboard Functions owns order ${orderId}.`);
+    return false;
+  }
 
   const targetDb = options.targetDb || db;
   const triggerSource = options.triggerSource || "onOrderCreated";
