@@ -414,6 +414,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private var manualRequestsListener: ListenerRegistration? = null
     private var merchantPaymentsListener: ListenerRegistration? = null
     private var vodafoneSettingsListener: ListenerRegistration? = null
+    private var subscriptionConfigListener: ListenerRegistration? = null
     private var orderTrackingListener: ListenerRegistration? = null
     private var captainTrackingListener: ListenerRegistration? = null
     private var currentTrackedCaptainId: String? = null
@@ -426,6 +427,22 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private var latestQuerySubscriptionSnapshots: List<RawSubscriptionSnapshot> = emptyList()
     @Volatile
     private var latestArchivedHistoryItems: List<SubscriptionHistoryItem> = emptyList()
+    @Volatile
+    private var latestCollectionPackages: List<SubscriptionPlanOption> = emptyList()
+    @Volatile
+    private var hasAuthoritativeCollectionPackages: Boolean = false
+    @Volatile
+    private var latestSubscriptionConfigPlans: List<SubscriptionPlanOption> = emptyList()
+    @Volatile
+    private var latestSubscriptionConfigUpdatedAtMs: Long = 0L
+    @Volatile
+    private var subscriptionPackagesPermDenied: Boolean = false
+    @Volatile
+    private var subscriptionHistoryPermDenied: Boolean = false
+    @Volatile
+    private var vodafoneSettingsPermDenied: Boolean = false
+    @Volatile
+    private var subscriptionConfigPermDenied: Boolean = false
     @Volatile
     private var latestRawVodafoneSettings: VodafoneCashSettings = VodafoneCashSettings(isLoading = true)
     @Volatile
@@ -871,12 +888,17 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             clearListeners()
         }
 
-        // Prevent duplicate listeners when listenToFirestore() is triggered repeatedly for the same active merchant
+        // Prevent duplicate listeners or teardown/re-registration churn on screen navigation
+        val packagesListenerHealthy = subscriptionPackagesListener != null || subscriptionPackagesPermDenied
+        val historyListenerHealthy = subscriptionHistoryListener != null || subscriptionHistoryPermDenied
+        val settingsListenersHealthy = (vodafoneSettingsListener != null || vodafoneSettingsPermDenied) &&
+            (subscriptionConfigListener != null || subscriptionConfigPermDenied)
         if (activeListenersUid == uid &&
             merchantProfileListener != null &&
             restaurantSubListener != null &&
-            subscriptionPackagesListener != null &&
-            subscriptionHistoryListener != null
+            packagesListenerHealthy &&
+            historyListenerHealthy &&
+            settingsListenersHealthy
         ) {
             return
         }
@@ -2303,6 +2325,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         manualRequestsListener?.remove()
         merchantPaymentsListener?.remove()
         vodafoneSettingsListener?.remove()
+        subscriptionConfigListener?.remove()
 
         // 1. Real-time snapshot listener on canonical subscriptions/{uid}
         restaurantSubListener = subscriptionRepository.observeSubscriptionDocument(
@@ -2364,26 +2387,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
         // 2b. Real-time listener on subscription_packages where isActive == true (dynamic plans from Dashboard)
         _isLoadingPackages.value = _subscriptionPackages.value.isEmpty()
-        subscriptionPackagesListener = subscriptionRepository.observeSubscriptionPackages(
-            onPackages = { packages ->
-                _isLoadingPackages.value = false
-                _packagesError.value = null
-                _subscriptionPackages.value = packages
-                publishMergedVodafoneSettings()
-                recomputeSubscriptionState()
-            },
-            onError = { error ->
-                Log.w("OrderViewModel", "Error listening to subscription_packages: ${error.message}")
-                _isLoadingPackages.value = false
-                _packagesError.value = "تعذر تحميل الباقات المتاحة (${error.localizedMessage ?: "خطأ في الاتصال"})."
-                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                    subscriptionPackagesListener?.remove()
-                    subscriptionPackagesListener = null
-                }
-            }
-        )
+        attachSubscriptionPackagesListener()
 
         // 2c. Real-time listener on subscription_history where merchantId == uid (archived past periods, local sort)
+        subscriptionHistoryPermDenied = false
         subscriptionHistoryListener = subscriptionRepository.observeSubscriptionHistory(
             uid = uid,
             onHistory = { archivedHistory ->
@@ -2393,6 +2400,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             onError = { error ->
                 Log.w("OrderViewModel", "Error listening to subscription_history for $uid: ${error.message}")
                 if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    subscriptionHistoryPermDenied = true
                     subscriptionHistoryListener?.remove()
                     subscriptionHistoryListener = null
                 }
@@ -2434,7 +2442,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             }
         )
 
-        // 5. Real-time listener on settings/manual_subscription_config so Admin edits to wallet/instructions reflect live
+        // 5. Real-time listener on settings/manual_subscription_config so Admin edits to wallet/instructions/plans reflect live
+        vodafoneSettingsPermDenied = false
         vodafoneSettingsListener = subscriptionRepository.observeVodafoneCashSettings(
             onSettings = { settings ->
                 latestRawVodafoneSettings = settings
@@ -2443,8 +2452,27 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             onError = { error ->
                 Log.w("OrderViewModel", "Error listening to settings/manual_subscription_config: ${error.message}")
                 if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    vodafoneSettingsPermDenied = true
                     vodafoneSettingsListener?.remove()
                     vodafoneSettingsListener = null
+                }
+            }
+        )
+
+        // 5b. Real-time listener on settings/subscription_config so Admin edits to plans stored there reflect live too
+        subscriptionConfigPermDenied = false
+        subscriptionConfigListener = subscriptionRepository.observeSubscriptionConfigPlans(
+            onPlans = { configPlans, updatedAtMs ->
+                latestSubscriptionConfigPlans = configPlans
+                latestSubscriptionConfigUpdatedAtMs = updatedAtMs
+                publishMergedVodafoneSettings()
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to settings/subscription_config: ${error.message}")
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    subscriptionConfigPermDenied = true
+                    subscriptionConfigListener?.remove()
+                    subscriptionConfigListener = null
                 }
             }
         )
@@ -2455,10 +2483,57 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun attachSubscriptionPackagesListener() {
+        subscriptionPackagesListener?.remove()
+        subscriptionPackagesPermDenied = false
+        subscriptionPackagesListener = subscriptionRepository.observeSubscriptionPackages(
+            onPackages = { packages ->
+                _isLoadingPackages.value = false
+                _packagesError.value = null
+                latestCollectionPackages = packages
+                if (packages.isNotEmpty()) {
+                    hasAuthoritativeCollectionPackages = true
+                }
+                publishMergedVodafoneSettings()
+                recomputeSubscriptionState()
+            },
+            onError = { error ->
+                Log.w("OrderViewModel", "Error listening to subscription_packages: ${error.message}")
+                _isLoadingPackages.value = false
+                if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                    subscriptionPackagesPermDenied = true
+                    subscriptionPackagesListener?.remove()
+                    subscriptionPackagesListener = null
+                }
+                val hasFallbackPlans = latestRawVodafoneSettings.plans.isNotEmpty() ||
+                    latestSubscriptionConfigPlans.isNotEmpty()
+                if (!hasFallbackPlans && latestCollectionPackages.isEmpty()) {
+                    _packagesError.value = if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        "تعذر تحميل الباقات المتاحة حالياً (صلاحيات القراءة غير مفعلة لقائمة الباقات). يرجى التواصل مع الإدارة أو إعادة المحاولة."
+                    } else {
+                        "تعذر تحميل الباقات المتاحة (${error.localizedMessage ?: "خطأ في الاتصال"})."
+                    }
+                }
+                publishMergedVodafoneSettings()
+            }
+        )
+    }
+
     private fun publishMergedVodafoneSettings() {
         val raw = latestRawVodafoneSettings
-        val livePackages = _subscriptionPackages.value
-        val effectivePlans = if (livePackages.isNotEmpty()) livePackages else raw.plans
+        val effectivePlans = MerchantSubscriptionRepository.resolveEffectivePackages(
+            collectionPackages = latestCollectionPackages,
+            hasAuthoritativeCollectionPackages = hasAuthoritativeCollectionPackages,
+            manualConfigPlans = raw.plans,
+            manualConfigUpdatedAtMs = raw.updatedAtMillis,
+            subscriptionConfigPlans = latestSubscriptionConfigPlans,
+            subscriptionConfigUpdatedAtMs = latestSubscriptionConfigUpdatedAtMs
+        )
+        _subscriptionPackages.value = effectivePlans
+        if (effectivePlans.isNotEmpty()) {
+            _packagesError.value = null
+            _isLoadingPackages.value = false
+        }
         val walletValid = raw.walletNumber.isNotBlank()
         val configured = walletValid && effectivePlans.isNotEmpty()
         _vodafoneCashSettings.value = raw.copy(
@@ -2474,6 +2549,9 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 else -> null
             }
         )
+        if (effectivePlans.isNotEmpty() && (latestSubscriptionSnapshot.exists || latestQuerySubscriptionSnapshots.isNotEmpty())) {
+            recomputeSubscriptionState()
+        }
     }
 
     private fun handleManualRequestsUpdated(requests: List<ManualSubscriptionRequestRecord>) {
@@ -2513,6 +2591,9 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         // NOTE: Unlinked payments in `payments` NEVER auto-activate subscriptions.
         // Only authoritative subscription documents control subscription activation.
         _merchantPayments.value = payments
+        if (latestSubscriptionSnapshot.exists || latestQuerySubscriptionSnapshots.isNotEmpty()) {
+            recomputeSubscriptionState()
+        }
         if (!hasLoadedPaymentsOnce) {
             payments.forEach { knownPaymentIds.add(it.paymentId) }
             hasLoadedPaymentsOnce = true
@@ -2583,7 +2664,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             subscriptionRepository.fetchSubscriptionPackagesFromServer().onSuccess { pkgs ->
                 _isLoadingPackages.value = false
                 _packagesError.value = null
-                _subscriptionPackages.value = pkgs
+                latestCollectionPackages = pkgs
+                if (pkgs.isNotEmpty()) {
+                    hasAuthoritativeCollectionPackages = true
+                }
+                if (subscriptionPackagesListener == null && activeListenersUid != null) {
+                    attachSubscriptionPackagesListener()
+                }
                 publishMergedVodafoneSettings()
             }
         }
@@ -2647,22 +2734,43 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         val nowMillis = System.currentTimeMillis()
         val previous = _subscriptionStatus.value
 
+        val availablePackages = _subscriptionPackages.value.ifEmpty { latestRawVodafoneSettings.plans }
+        val knownPayments = _merchantPayments.value
+
+        val enrichedCanonicalDoc = SubscriptionSyncResolver.enrichSnapshotFromPackagesAndPayments(
+            snapshot = latestSubscriptionSnapshot,
+            packages = availablePackages,
+            payments = knownPayments
+        )
+        val enrichedQueryDocs = latestQuerySubscriptionSnapshots.map { doc ->
+            SubscriptionSyncResolver.enrichSnapshotFromPackagesAndPayments(
+                snapshot = doc,
+                packages = availablePackages,
+                payments = knownPayments
+            )
+        }
+        val enrichedMerchantDoc = SubscriptionSyncResolver.enrichSnapshotFromPackagesAndPayments(
+            snapshot = latestMerchantSubSnapshot,
+            packages = availablePackages,
+            payments = knownPayments
+        )
+
         // Reconcile canonical subscriptions/{uid} + auto-ID subscriptions where merchantId == uid
         val effectiveSubSnapshot = SubscriptionSyncResolver.selectEffectiveSubscriptionSnapshot(
-            canonicalDoc = latestSubscriptionSnapshot,
-            queryDocs = latestQuerySubscriptionSnapshots,
+            canonicalDoc = enrichedCanonicalDoc,
+            queryDocs = enrichedQueryDocs,
             nowMillis = nowMillis
         )
         _subscriptionHistory.value = SubscriptionSyncResolver.buildSubscriptionHistory(
-            canonicalDoc = latestSubscriptionSnapshot,
-            queryDocs = latestQuerySubscriptionSnapshots,
+            canonicalDoc = enrichedCanonicalDoc,
+            queryDocs = enrichedQueryDocs,
             archivedHistoryDocs = latestArchivedHistoryItems,
             nowMillis = nowMillis
         )
 
         val baseResolved = SubscriptionSyncResolver.resolve(
             subscriptionDoc = effectiveSubSnapshot,
-            merchantDoc = latestMerchantSubSnapshot,
+            merchantDoc = enrichedMerchantDoc,
             isOnline = NetworkHelper.isOnline.value,
             nowMillis = nowMillis,
             activeCaptainsCount = activeOrdersCount,
@@ -2670,7 +2778,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             isInitialServerCheckInProgress = isInitialSubscriptionCheckInProgress,
             serverError = latestSubscriptionServerError
         )
-        val matchedPackage = _subscriptionPackages.value.firstOrNull { pkg ->
+        val matchedPackage = availablePackages.firstOrNull { pkg ->
             SubscriptionSyncResolver.planIdsMatch(pkg.id, baseResolved.planId) ||
                 SubscriptionSyncResolver.planIdsMatch(pkg.planKey, baseResolved.planId) ||
                 SubscriptionSyncResolver.planIdsMatch(pkg.packageId, baseResolved.planId)
@@ -2723,20 +2831,49 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             _vodafoneCashSettings.value = _vodafoneCashSettings.value.copy(isLoading = true, loadError = null)
             _isLoadingPackages.value = _subscriptionPackages.value.isEmpty()
             val pkgsResult = subscriptionRepository.fetchSubscriptionPackagesFromServer()
+            var packagesFetchError: Throwable? = null
             pkgsResult.onSuccess { pkgs ->
-                _isLoadingPackages.value = false
-                _packagesError.value = null
-                _subscriptionPackages.value = pkgs
+                latestCollectionPackages = pkgs
+                if (pkgs.isNotEmpty()) {
+                    hasAuthoritativeCollectionPackages = true
+                    _isLoadingPackages.value = false
+                    _packagesError.value = null
+                }
+                // If rules were updated to allow reading subscription_packages, re-attach the live listener automatically
+                if (subscriptionPackagesListener == null && activeListenersUid != null) {
+                    attachSubscriptionPackagesListener()
+                }
             }.onFailure { err ->
-                _isLoadingPackages.value = false
-                if (_subscriptionPackages.value.isEmpty()) {
-                    _packagesError.value = "تعذر تحميل الباقات المتاحة (${err.localizedMessage ?: "خطأ في الاتصال"})."
+                packagesFetchError = err
+            }
+            val fetchedManual = subscriptionRepository.fetchVodafoneCashSettings()
+            latestRawVodafoneSettings = fetchedManual
+
+            subscriptionRepository.fetchSubscriptionConfigPlansFromServer().onSuccess { (plans, updatedAtMs) ->
+                latestSubscriptionConfigPlans = plans
+                latestSubscriptionConfigUpdatedAtMs = updatedAtMs
+            }
+
+            val resolvedPlans = MerchantSubscriptionRepository.resolveEffectivePackages(
+                collectionPackages = latestCollectionPackages,
+                hasAuthoritativeCollectionPackages = hasAuthoritativeCollectionPackages,
+                manualConfigPlans = fetchedManual.plans,
+                manualConfigUpdatedAtMs = fetchedManual.updatedAtMillis,
+                subscriptionConfigPlans = latestSubscriptionConfigPlans,
+                subscriptionConfigUpdatedAtMs = latestSubscriptionConfigUpdatedAtMs
+            )
+            if (resolvedPlans.isNotEmpty()) {
+                _packagesError.value = null
+            } else if (packagesFetchError != null && !hasAuthoritativeCollectionPackages) {
+                val isPermDenied = (packagesFetchError as? FirebaseFirestoreException)?.code == FirebaseFirestoreException.Code.PERMISSION_DENIED ||
+                    packagesFetchError?.message?.contains("PERMISSION_DENIED", ignoreCase = true) == true
+                _packagesError.value = if (isPermDenied) {
+                    "تعذر تحميل الباقات المتاحة حالياً (صلاحيات القراءة غير مفعلة لقائمة الباقات). يرجى التواصل مع الإدارة أو إعادة المحاولة."
+                } else {
+                    "تعذر تحميل الباقات المتاحة (${packagesFetchError?.localizedMessage ?: "خطأ في الاتصال"})."
                 }
             }
-            val fetched = subscriptionRepository.fetchVodafoneCashSettings(
-                knownPackages = _subscriptionPackages.value
-            )
-            latestRawVodafoneSettings = fetched
+            _isLoadingPackages.value = false
             publishMergedVodafoneSettings()
         }
     }
@@ -2942,6 +3079,8 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         merchantPaymentsListener = null
         vodafoneSettingsListener?.remove()
         vodafoneSettingsListener = null
+        subscriptionConfigListener?.remove()
+        subscriptionConfigListener = null
         orderTrackingListener?.remove()
         orderTrackingListener = null
         captainTrackingListener?.remove()
@@ -2951,6 +3090,14 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         latestSubscriptionSnapshot = RawSubscriptionSnapshot()
         latestQuerySubscriptionSnapshots = emptyList()
         latestArchivedHistoryItems = emptyList()
+        latestCollectionPackages = emptyList()
+        hasAuthoritativeCollectionPackages = false
+        latestSubscriptionConfigPlans = emptyList()
+        latestSubscriptionConfigUpdatedAtMs = 0L
+        subscriptionPackagesPermDenied = false
+        subscriptionHistoryPermDenied = false
+        vodafoneSettingsPermDenied = false
+        subscriptionConfigPermDenied = false
         latestRawVodafoneSettings = VodafoneCashSettings()
         latestMerchantSubSnapshot = RawSubscriptionSnapshot()
         lastServerActiveCaptainsCount = null

@@ -613,4 +613,121 @@ class MerchantIntegrationAuditFixesTest {
         assertEquals("", vm.vodafoneCashSettings.value.walletNumber)
         assertFalse(vm.isSubmittingOrder.value)
     }
+
+    // Test 13: Active paid subscription missing planName/planId/maxCaptains NEVER shows as unsubscribed
+    // and enriches seamlessly from live packages & merchant payments
+    @Test
+    fun test13_activePaidSubscriptionWithMissingPlanMetadataStaysActiveAndEnriches() {
+        val rawActiveDoc = RawSubscriptionSnapshot(
+            exists = true,
+            documentId = "sub_live_400",
+            subscriptionId = "sub_live_400",
+            merchantId = "merchant_uid_55",
+            status = "active",
+            paymentStatus = "paid",
+            planId = null,
+            planName = null,
+            maxCaptains = null,
+            price = 400,
+            startDateMillis = nowMs,
+            endDateMillis = nowMs + 30 * dayMs,
+            isFromCache = false
+        )
+
+        // Even with zero packages loaded (e.g. subscription_packages PERMISSION_DENIED),
+        // an active, paid, unexpired subscription must NEVER downgrade to "unsubscribed".
+        val resolvedWithoutCatalog = SubscriptionSyncResolver.resolve(
+            subscriptionDoc = rawActiveDoc,
+            merchantDoc = RawSubscriptionSnapshot(exists = true, subscriptionStatus = "unsubscribed", isFromCache = false),
+            isOnline = true,
+            nowMillis = nowMs,
+            hasVerifiedServerOnce = true
+        )
+        assertEquals("active", resolvedWithoutCatalog.status)
+        assertTrue(resolvedWithoutCatalog.isSubscribed)
+        assertTrue(resolvedWithoutCatalog.canRequestCaptain(nowMs))
+        assertEquals(400, resolvedWithoutCatalog.price)
+        assertEquals(30, resolvedWithoutCatalog.durationDays)
+        assertTrue(resolvedWithoutCatalog.maxCaptains >= 1)
+
+        // When packages & payments are available, enrichment fills planName, maxCaptains, paymentMethod, features
+        val livePackages = listOf(
+            com.example.db.SubscriptionPlanOption(
+                id = "plan_2_captains",
+                name = "الباقة الأساسية",
+                captainsLabel = "2 كابتن",
+                maxCaptains = 2,
+                priceEgp = 400,
+                durationDays = 30,
+                features = listOf("2 كابتن متزامن", "دعم فني")
+            ),
+            com.example.db.SubscriptionPlanOption(
+                id = "plan_4_captains",
+                name = "الباقة المتوسطة",
+                captainsLabel = "4 كابتن",
+                maxCaptains = 4,
+                priceEgp = 800,
+                durationDays = 30
+            )
+        )
+        val payments = listOf(
+            SubscriptionSyncResolver.parsePaymentMap(
+                id = "pay_400",
+                data = mapOf(
+                    "merchantId" to "merchant_uid_55",
+                    "subscriptionId" to "sub_live_400",
+                    "amount" to 400,
+                    "packageName" to "الباقة الأساسية",
+                    "paymentMethod" to "vodafone_cash",
+                    "paymentStatus" to "paid"
+                )
+            )
+        )
+        val enriched = SubscriptionSyncResolver.enrichSnapshotFromPackagesAndPayments(
+            snapshot = rawActiveDoc,
+            packages = livePackages,
+            payments = payments
+        )
+        val resolvedEnriched = SubscriptionSyncResolver.resolve(
+            subscriptionDoc = enriched,
+            merchantDoc = RawSubscriptionSnapshot(exists = true, subscriptionStatus = "unsubscribed", isFromCache = false),
+            isOnline = true,
+            nowMillis = nowMs,
+            hasVerifiedServerOnce = true
+        )
+        assertEquals("active", resolvedEnriched.status)
+        assertTrue(resolvedEnriched.canRequestCaptain(nowMs))
+        assertEquals("الباقة الأساسية", resolvedEnriched.planName)
+        assertEquals(2, resolvedEnriched.maxCaptains)
+        assertEquals(400, resolvedEnriched.price)
+        assertEquals("vodafone_cash", resolvedEnriched.paymentMethod)
+        assertEquals(listOf("2 كابتن متزامن", "دعم فني"), resolvedEnriched.features)
+    }
+
+    // Test 14: Unlinked payment NEVER creates/activates a missing subscription, and text-based captain extraction works
+    @Test
+    fun test14_enrichmentNeverActivatesMissingSubscriptionAndExtractsCaptainsFromPlanText() {
+        val emptySnapshot = RawSubscriptionSnapshot(exists = false)
+        val payments = listOf(
+            SubscriptionSyncResolver.parsePaymentMap(
+                id = "pay_unlinked",
+                data = mapOf(
+                    "merchantId" to "merchant_uid_55",
+                    "amount" to 400,
+                    "packageName" to "الباقة الأساسية",
+                    "paymentStatus" to "paid"
+                )
+            )
+        )
+        val enrichedEmpty = SubscriptionSyncResolver.enrichSnapshotFromPackagesAndPayments(
+            snapshot = emptySnapshot,
+            packages = emptyList(),
+            payments = payments
+        )
+        assertFalse(enrichedEmpty.exists)
+
+        assertEquals(2, SubscriptionSyncResolver.extractCaptainsFromPlanText("plan_2_captains"))
+        assertEquals(6, SubscriptionSyncResolver.extractCaptainsFromPlanText("باقة 6 كابتن"))
+        assertEquals(12, SubscriptionSyncResolver.extractCaptainsFromPlanText("pkg_12_captains"))
+    }
 }

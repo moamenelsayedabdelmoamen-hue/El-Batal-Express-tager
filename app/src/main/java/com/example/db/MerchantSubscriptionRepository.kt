@@ -76,7 +76,8 @@ data class VodafoneCashSettings(
     val isAcceptingSubscriptions: Boolean = false,
     val pauseMessage: String? = null,
     val isLoading: Boolean = false,
-    val loadError: String? = null
+    val loadError: String? = null,
+    val updatedAtMillis: Long = 0L
 )
 
 /**
@@ -240,6 +241,8 @@ class MerchantSubscriptionRepository(
         ): SubscriptionPlanOption? {
             if (map["isActive"] == false) return null
             if (map["enabled"] == false) return null
+            val rawPkgStatus = map["status"]?.toString()?.trim()?.lowercase(java.util.Locale.ROOT)
+            if (rawPkgStatus == "inactive" || rawPkgStatus == "disabled" || rawPkgStatus == "archived") return null
 
             val resolvedPlanId = SubscriptionSyncResolver.parsePlanIdString(
                 rawPlanId = map["planId"],
@@ -262,21 +265,37 @@ class MerchantSubscriptionRepository(
             val configuredLimit = (map["maxCaptains"] as? Number)?.toInt()
                 ?: (map["captainLimit"] as? Number)?.toInt()
                 ?: (map["captainsLimit"] as? Number)?.toInt()
+                ?: (map["captainsCount"] as? Number)?.toInt()
+                ?: (map["captainCount"] as? Number)?.toInt()
+                ?: (map["max_captains"] as? Number)?.toInt()
+                ?: (map["captain_limit"] as? Number)?.toInt()
+                ?: (map["allowedCaptains"] as? Number)?.toInt()
                 ?: map["maxCaptains"]?.toString()?.toIntOrNull()
                 ?: map["captainLimit"]?.toString()?.toIntOrNull()
+                ?: map["captainsCount"]?.toString()?.toIntOrNull()
+                ?: map["max_captains"]?.toString()?.toIntOrNull()
+                ?: map["captain_limit"]?.toString()?.toIntOrNull()
                 ?: return null
             if (configuredLimit <= 0) return null
 
             val price = (map["price"] as? Number)?.toInt()
                 ?: (map["priceEgp"] as? Number)?.toInt()
+                ?: (map["price_egp"] as? Number)?.toInt()
+                ?: (map["monthlyPrice"] as? Number)?.toInt()
                 ?: (map["amount"] as? Number)?.toInt()
+                ?: (map["cost"] as? Number)?.toInt()
                 ?: map["price"]?.toString()?.toDoubleOrNull()?.toInt()
+                ?: map["priceEgp"]?.toString()?.toDoubleOrNull()?.toInt()
+                ?: map["amount"]?.toString()?.toDoubleOrNull()?.toInt()
                 ?: return null
             if (price <= 0) return null
 
             val durationDays = (map["durationDays"] as? Number)?.toInt()
+                ?: (map["duration_days"] as? Number)?.toInt()
                 ?: (map["duration"] as? Number)?.toInt()
+                ?: (map["days"] as? Number)?.toInt()
                 ?: map["durationDays"]?.toString()?.toIntOrNull()
+                ?: map["duration_days"]?.toString()?.toIntOrNull()
                 ?: 30
             if (durationDays !in 1..3650) return null
 
@@ -343,6 +362,37 @@ class MerchantSubscriptionRepository(
                 fallbackId to map
             }
             return parseSubscriptionPackages(pairs)
+        }
+
+        /**
+         * Deterministically reconciles packages across all 3 possible Firestore sources without
+         * resurrecting disabled packages or allowing an older document to overwrite newer edits:
+         * 1. `subscription_packages` (`isActive == true`) is authoritative whenever non-empty, or
+         *    once it has already served active packages in this session (so disabling all packages
+         *    there empties the list rather than resurrecting legacy plans from `settings` docs).
+         * 2. Between `settings/manual_subscription_config` and `settings/subscription_config`,
+         *    when both contain plans, the document with the newer server `updatedAtMillis` wins.
+         */
+        fun resolveEffectivePackages(
+            collectionPackages: List<SubscriptionPlanOption>,
+            hasAuthoritativeCollectionPackages: Boolean,
+            manualConfigPlans: List<SubscriptionPlanOption>,
+            manualConfigUpdatedAtMs: Long = 0L,
+            subscriptionConfigPlans: List<SubscriptionPlanOption>,
+            subscriptionConfigUpdatedAtMs: Long = 0L
+        ): List<SubscriptionPlanOption> {
+            if (collectionPackages.isNotEmpty()) return collectionPackages
+            if (hasAuthoritativeCollectionPackages) return emptyList()
+            if (manualConfigPlans.isNotEmpty() && subscriptionConfigPlans.isNotEmpty()) {
+                return if (subscriptionConfigUpdatedAtMs > manualConfigUpdatedAtMs) {
+                    subscriptionConfigPlans
+                } else {
+                    manualConfigPlans
+                }
+            }
+            if (manualConfigPlans.isNotEmpty()) return manualConfigPlans
+            if (subscriptionConfigPlans.isNotEmpty()) return subscriptionConfigPlans
+            return emptyList()
         }
 
         /**
@@ -764,6 +814,51 @@ class MerchantSubscriptionRepository(
             }
     }
 
+    /**
+     * Real-time listener for `settings/subscription_config` so Dashboard package edits stored
+     * in `settings/subscription_config` (`plans` or `packages`) appear immediately without restart.
+     */
+    fun observeSubscriptionConfigPlans(
+        onPlans: (List<SubscriptionPlanOption>, Long) -> Unit,
+        onError: (FirebaseFirestoreException) -> Unit
+    ): ListenerRegistration {
+        return Firebase.firestore.collection("settings")
+            .document("subscription_config")
+            .addSnapshotListener { snap, err ->
+                if (err != null) {
+                    onError(err)
+                    return@addSnapshotListener
+                }
+                val rawPlans = snap?.get("plans") ?: snap?.get("packages")
+                val updatedAt = extractConfigUpdatedAtMillis(snap)
+                onPlans(parseConfiguredPlans(rawPlans), updatedAt)
+            }
+    }
+
+    suspend fun fetchSubscriptionConfigPlansFromServer(): Result<Pair<List<SubscriptionPlanOption>, Long>> {
+        return try {
+            val snap = Firebase.firestore.collection("settings")
+                .document("subscription_config")
+                .get(Source.SERVER)
+                .await()
+            val rawPlans = snap.get("plans") ?: snap.get("packages")
+            val updatedAt = extractConfigUpdatedAtMillis(snap)
+            Result.success(parseConfiguredPlans(rawPlans) to updatedAt)
+        } catch (e: Exception) {
+            Log.w(TAG, "Source.SERVER read settings/subscription_config failed: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    private fun extractConfigUpdatedAtMillis(snapshot: DocumentSnapshot?): Long {
+        if (snapshot == null || !snapshot.exists()) return 0L
+        return SubscriptionSyncResolver.parseDateMillis(snapshot.get("updatedAt"))
+            ?: SubscriptionSyncResolver.parseDateMillis(snapshot.get("updated_at"))
+            ?: SubscriptionSyncResolver.parseDateMillis(snapshot.get("lastUpdatedAt"))
+            ?: SubscriptionSyncResolver.parseDateMillis(snapshot.get("modifiedAt"))
+            ?: 0L
+    }
+
     suspend fun fetchMerchantPaymentsFromServer(uid: String): Result<List<MerchantPaymentRecord>> {
         if (uid.isBlank()) return Result.success(emptyList())
         return try {
@@ -1097,7 +1192,7 @@ class MerchantSubscriptionRepository(
         )?.trim().orEmpty()
         val normalizedWallet = normalizeEgyptianMobile(wallet).orEmpty()
         val walletIsValid = normalizedWallet.isNotEmpty()
-        val configPlans = parseConfiguredPlans(snapshot.get("plans"))
+        val configPlans = parseConfiguredPlans(snapshot.get("plans") ?: snapshot.get("packages"))
         val effectivePlans = if (activePackages.isNotEmpty()) activePackages else configPlans
         val accepting = snapshot.getBoolean("isAcceptingSubscriptions")
             ?: snapshot.getBoolean("enabled")
@@ -1106,6 +1201,7 @@ class MerchantSubscriptionRepository(
         val pauseMessage = snapshot.getAnyString("pauseMessage")?.trim()
             ?.takeIf { it.isNotBlank() }
         val configured = walletIsValid && effectivePlans.isNotEmpty()
+        val updatedAtMillis = extractConfigUpdatedAtMillis(snapshot)
 
         return VodafoneCashSettings(
             walletNumber = normalizedWallet,
@@ -1126,24 +1222,30 @@ class MerchantSubscriptionRepository(
                 effectivePlans.isEmpty() -> "لا توجد باقات نشطة حالياً في إعدادات الإدارة."
                 !accepting -> pauseMessage ?: "استقبال طلبات الاشتراك متوقف مؤقتاً من الإدارة."
                 else -> null
-            }
+            },
+            updatedAtMillis = updatedAtMillis
         )
     }
 
     /**
-     * Fetches wallet settings from `settings/manual_subscription_config` and active packages
-     * from `subscription_packages` (`isActive == true`).
+     * Fetches wallet settings from `settings/manual_subscription_config` (purely without mutating
+     * with stale fallbacks; callers merge `subscription_packages`, `manual_subscription_config`,
+     * and `subscription_config` deterministically via `resolveEffectivePackages`).
      */
     suspend fun fetchVodafoneCashSettings(
         knownPackages: List<SubscriptionPlanOption> = emptyList()
     ): VodafoneCashSettings {
         return try {
-            val packages = fetchSubscriptionPackagesFromServer().getOrElse { knownPackages }
-            val snapshot = Firebase.firestore.collection("settings")
-                .document("manual_subscription_config")
-                .get(Source.SERVER)
-                .await()
-            parseVodafoneCashSettingsSnapshot(snapshot, activePackages = packages)
+            val manualSnap = try {
+                Firebase.firestore.collection("settings")
+                    .document("manual_subscription_config")
+                    .get(Source.SERVER)
+                    .await()
+            } catch (e: Exception) {
+                Log.w(TAG, "Reading settings/manual_subscription_config from server failed: ${e.message}")
+                null
+            }
+            parseVodafoneCashSettingsSnapshot(manualSnap, activePackages = emptyList())
         } catch (e: Exception) {
             Log.e(TAG, "Reading settings/manual_subscription_config from server failed: ${e.message}", e)
             VodafoneCashSettings(

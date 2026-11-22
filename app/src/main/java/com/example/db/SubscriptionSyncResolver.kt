@@ -411,6 +411,135 @@ object SubscriptionSyncResolver {
         }
     }
 
+    private fun extractIntFromMapOrSnapshot(raw: Any?): Int? {
+        if (raw == null) return null
+        if (raw is Number) return raw.toInt().takeIf { it > 0 }
+        return raw.toString().trim().toDoubleOrNull()?.toInt()?.takeIf { it > 0 }
+    }
+
+    private fun extractNestedPlanMap(raw: Any?): Map<*, *>? = raw as? Map<*, *>
+
+    /**
+     * Extracts captain count from structured plan identifiers or Arabic/English plan names
+     * such as `plan_2_captains`, `pkg_6_captains`, or `باقة 4 كابتن` when numeric limit fields are omitted.
+     */
+    fun extractCaptainsFromPlanText(vararg values: String?): Int? {
+        val patterns = listOf(
+            Regex("""(?:plan|pkg|package)[_\-\s]*(\d{1,3})[_\-\s]*(?:captain|captains|driver|drivers)""", RegexOption.IGNORE_CASE),
+            Regex("""(\d{1,3})\s*(?:كابتن|كباتن|مندوب|مناديب|captains?|drivers?)""", RegexOption.IGNORE_CASE)
+        )
+        for (raw in values) {
+            val text = raw?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            for (pattern in patterns) {
+                val match = pattern.find(text)
+                val count = match?.groupValues?.getOrNull(1)?.toIntOrNull()
+                if (count != null && count in 1..500) return count
+            }
+        }
+        return null
+    }
+
+    /**
+     * Enriches an EXISTING subscription snapshot with missing metadata (`planId`, `planName`,
+     * `maxCaptains`, `durationDays`, `features`, `paymentMethod`) from live Firestore packages
+     * and the merchant's own paid payment records.
+     *
+     * SAFETY: Never creates or activates a subscription when `snapshot.exists == false`.
+     */
+    fun enrichSnapshotFromPackagesAndPayments(
+        snapshot: RawSubscriptionSnapshot,
+        packages: List<SubscriptionPlanOption>,
+        payments: List<MerchantPaymentRecord> = emptyList()
+    ): RawSubscriptionSnapshot {
+        if (!snapshot.exists) return snapshot
+
+        // 1. Cross-reference linked paid payment ONLY for missing display/metadata fields
+        val linkedPayment = payments.firstOrNull { pay ->
+            val subIdMatch = !pay.subscriptionId.isNullOrBlank() && (
+                pay.subscriptionId == snapshot.subscriptionId ||
+                    pay.subscriptionId == snapshot.documentId
+                )
+            subIdMatch
+        } ?: if (snapshot.planName.isNullOrBlank() || snapshot.paymentMethod.isNullOrBlank()) {
+            val subPrice = snapshot.price ?: 0
+            if (subPrice > 0) {
+                payments.firstOrNull { pay ->
+                    normalizePaymentStatus(pay.paymentStatus) in setOf("paid", "admin_manual") &&
+                        pay.amount.toInt() == subPrice &&
+                        (!pay.packageName.isNullOrBlank() || !pay.packageId.isNullOrBlank() || pay.paymentMethod.isNotBlank())
+                }
+            } else null
+        } else null
+
+        val withPaymentMeta = if (linkedPayment != null) {
+            snapshot.copy(
+                planName = snapshot.planName?.takeIf { it.isNotBlank() } ?: linkedPayment.packageName,
+                packageId = snapshot.packageId?.takeIf { it.isNotBlank() } ?: linkedPayment.packageId,
+                planId = snapshot.planId?.takeIf { it.isNotBlank() } ?: linkedPayment.packageId,
+                paymentMethod = snapshot.paymentMethod?.takeIf { it.isNotBlank() }
+                    ?: linkedPayment.paymentMethod.takeIf { it.isNotBlank() }
+            )
+        } else {
+            snapshot
+        }
+
+        // 2. Match live Firestore package by ID, key, name, or unique price when metadata is missing
+        val matchedPackage = packages.firstOrNull { pkg ->
+            planIdsMatch(pkg.id, withPaymentMeta.planId) ||
+                planIdsMatch(pkg.planKey, withPaymentMeta.planId) ||
+                planIdsMatch(pkg.packageId, withPaymentMeta.planId) ||
+                planIdsMatch(pkg.id, withPaymentMeta.packageId) ||
+                planIdsMatch(pkg.id, withPaymentMeta.planKey)
+        } ?: withPaymentMeta.planName?.trim()?.takeIf { it.isNotBlank() }?.let { targetName ->
+            packages.firstOrNull { pkg ->
+                pkg.name.trim().equals(targetName, ignoreCase = true)
+            }
+        } ?: run {
+            val subPrice = withPaymentMeta.price ?: 0
+            if (subPrice > 0 && ((withPaymentMeta.maxCaptains ?: 0) <= 0 || withPaymentMeta.planName.isNullOrBlank())) {
+                val priceMatches = packages.filter { it.priceEgp == subPrice }
+                if (priceMatches.size == 1) priceMatches.first() else null
+            } else {
+                null
+            }
+        }
+
+        val derivedDuration = withPaymentMeta.durationDays?.takeIf { it > 0 }
+            ?: matchedPackage?.durationDays?.takeIf { it > 0 }
+            ?: run {
+                val start = withPaymentMeta.startDateMillis
+                val end = withPaymentMeta.endDateMillis
+                if (start != null && end != null && end > start) {
+                    ((end - start) / (24L * 60L * 60L * 1000L)).toInt().coerceAtLeast(1)
+                } else null
+            }
+
+        if (matchedPackage == null) {
+            val extractedCaptains = withPaymentMeta.maxCaptains?.takeIf { it > 0 }
+                ?: extractCaptainsFromPlanText(
+                    withPaymentMeta.planId,
+                    withPaymentMeta.planKey,
+                    withPaymentMeta.packageId,
+                    withPaymentMeta.planName
+                )
+            return withPaymentMeta.copy(
+                maxCaptains = extractedCaptains ?: withPaymentMeta.maxCaptains,
+                durationDays = derivedDuration ?: withPaymentMeta.durationDays
+            )
+        }
+
+        return withPaymentMeta.copy(
+            planId = withPaymentMeta.planId?.takeIf { it.isNotBlank() } ?: matchedPackage.id,
+            planKey = withPaymentMeta.planKey?.takeIf { it.isNotBlank() } ?: matchedPackage.planKey,
+            packageId = withPaymentMeta.packageId?.takeIf { it.isNotBlank() } ?: matchedPackage.packageId,
+            planName = withPaymentMeta.planName?.takeIf { it.isNotBlank() } ?: matchedPackage.name,
+            maxCaptains = withPaymentMeta.maxCaptains?.takeIf { it > 0 } ?: matchedPackage.maxCaptains,
+            price = withPaymentMeta.price?.takeIf { it > 0 } ?: matchedPackage.priceEgp,
+            durationDays = derivedDuration ?: matchedPackage.durationDays,
+            features = withPaymentMeta.features.ifEmpty { matchedPackage.features }
+        )
+    }
+
     fun fromFirestoreSnapshot(snapshot: DocumentSnapshot?): RawSubscriptionSnapshot {
         if (snapshot == null || !snapshot.exists()) {
             return RawSubscriptionSnapshot(
@@ -419,26 +548,65 @@ object SubscriptionSyncResolver {
                 isFromCache = snapshot?.metadata?.isFromCache == true
             )
         }
+        val nestedPlanMap = extractNestedPlanMap(snapshot.get("plan"))
+            ?: extractNestedPlanMap(snapshot.get("package"))
+            ?: extractNestedPlanMap(snapshot.get("planDetails"))
+            ?: extractNestedPlanMap(snapshot.get("packageDetails"))
         val isActiveField = snapshot.getBoolean("isActive")
         val isSubscribedField = snapshot.getBoolean("isSubscribed")
-        val limitValue = (snapshot.get("captainLimit") as? Number)?.toInt()
-            ?: (snapshot.get("maxCaptains") as? Number)?.toInt()
-            ?: (snapshot.get("captainsLimit") as? Number)?.toInt()
-            ?: (snapshot.get("captains") as? Number)?.toInt()
-            ?: snapshot.safeString("captainLimit")?.toIntOrNull()
-            ?: snapshot.safeString("maxCaptains")?.toIntOrNull()
-        val rawPlanName = snapshot.getAnyString("planName", "packageName", "plan_name", "package_name", "title")
-        val rawPlanKey = snapshot.getAnyString("planKey", "plan_key")
-        val rawPackageId = snapshot.getAnyString("packageId", "package_id", "planId", "plan_id", "planKey")
-        val parsedPlanId = parsePlanIdString(
-            rawPlanId = snapshot.get("planId"),
-            rawPlanKey = snapshot.get("planKey"),
-            rawPackageId = snapshot.get("packageId")
+        val limitKeys = listOf(
+            "captainLimit", "maxCaptains", "captainsLimit", "captainsCount", "captainCount",
+            "captains_count", "captain_limit", "max_captains", "allowedCaptains", "allowed_captains",
+            "numberOfCaptains", "numCaptains", "driversLimit", "maxDrivers", "driverLimit",
+            "captains", "drivers", "limit", "quota"
         )
-        val durationDays = (snapshot.get("durationDays") as? Number)?.toInt()
-            ?: (snapshot.get("duration") as? Number)?.toInt()
-            ?: snapshot.safeString("durationDays")?.toIntOrNull()
+        val rawPlanName = snapshot.getAnyString(
+            "planName", "packageName", "plan_name", "package_name",
+            "packageTitle", "planTitle", "subscriptionPlanName", "subscriptionPlan",
+            "tierName", "title", "name", "label"
+        )
+            ?: (snapshot.get("plan") as? String)?.trim()?.takeIf { it.isNotBlank() }
+            ?: (snapshot.get("package") as? String)?.trim()?.takeIf { it.isNotBlank() }
+            ?: listOf("planName", "packageName", "name", "title", "label")
+                .firstNotNullOfOrNull { k -> nestedPlanMap?.get(k)?.toString()?.trim()?.takeIf { it.isNotBlank() } }
+        val rawPlanKey = snapshot.getAnyString("planKey", "plan_key")
+            ?: nestedPlanMap?.get("planKey")?.toString()?.trim()?.takeIf { it.isNotBlank() }
+        val rawPackageId = snapshot.getAnyString(
+            "packageId", "package_id", "planId", "plan_id", "planKey", "plan_key", "subscriptionPlanId", "tierId"
+        ) ?: listOf("packageId", "planId", "id", "planKey")
+            .firstNotNullOfOrNull { k -> nestedPlanMap?.get(k)?.toString()?.trim()?.takeIf { it.isNotBlank() } }
+        val parsedPlanId = parsePlanIdString(
+            rawPlanId = snapshot.get("planId") ?: snapshot.get("plan_id") ?: nestedPlanMap?.get("planId") ?: nestedPlanMap?.get("id"),
+            rawPlanKey = snapshot.get("planKey") ?: snapshot.get("plan_key") ?: nestedPlanMap?.get("planKey"),
+            rawPackageId = snapshot.get("packageId") ?: snapshot.get("package_id") ?: snapshot.get("subscriptionPlanId") ?: nestedPlanMap?.get("packageId")
+        )
+        val limitValue = limitKeys.firstNotNullOfOrNull { key ->
+            extractIntFromMapOrSnapshot(snapshot.get(key))
+        } ?: limitKeys.firstNotNullOfOrNull { key ->
+            extractIntFromMapOrSnapshot(nestedPlanMap?.get(key))
+        } ?: extractCaptainsFromPlanText(parsedPlanId, rawPlanKey, rawPackageId, rawPlanName)
+
+        val startMs = parseDateFields(
+            snapshot,
+            listOf("activatedAt", "startDate", "subscriptionStartDate", "startsAt", "createdAt")
+        )
+        val endMs = parseDateFields(
+            snapshot,
+            listOf("expiresAt", "endDate", "subscriptionEndDate", "endsAt", "renewalDate", "nextBillingDate", "expiryDate")
+        )
+        val durationDays = listOf("durationDays", "duration_days", "duration", "days", "periodDays")
+            .firstNotNullOfOrNull { key -> extractIntFromMapOrSnapshot(snapshot.get(key)) }
+            ?: listOf("durationDays", "duration", "days")
+                .firstNotNullOfOrNull { key -> extractIntFromMapOrSnapshot(nestedPlanMap?.get(key)) }
+            ?: if (startMs != null && endMs != null && endMs > startMs) {
+                ((endMs - startMs) / (24L * 60L * 60L * 1000L)).toInt().coerceAtLeast(1)
+            } else null
         val features = parseFeaturesList(snapshot.get("features"))
+            .ifEmpty { parseFeaturesList(nestedPlanMap?.get("features")) }
+        val priceValue = listOf("price", "amount", "packagePrice", "planPrice", "subscriptionPrice", "cost", "totalAmount", "fee")
+            .firstNotNullOfOrNull { key -> extractIntFromMapOrSnapshot(snapshot.get(key)) }
+            ?: listOf("price", "amount", "priceEgp")
+                .firstNotNullOfOrNull { key -> extractIntFromMapOrSnapshot(nestedPlanMap?.get(key)) }
         return RawSubscriptionSnapshot(
             exists = true,
             documentId = snapshot.id,
@@ -455,26 +623,15 @@ object SubscriptionSyncResolver {
             planId = parsedPlanId,
             planName = rawPlanName,
             maxCaptains = limitValue,
-            price = (snapshot.get("price") as? Number)?.toInt()
-                ?: (snapshot.get("amount") as? Number)?.toInt()
-                ?: (snapshot.get("packagePrice") as? Number)?.toInt()
-                ?: (snapshot.get("planPrice") as? Number)?.toInt()
-                ?: snapshot.safeString("price")?.toIntOrNull()
-                ?: snapshot.safeString("amount")?.toIntOrNull(),
+            price = priceValue,
             durationDays = durationDays,
             features = features,
-            startDateMillis = parseDateFields(
-                snapshot,
-                listOf("activatedAt", "startDate", "subscriptionStartDate", "startsAt", "createdAt")
-            ),
+            startDateMillis = startMs,
             approvedAtMillis = parseDateFields(
                 snapshot,
                 listOf("approvedAt", "activatedAt", "startDate")
             ),
-            endDateMillis = parseDateFields(
-                snapshot,
-                listOf("expiresAt", "endDate", "subscriptionEndDate", "endsAt", "renewalDate", "nextBillingDate", "expiryDate")
-            ),
+            endDateMillis = endMs,
             archivedAtMillis = parseDateFields(
                 snapshot,
                 listOf("archivedAtMs", "archivedAt", "archived_at")
@@ -495,7 +652,7 @@ object SubscriptionSyncResolver {
             reason = snapshot.getAnyString("suspensionReason", "cancellationReason", "resubmissionReason", "rejectionReason", "reason"),
             rejectionReason = snapshot.getAnyString("rejectionReason"),
             resubmissionReason = snapshot.getAnyString("resubmissionReason", "rejectionReason"),
-            paymentMethod = snapshot.getAnyString("paymentMethod", "payment_method"),
+            paymentMethod = snapshot.getAnyString("paymentMethod", "payment_method", "method", "paymentGateway", "gateway", "paymentType", "source"),
             pendingRequestId = snapshot.getAnyString("pendingRequestId", "requestId"),
             requestNumber = snapshot.getAnyString("requestNumber"),
             senderPhone = snapshot.getAnyString("senderPhone"),
@@ -1171,13 +1328,31 @@ object SubscriptionSyncResolver {
         val resolvedPackageId = (primary.packageId ?: secondary.packageId ?: resolvedPlanId).takeIf { it.isNotBlank() }
         val rawPlanName = primary.planName?.takeIf { it.isNotBlank() } ?: secondary.planName?.takeIf { it.isNotBlank() }
         val planName = rawPlanName ?: "باقة اشتراك"
-        val resolvedMaxCaptains = primary.maxCaptains?.takeIf { it > 0 } ?: secondary.maxCaptains?.takeIf { it > 0 } ?: 0
         val planPrice = primary.price?.takeIf { it > 0 } ?: secondary.price?.takeIf { it > 0 } ?: 0
-        val durationDays = primary.durationDays?.takeIf { it > 0 } ?: secondary.durationDays?.takeIf { it > 0 } ?: 0
+        val durationDays = primary.durationDays?.takeIf { it > 0 }
+            ?: secondary.durationDays?.takeIf { it > 0 }
+            ?: if (startDateMillis != null && endDateMillis != null && endDateMillis > startDateMillis) {
+                ((endDateMillis - startDateMillis) / (24L * 60L * 60L * 1000L)).toInt().coerceAtLeast(1)
+            } else 0
         val features = primary.features.ifEmpty { secondary.features }
-        val hasValidPlan = resolvedPlanId.isNotBlank() || !rawPlanName.isNullOrBlank() || resolvedMaxCaptains > 0
-
+        val rawMaxCaptains = primary.maxCaptains?.takeIf { it > 0 }
+            ?: secondary.maxCaptains?.takeIf { it > 0 }
+            ?: extractCaptainsFromPlanText(resolvedPlanId, resolvedPlanKey, resolvedPackageId, rawPlanName)
+            ?: 0
         val isExplicitlyDeactivatedByFlag = primary.isActive == false && primary.isSubscribed != true
+        val hasActiveSubscriptionProof = chosenStatus == "active" &&
+            !isExplicitlyDeactivatedByFlag &&
+            normalizedPaymentStatus !in BLOCKED_PAYMENT_STATUSES &&
+            (planPrice > 0 || (endDateMillis != null && nowMillis < endDateMillis))
+        val resolvedMaxCaptains = when {
+            rawMaxCaptains > 0 -> rawMaxCaptains
+            hasActiveSubscriptionProof -> 1
+            else -> 0
+        }
+        val hasValidPlan = resolvedPlanId.isNotBlank() ||
+            !rawPlanName.isNullOrBlank() ||
+            resolvedMaxCaptains > 0 ||
+            hasActiveSubscriptionProof
 
         // 1. Explicit admin suspension or inactive state
         if (chosenStatus == "suspended" || chosenStatus == "inactive" || (chosenStatus == "active" && isExplicitlyDeactivatedByFlag)) {
