@@ -3,6 +3,9 @@ package com.example
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import com.google.firebase.appcheck.FirebaseAppCheck
+import com.google.firebase.appcheck.debug.DebugAppCheckProviderFactory
+import com.google.firebase.appcheck.playintegrity.PlayIntegrityAppCheckProviderFactory
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -118,6 +121,10 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    FirebaseAppCheck.getInstance().installAppCheckProviderFactory(
+      if (BuildConfig.DEBUG) DebugAppCheckProviderFactory.getInstance()
+      else PlayIntegrityAppCheckProviderFactory.getInstance()
+    )
     com.example.splash.SplashSessionState.markCompleted()
     NetworkHelper.startMonitoring(this)
     try {
