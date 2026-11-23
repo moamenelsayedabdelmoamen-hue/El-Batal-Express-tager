@@ -25,10 +25,11 @@ jobs:
         run: |
           test -s app/google-services.json
           node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync("app/google-services.json","utf8")); const p=c.client?.find(x=>x.client_info?.android_client_info?.package_name==="com.aistudio.elbatal.xydbca"); if(!p) { console.error("No Firebase Android client matches com.aistudio.elbatal.xydbca"); process.exit(1); } if(c.project_info?.project_id!=="el-batal-express-956ae") { console.error("Unexpected Firebase project"); process.exit(1); } console.log("Firebase config matches merchant applicationId and project.");'
+      # Robolectric SDK 36 requires Java 21; app compilation remains compatible.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
       - name: Install Android SDK packages
         run: |
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n 1)"
