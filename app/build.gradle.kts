@@ -70,7 +70,8 @@ secrets {
 }
 
 googleServices {
-  missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN
+  // Firebase configuration is mandatory; prevent APKs from building without the correct project.
+  missingGoogleServicesStrategy = MissingGoogleServicesStrategy.FAIL
 }
 
 

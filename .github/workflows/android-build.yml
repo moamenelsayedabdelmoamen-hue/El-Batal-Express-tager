@@ -14,12 +14,17 @@ on:
       - "gradle/**"
       - "*.gradle.kts"
       - "settings.gradle.kts"
+      - ".github/workflows/android-build.yml"
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      - name: Verify merchant Firebase configuration
+        run: |
+          test -s app/google-services.json
+          node -e 'const fs=require("fs"); const c=JSON.parse(fs.readFileSync("app/google-services.json","utf8")); const p=c.client?.find(x=>x.client_info?.android_client_info?.package_name==="com.aistudio.elbatal.xydbca"); if(!p) { console.error("No Firebase Android client matches com.aistudio.elbatal.xydbca"); process.exit(1); } if(c.project_info?.project_id!=="el-batal-express-956ae") { console.error("Unexpected Firebase project"); process.exit(1); } console.log("Firebase config matches merchant applicationId and project.");'
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -35,7 +40,10 @@ jobs:
       - name: Generate CI debug keystore
         run: |
           keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
-      - run: gradle :app:assembleDebug
+      - name: Run Android unit tests
+        run: gradle :app:testDebugUnitTest
+      - name: Assemble debug APK
+        run: gradle :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-debug-apk
