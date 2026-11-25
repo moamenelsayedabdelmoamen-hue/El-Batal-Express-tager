@@ -237,39 +237,11 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _isRefreshing.value = true
             try {
+                // The profile and order snapshot listeners are the single source of truth.
+                // Do not issue duplicate get() queries here: they re-read the same order set
+                // immediately after listenToFirestore() has already attached listeners.
                 listenToFirestore()
-                // Fetch merchant profile and orders exclusively from merchants/{uid} and orders
-                val user = Firebase.auth.currentUser
-                val uid = user?.uid
-                if (uid != null && user.isEmailVerified) {
-                    try {
-                        val doc = Firebase.firestore.collection("merchants").document(uid).get().await()
-                        if (doc != null && doc.exists() && doc.safeString("accountType")?.trim()?.lowercase() == "merchant") {
-                            _restaurantProfile.value = mapDocToRestaurantProfile(doc, uid)
-                        }
-                    } catch (e: Exception) {
-                        Log.w("OrderViewModel", "Failed to refresh merchant profile directly: ${e.message}")
-                    }
-
-                    try {
-                        val db = Firebase.firestore
-                        val byUser = try { db.collection("orders").whereEqualTo("userId", uid).get().await().documents } catch (_: Exception) { emptyList() }
-                        val byRest = try { db.collection("orders").whereEqualTo("restaurantId", uid).get().await().documents } catch (_: Exception) { emptyList() }
-                        val byMerch = try { db.collection("orders").whereEqualTo("merchantId", uid).get().await().documents } catch (_: Exception) { emptyList() }
-
-                        userOrdersDocs.clear()
-                        byUser.forEach { userOrdersDocs[it.id] = it }
-                        restaurantOrdersDocs.clear()
-                        byRest.forEach { restaurantOrdersDocs[it.id] = it }
-                        merchantOrdersDocs.clear()
-                        byMerch.forEach { merchantOrdersDocs[it.id] = it }
-
-                        rebuildMergedFirestoreOrders()
-                    } catch (e: Exception) {
-                        Log.w("OrderViewModel", "Failed to refresh orders directly: ${e.message}")
-                    }
-                }
-                delay(400)
+                delay(250)
             } finally {
                 _isRefreshing.value = false
             }
@@ -951,49 +923,25 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-        // 2. Read / Listen to real-time orders for current merchant from Firestore across userId, restaurantId, and merchantId
+        // 2. One OR query covers legacy and canonical merchant ownership fields.
+        // Firestore returns a matching document once even when multiple fields match,
+        // avoiding three overlapping listeners and duplicate document reads.
         ordersListener?.remove()
+        ordersListener = null
         restaurantOrdersListener?.remove()
+        restaurantOrdersListener = null
         merchantOrdersListener?.remove()
-
-        ordersListener = Firebase.firestore.collection("orders")
-            .whereEqualTo("userId", uid)
-            .addSnapshotListener { querySnapshot, error ->
-                if (error != null) {
-                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        ordersListener?.remove()
-                        ordersListener = null
-                    }
-                    return@addSnapshotListener
-                }
-                if (querySnapshot != null) {
-                    userOrdersDocs.clear()
-                    querySnapshot.documents.forEach { userOrdersDocs[it.id] = it }
-                    rebuildMergedFirestoreOrders()
-                }
-            }
-
-        restaurantOrdersListener = Firebase.firestore.collection("orders")
-            .whereEqualTo("restaurantId", uid)
-            .addSnapshotListener { querySnapshot, error ->
-                if (error != null) {
-                    if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        restaurantOrdersListener?.remove()
-                        restaurantOrdersListener = null
-                    }
-                    return@addSnapshotListener
-                }
-                if (querySnapshot != null) {
-                    restaurantOrdersDocs.clear()
-                    querySnapshot.documents.forEach { restaurantOrdersDocs[it.id] = it }
-                    rebuildMergedFirestoreOrders()
-                }
-            }
-
         merchantOrdersListener = Firebase.firestore.collection("orders")
-            .whereEqualTo("merchantId", uid)
+            .where(
+                com.google.firebase.firestore.Filter.or(
+                    com.google.firebase.firestore.Filter.equalTo("userId", uid),
+                    com.google.firebase.firestore.Filter.equalTo("restaurantId", uid),
+                    com.google.firebase.firestore.Filter.equalTo("merchantId", uid)
+                )
+            )
             .addSnapshotListener { querySnapshot, error ->
                 if (error != null) {
+                    Log.w("OrderViewModel", "Error listening to merchant orders: ${error.message}")
                     if (error.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
                         merchantOrdersListener?.remove()
                         merchantOrdersListener = null
@@ -1001,8 +949,13 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     return@addSnapshotListener
                 }
                 if (querySnapshot != null) {
+                    userOrdersDocs.clear()
+                    restaurantOrdersDocs.clear()
                     merchantOrdersDocs.clear()
-                    querySnapshot.documents.forEach { merchantOrdersDocs[it.id] = it }
+                    querySnapshot.documents.forEach { doc ->
+                        // Keep the maps mutually exclusive; the merged list remains deduplicated.
+                        merchantOrdersDocs[doc.id] = doc
+                    }
                     rebuildMergedFirestoreOrders()
                 }
             }
