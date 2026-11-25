@@ -26,7 +26,10 @@ import kotlinx.coroutines.tasks.await
  */
 class MerchantMessagingService : FirebaseMessagingService() {
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceExceptionHandler = kotlinx.coroutines.CoroutineExceptionHandler { _, throwable ->
+        Log.w(TAG, "Unhandled error in MerchantMessagingService coroutine: ${throwable.message}")
+    }
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + serviceExceptionHandler)
 
     override fun onNewToken(token: String) {
         super.onNewToken(token)
@@ -201,7 +204,7 @@ class MerchantMessagingService : FirebaseMessagingService() {
         }
 
         private suspend fun persistTokenForCurrentMerchant(token: String) {
-            val user = Firebase.auth.currentUser ?: return
+            val user = runCatching { Firebase.auth.currentUser }.getOrNull() ?: return
             if (!user.isEmailVerified || token.isBlank()) return
             persistToken(user.uid, token)
             lastSyncedUid = user.uid

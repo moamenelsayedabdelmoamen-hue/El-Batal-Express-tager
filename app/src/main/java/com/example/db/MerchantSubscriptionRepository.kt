@@ -646,9 +646,13 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                val raw = SubscriptionSyncResolver.fromFirestoreSnapshot(snap)
-                val fromServer = snap != null && !snap.metadata.isFromCache
-                onSnapshot(raw, fromServer)
+                try {
+                    val raw = SubscriptionSyncResolver.fromFirestoreSnapshot(snap)
+                    val fromServer = snap != null && !snap.metadata.isFromCache
+                    onSnapshot(raw, fromServer)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing subscriptions/$uid snapshot: ${e.message}", e)
+                }
             }
     }
 
@@ -667,11 +671,19 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                val docs = querySnap?.documents
-                    ?.map { SubscriptionSyncResolver.fromFirestoreSnapshot(it) }
-                    .orEmpty()
-                val fromServer = querySnap != null && !querySnap.metadata.isFromCache
-                onSnapshots(docs, fromServer)
+                try {
+                    val docs = querySnap?.documents
+                        ?.mapNotNull { doc ->
+                            runCatching { SubscriptionSyncResolver.fromFirestoreSnapshot(doc) }
+                                .onFailure { Log.w(TAG, "Skipped malformed subscription doc ${doc.id}: ${it.message}") }
+                                .getOrNull()
+                        }
+                        .orEmpty()
+                    val fromServer = querySnap != null && !querySnap.metadata.isFromCache
+                    onSnapshots(docs, fromServer)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing subscriptions query for $uid: ${e.message}", e)
+                }
             }
     }
 
@@ -690,10 +702,14 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                val entries = querySnap?.documents
-                    ?.map { doc -> doc.id to (doc.data ?: emptyMap<String, Any?>()) }
-                    .orEmpty()
-                onPackages(parseSubscriptionPackages(entries))
+                try {
+                    val entries = querySnap?.documents
+                        ?.map { doc -> doc.id to (doc.data ?: emptyMap<String, Any?>()) }
+                        .orEmpty()
+                    onPackages(parseSubscriptionPackages(entries))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing subscription_packages snapshot: ${e.message}", e)
+                }
             }
     }
 
@@ -728,10 +744,18 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                val parsed = querySnap?.documents
-                    ?.map { SubscriptionSyncResolver.parseSubscriptionHistorySnapshot(it) }
-                    .orEmpty()
-                onHistory(SubscriptionSyncResolver.sortArchivedSubscriptionHistory(parsed))
+                try {
+                    val parsed = querySnap?.documents
+                        ?.mapNotNull { doc ->
+                            runCatching { SubscriptionSyncResolver.parseSubscriptionHistorySnapshot(doc) }
+                                .onFailure { Log.w(TAG, "Skipped malformed subscription_history doc ${doc.id}: ${it.message}") }
+                                .getOrNull()
+                        }
+                        .orEmpty()
+                    onHistory(SubscriptionSyncResolver.sortArchivedSubscriptionHistory(parsed))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing subscription_history snapshot: ${e.message}", e)
+                }
             }
     }
 
@@ -765,11 +789,19 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                val parsed = querySnap?.documents
-                    ?.map { SubscriptionSyncResolver.parseManualRequestSnapshot(it) }
-                    ?.sortedByDescending { it.createdAtMillis ?: it.updatedAtMillis ?: 0L }
-                    .orEmpty()
-                onRequests(parsed)
+                try {
+                    val parsed = querySnap?.documents
+                        ?.mapNotNull { doc ->
+                            runCatching { SubscriptionSyncResolver.parseManualRequestSnapshot(doc) }
+                                .onFailure { Log.w(TAG, "Skipped malformed manual request doc ${doc.id}: ${it.message}") }
+                                .getOrNull()
+                        }
+                        ?.sortedByDescending { it.createdAtMillis ?: it.updatedAtMillis ?: 0L }
+                        .orEmpty()
+                    onRequests(parsed)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing manual_subscription_requests snapshot: ${e.message}", e)
+                }
             }
     }
 
@@ -788,11 +820,19 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                val parsed = querySnap?.documents
-                    ?.map { SubscriptionSyncResolver.parsePaymentSnapshot(it) }
-                    ?.sortedByDescending { it.paymentDateMillis ?: it.createdAtMillis ?: 0L }
-                    .orEmpty()
-                onPayments(parsed)
+                try {
+                    val parsed = querySnap?.documents
+                        ?.mapNotNull { doc ->
+                            runCatching { SubscriptionSyncResolver.parsePaymentSnapshot(doc) }
+                                .onFailure { Log.w(TAG, "Skipped malformed payment doc ${doc.id}: ${it.message}") }
+                                .getOrNull()
+                        }
+                        ?.sortedByDescending { it.paymentDateMillis ?: it.createdAtMillis ?: 0L }
+                        .orEmpty()
+                    onPayments(parsed)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing payments snapshot: ${e.message}", e)
+                }
             }
     }
 
@@ -810,7 +850,11 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                onSettings(parseVodafoneCashSettingsSnapshot(snap))
+                try {
+                    onSettings(parseVodafoneCashSettingsSnapshot(snap))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing settings/manual_subscription_config snapshot: ${e.message}", e)
+                }
             }
     }
 
@@ -829,9 +873,13 @@ class MerchantSubscriptionRepository(
                     onError(err)
                     return@addSnapshotListener
                 }
-                val rawPlans = snap?.get("plans") ?: snap?.get("packages")
-                val updatedAt = extractConfigUpdatedAtMillis(snap)
-                onPlans(parseConfiguredPlans(rawPlans), updatedAt)
+                try {
+                    val rawPlans = snap?.get("plans") ?: snap?.get("packages")
+                    val updatedAt = extractConfigUpdatedAtMillis(snap)
+                    onPlans(parseConfiguredPlans(rawPlans), updatedAt)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed parsing settings/subscription_config snapshot: ${e.message}", e)
+                }
             }
     }
 
@@ -1194,9 +1242,9 @@ class MerchantSubscriptionRepository(
         val walletIsValid = normalizedWallet.isNotEmpty()
         val configPlans = parseConfiguredPlans(snapshot.get("plans") ?: snapshot.get("packages"))
         val effectivePlans = if (activePackages.isNotEmpty()) activePackages else configPlans
-        val accepting = snapshot.getBoolean("isAcceptingSubscriptions")
-            ?: snapshot.getBoolean("enabled")
-            ?: snapshot.getBoolean("isActive")
+        val accepting = snapshot.safeBoolean("isAcceptingSubscriptions")
+            ?: snapshot.safeBoolean("enabled")
+            ?: snapshot.safeBoolean("isActive")
             ?: true
         val pauseMessage = snapshot.getAnyString("pauseMessage")?.trim()
             ?.takeIf { it.isNotBlank() }

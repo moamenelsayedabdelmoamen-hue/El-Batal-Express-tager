@@ -19,12 +19,21 @@ import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.auth
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.firestore
+import com.example.db.safeBoolean
+import com.example.db.safeString
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class MerchantAccount(
     val uid: String = "",
@@ -119,12 +128,19 @@ interface MerchantAuthBackend {
     suspend fun getMerchantDocument(uid: String): MerchantDocSnapshot?
 
     /**
+     * Exclusively reads `merchants/{uid}` from local Firestore cache (`Source.CACHE`).
+     * Returns `null` when no cached document is available locally.
+     */
+    suspend fun getCachedMerchantDocument(uid: String): MerchantDocSnapshot? = null
+
+    /**
      * Exclusively creates `merchants/{uid}`. Never writes to `captains`, `restaurants`, or `users`.
      */
     suspend fun createMerchantDocument(uid: String, data: Map<String, Any>)
 
     /**
-     * Updates verification/login fields exclusively in `merchants/{uid}`.
+     * Queues verification/login field updates exclusively in `merchants/{uid}` without
+     * blocking session restoration on server acknowledgement.
      */
     suspend fun updateMerchantFields(uid: String, updates: Map<String, Any>)
 }
@@ -141,7 +157,12 @@ object FirebaseMerchantAuthBackend : MerchantAuthBackend {
         isEmailVerified = isEmailVerified
     )
 
-    override fun currentUser(): AuthUserSnapshot? = Firebase.auth.currentUser?.toSnapshot()
+    override fun currentUser(): AuthUserSnapshot? = try {
+        Firebase.auth.currentUser?.toSnapshot()
+    } catch (e: Exception) {
+        Log.w(TAG, "FirebaseAuth currentUser unavailable: ${e.message}")
+        null
+    }
 
     override suspend fun createUserWithEmailAndPassword(email: String, password: String): AuthUserSnapshot {
         val result = Firebase.auth.createUserWithEmailAndPassword(email, password).await()
@@ -165,8 +186,15 @@ object FirebaseMerchantAuthBackend : MerchantAuthBackend {
     }
 
     override suspend fun reloadCurrentUser(): AuthUserSnapshot? {
-        val user = Firebase.auth.currentUser ?: return null
-        user.reload().await()
+        val user = try {
+            Firebase.auth.currentUser
+        } catch (e: Exception) {
+            Log.w(TAG, "FirebaseAuth unavailable during reloadCurrentUser: ${e.message}")
+            null
+        } ?: return null
+        withTimeout(8_000L) {
+            user.reload().await()
+        }
         return Firebase.auth.currentUser?.toSnapshot()
     }
 
@@ -198,32 +226,74 @@ object FirebaseMerchantAuthBackend : MerchantAuthBackend {
         }
     }
 
-    override suspend fun getMerchantDocument(uid: String): MerchantDocSnapshot? {
-        val doc = Firebase.firestore.collection(COLLECTION_MERCHANTS).document(uid).get().await()
-        if (!doc.exists()) {
+    private fun DocumentSnapshot.toMerchantDocSnapshot(): MerchantDocSnapshot {
+        if (!exists()) {
+            // An offline cache-only miss does NOT prove the merchant account was deleted on the server.
+            if (metadata.isFromCache) {
+                throw FirebaseFirestoreException(
+                    "Merchant document unavailable in local cache while offline",
+                    FirebaseFirestoreException.Code.UNAVAILABLE
+                )
+            }
             return MerchantDocSnapshot(exists = false)
         }
-        val resolvedLogo = doc.getString("logo")?.takeIf { it.isNotBlank() }
-            ?: doc.getString("photoUrl")?.takeIf { it.isNotBlank() }
-            ?: doc.getString("logoUrl")?.takeIf { it.isNotBlank() }
+        val resolvedLogo = safeString("logo")?.takeIf { it.isNotBlank() }
+            ?: safeString("photoUrl")?.takeIf { it.isNotBlank() }
+            ?: safeString("logoUrl")?.takeIf { it.isNotBlank() }
             ?: ""
         return MerchantDocSnapshot(
             exists = true,
-            uid = doc.getString("uid").orEmpty().ifBlank { doc.id },
-            name = doc.getString("name").orEmpty(),
-            email = doc.getString("email").orEmpty(),
-            phone = doc.getString("phone").orEmpty(),
-            address = doc.getString("address").orEmpty(),
-            category = doc.getString("category").orEmpty(),
+            uid = safeString("uid").orEmpty().ifBlank { id },
+            name = safeString("name").orEmpty(),
+            email = safeString("email").orEmpty(),
+            phone = safeString("phone").orEmpty(),
+            address = safeString("address").orEmpty(),
+            category = safeString("category").orEmpty(),
             logo = resolvedLogo,
-            storagePath = doc.getString("storagePath").orEmpty(),
-            accountType = doc.getString("accountType").orEmpty(),
-            role = doc.getString("role").orEmpty(),
-            emailVerified = doc.getBoolean("emailVerified") == true,
-            subscriptionStatus = doc.getString("subscriptionStatus").orEmpty().ifBlank { "unsubscribed" },
-            status = doc.getString("status").orEmpty(),
-            isApproved = doc.getBoolean("isApproved")
+            storagePath = safeString("storagePath").orEmpty(),
+            accountType = safeString("accountType").orEmpty(),
+            role = safeString("role").orEmpty(),
+            emailVerified = safeBoolean("emailVerified") == true,
+            subscriptionStatus = safeString("subscriptionStatus").orEmpty().ifBlank { "unsubscribed" },
+            status = safeString("status").orEmpty(),
+            isApproved = safeBoolean("isApproved")
         )
+    }
+
+    override suspend fun getCachedMerchantDocument(uid: String): MerchantDocSnapshot? {
+        return try {
+            val doc = Firebase.firestore.collection(COLLECTION_MERCHANTS)
+                .document(uid)
+                .get(Source.CACHE)
+                .await()
+            if (!doc.exists()) null else doc.toMerchantDocSnapshot()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    override suspend fun getMerchantDocument(uid: String): MerchantDocSnapshot? {
+        val doc = try {
+            withTimeout(10_000L) {
+                Firebase.firestore.collection(COLLECTION_MERCHANTS).document(uid).get().await()
+            }
+        } catch (timeoutEx: TimeoutCancellationException) {
+            // On timeout, recover from Firestore persistent local cache before surfacing timeout.
+            val cached = getCachedMerchantDocument(uid)
+            if (cached != null) return cached
+            throw timeoutEx
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            if (MerchantAuthManager.isTransientConnectivityError(e)) {
+                val cached = getCachedMerchantDocument(uid)
+                if (cached != null) return cached
+            }
+            throw e
+        }
+        return doc.toMerchantDocSnapshot()
     }
 
     override suspend fun createMerchantDocument(uid: String, data: Map<String, Any>) {
@@ -234,10 +304,18 @@ object FirebaseMerchantAuthBackend : MerchantAuthBackend {
     }
 
     override suspend fun updateMerchantFields(uid: String, updates: Map<String, Any>) {
-        Firebase.firestore.collection(COLLECTION_MERCHANTS)
-            .document(uid)
-            .set(updates, SetOptions.merge())
-            .await()
+        // Enqueue merge write without awaiting server ACK so offline launches never hang.
+        // Firestore local persistence applies the write locally and syncs automatically on reconnect.
+        try {
+            Firebase.firestore.collection(COLLECTION_MERCHANTS)
+                .document(uid)
+                .set(updates, SetOptions.merge())
+                .addOnFailureListener { ex ->
+                    Log.w(TAG, "Non-fatal deferred updateMerchantFields warning for merchants/$uid: ${ex.message}")
+                }
+        } catch (e: Exception) {
+            Log.w(TAG, "Non-fatal updateMerchantFields enqueue warning for merchants/$uid: ${e.message}")
+        }
     }
 }
 
@@ -538,25 +616,95 @@ object MerchantAuthManager {
         return verifyMerchantIdentity(context, initialSnapshot, reloadBeforeCheck = true)
     }
 
+    internal fun isTransientConnectivityError(error: Throwable?): Boolean {
+        var current = error
+        while (current != null) {
+            if (current is TimeoutCancellationException) return true
+            if (current is FirebaseNetworkException) return true
+            if (current is java.io.IOException) return true
+            if (current is FirebaseFirestoreException) {
+                return when (current.code) {
+                    FirebaseFirestoreException.Code.UNAVAILABLE,
+                    FirebaseFirestoreException.Code.DEADLINE_EXCEEDED,
+                    FirebaseFirestoreException.Code.ABORTED,
+                    FirebaseFirestoreException.Code.RESOURCE_EXHAUSTED,
+                    FirebaseFirestoreException.Code.UNKNOWN,
+                    FirebaseFirestoreException.Code.INTERNAL -> true
+                    else -> false
+                }
+            }
+            val msg = current.message.orEmpty()
+            if (
+                msg.contains("PERMISSION_DENIED", ignoreCase = true) ||
+                msg.contains("UNAUTHENTICATED", ignoreCase = true) ||
+                msg.contains("Missing or insufficient permissions", ignoreCase = true)
+            ) {
+                return false
+            }
+            if (
+                msg.contains("UNAVAILABLE", ignoreCase = true) ||
+                msg.contains("DEADLINE_EXCEEDED", ignoreCase = true) ||
+                msg.contains("client is offline", ignoreCase = true) ||
+                msg.contains("timed out", ignoreCase = true) ||
+                msg.contains("timeout", ignoreCase = true) ||
+                msg.contains("network", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun buildOfflinePreservedAccount(user: AuthUserSnapshot): MerchantAccount {
+        return MerchantAccount(
+            uid = user.uid,
+            name = user.displayName.takeIf { it.isNotBlank() } ?: "تاجر البطل",
+            email = user.email,
+            photoUrl = user.photoUrl,
+            logo = user.photoUrl,
+            storagePath = "",
+            phone = "",
+            address = "",
+            category = "",
+            accountType = ACCOUNT_TYPE_MERCHANT,
+            emailVerified = true,
+            subscriptionStatus = "unsubscribed",
+            status = "approved",
+            isApproved = true,
+            role = ACCOUNT_TYPE_MERCHANT
+        )
+    }
+
     internal suspend fun verifyMerchantIdentity(
         context: Context,
         userSnapshot: AuthUserSnapshot,
-        reloadBeforeCheck: Boolean = true
+        reloadBeforeCheck: Boolean = true,
+        preserveSessionOnTransientError: Boolean = false
     ): MerchantSignInResult {
+        var latestUserSnapshot = userSnapshot
         return try {
             val freshUser = if (reloadBeforeCheck) {
                 try {
                     backend.reloadCurrentUser() ?: userSnapshot
-                } catch (_: Exception) {
+                } catch (timeoutEx: TimeoutCancellationException) {
+                    safeLogW("reloadCurrentUser timed out; keeping cached Firebase Auth user snapshot.")
+                    userSnapshot
+                } catch (ce: CancellationException) {
+                    // Always rethrow parent coroutine cancellation instead of swallowing it.
+                    throw ce
+                } catch (e: Exception) {
+                    safeLogW("reloadCurrentUser failed (${e.message}); keeping cached Firebase Auth user snapshot.")
                     userSnapshot
                 }
             } else {
                 userSnapshot
             }
+            latestUserSnapshot = freshUser
 
             // Step 1: Authoritative Email Verification check against Firebase Authentication
             if (!freshUser.isEmailVerified) {
-                Log.w(TAG, "Login rejected: Email not verified for uid=${freshUser.uid}, email=${freshUser.email}")
+                safeLogW("Login rejected: Email not verified for uid=${freshUser.uid}, email=${freshUser.email}")
                 backend.signOut(context)
                 return MerchantSignInResult.EmailNotVerified(
                     email = freshUser.email,
@@ -568,9 +716,55 @@ object MerchantAuthManager {
 
             // Step 2: Read EXCLUSIVELY from `merchants/{uid}`.
             // Never fall back to `captains`, `restaurants`, or `users`.
-            val merchantDoc = backend.getMerchantDocument(uid)
+            val merchantDoc = try {
+                backend.getMerchantDocument(uid)
+            } catch (timeoutEx: TimeoutCancellationException) {
+                safeLogW("getMerchantDocument timed out for merchants/$uid; checking local cache without signing out.")
+                val cachedDoc = try {
+                    backend.getCachedMerchantDocument(uid)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    null
+                }
+                if (cachedDoc != null) {
+                    cachedDoc
+                } else if (preserveSessionOnTransientError) {
+                    return MerchantSignInResult.Success(buildOfflinePreservedAccount(freshUser))
+                } else {
+                    return MerchantSignInResult.Error(
+                        "انتهت مهلة الاتصال بالخادم أثناء التحقق من الحساب. يرجى المحاولة مرة أخرى."
+                    )
+                }
+            } catch (ce: CancellationException) {
+                // Always propagate parent coroutine cancellation.
+                throw ce
+            } catch (e: Exception) {
+                if (isTransientConnectivityError(e)) {
+                    safeLogW("Transient Firestore error for merchants/$uid (${e.message}); checking local cache without signing out.")
+                    val cachedDoc = try {
+                        backend.getCachedMerchantDocument(uid)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (cachedDoc != null) {
+                        cachedDoc
+                    } else if (preserveSessionOnTransientError) {
+                        return MerchantSignInResult.Success(buildOfflinePreservedAccount(freshUser))
+                    } else {
+                        return MerchantSignInResult.Error(
+                            "تعذر الاتصال بالخادم حالياً. يرجى التحقق من اتصال الإنترنت والمحاولة مرة أخرى."
+                        )
+                    }
+                } else {
+                    throw e
+                }
+            }
+
             if (merchantDoc == null || !merchantDoc.exists) {
-                Log.w(TAG, "Login rejected: No document in merchants/$uid")
+                safeLogW("Login rejected: No document in merchants/$uid")
                 backend.signOut(context)
                 return MerchantSignInResult.NotRegistered(
                     "هذا الحساب غير مسجل كتاجر في قاعدة البيانات. لا يمكن الدخول بهذا الحساب إلى تطبيق التاجر."
@@ -580,7 +774,7 @@ object MerchantAuthManager {
             // Step 3: Strictly require accountType == "merchant" (rejects captain or other account types)
             val docAccountType = merchantDoc.accountType.trim().lowercase()
             if (docAccountType != ACCOUNT_TYPE_MERCHANT) {
-                Log.w(TAG, "Login rejected: uid=$uid has invalid accountType='$docAccountType' in merchants/$uid")
+                safeLogW("Login rejected: uid=$uid has invalid accountType='$docAccountType' in merchants/$uid")
                 backend.signOut(context)
                 return MerchantSignInResult.NotRegistered(
                     "هذا الحساب ليس حساب تاجر (accountType=$docAccountType) ولا يمكنه الدخول إلى تطبيق التاجر."
@@ -590,7 +784,7 @@ object MerchantAuthManager {
             // Step 4: Ensure the account is not suspended/blocked
             val status = merchantDoc.status.trim().lowercase()
             if (status in listOf("pending", "awaiting_approval", "under_review", "قيد المراجعة", "في انتظار الموافقة")) {
-                Log.i(TAG, "Login deferred: merchant account is awaiting admin approval (uid=$uid)")
+                safeLogI("Login deferred: merchant account is awaiting admin approval (uid=$uid)")
                 backend.signOut(context)
                 return MerchantSignInResult.NotRegistered(
                     "تم استلام طلب تسجيلك بنجاح. حسابك في انتظار موافقة الإدارة، وسيتمكن من الدخول بعد اعتماد الحساب."
@@ -601,25 +795,29 @@ object MerchantAuthManager {
             ) || merchantDoc.isApproved == false
 
             if (isExplicitlyBlocked) {
-                Log.w(TAG, "Login rejected: Merchant account uid=$uid is blocked/suspended (status=$status)")
+                safeLogW("Login rejected: Merchant account uid=$uid is blocked/suspended (status=$status)")
                 backend.signOut(context)
                 return MerchantSignInResult.NotRegistered(
                     "حساب التاجر قيد مراجعة الإدارة أو موقوف. يرجى انتظار الموافقة قبل تسجيل الدخول."
                 )
             }
 
-            // Sync verified status & login timestamps ONLY in `merchants/{uid}`
+            // Sync verified status & login timestamps ONLY in `merchants/{uid}` without blocking offline startup.
             try {
-                backend.updateMerchantFields(
-                    uid,
-                    mapOf(
-                        "emailVerified" to true,
-                        "lastLoginAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp()
+                withTimeoutOrNull(1_500L) {
+                    backend.updateMerchantFields(
+                        uid,
+                        mapOf(
+                            "emailVerified" to true,
+                            "lastLoginAt" to FieldValue.serverTimestamp(),
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
                     )
-                )
+                }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (syncEx: Exception) {
-                Log.w(TAG, "Non-fatal sync warning for merchants/$uid: ${syncEx.message}")
+                safeLogW("Non-fatal sync warning for merchants/$uid: ${syncEx.message}")
             }
 
             val finalName = merchantDoc.name.takeIf { it.isNotBlank() }
@@ -647,22 +845,59 @@ object MerchantAuthManager {
                     role = ACCOUNT_TYPE_MERCHANT
                 )
             )
+        } catch (timeoutEx: TimeoutCancellationException) {
+            safeLogW("Merchant session verification timed out; preserving Firebase Auth session.")
+            if (preserveSessionOnTransientError && latestUserSnapshot.isEmailVerified) {
+                MerchantSignInResult.Success(buildOfflinePreservedAccount(latestUserSnapshot))
+            } else {
+                MerchantSignInResult.Error("انتهت مهلة الاتصال بالخادم، يرجى المحاولة مرة أخرى.")
+            }
+        } catch (ce: CancellationException) {
+            // Never swallow parent coroutine cancellation.
+            throw ce
         } catch (e: Exception) {
-            Log.e(TAG, "Error verifying merchant session: ${e.message}", e)
-            backend.signOut(context)
-            MerchantSignInResult.Error(
-                "فشل التحقق من حساب التاجر في قاعدة البيانات: ${e.localizedMessage ?: e.message}"
-            )
+            safeLogE("Error verifying merchant session: ${e.message}", e)
+            if (isTransientConnectivityError(e)) {
+                // Transient network/UNAVAILABLE/timeout error: NEVER sign out Firebase Auth.
+                if (preserveSessionOnTransientError && latestUserSnapshot.isEmailVerified) {
+                    MerchantSignInResult.Success(buildOfflinePreservedAccount(latestUserSnapshot))
+                } else {
+                    MerchantSignInResult.Error(
+                        "تعذر الاتصال بالخادم حالياً: ${e.localizedMessage ?: e.message}"
+                    )
+                }
+            } else {
+                // Non-transient error (e.g. PERMISSION_DENIED): surface real error without faking success
+                // and without falsely signing out on a rules/server error.
+                MerchantSignInResult.Error(
+                    "فشل التحقق من حساب التاجر في قاعدة البيانات: ${e.localizedMessage ?: e.message}"
+                )
+            }
         }
     }
 
     /**
-     * Restores session ONLY if Firebase Auth user exists, `isEmailVerified == true` (after `reload()`),
-     * and `merchants/{uid}` exists with `accountType == "merchant"`.
+     * Evaluates an existing persisted Firebase Auth session while preserving the session across
+     * offline launches, `UNAVAILABLE` states, and Firestore timeouts.
+     * Signs out ONLY when concrete proof shows the account is unverified, missing, non-merchant, or blocked.
+     */
+    suspend fun checkExistingMerchantSessionResult(context: Context): MerchantSignInResult {
+        val current = backend.currentUser()
+            ?: return MerchantSignInResult.NotRegistered("لا توجد جلسة تاجر مسجلة حالياً.")
+        return verifyMerchantIdentity(
+            context = context,
+            userSnapshot = current,
+            reloadBeforeCheck = true,
+            preserveSessionOnTransientError = true
+        )
+    }
+
+    /**
+     * Restores session ONLY if Firebase Auth user exists, `isEmailVerified == true`,
+     * and `merchants/{uid}` is valid (or preserved offline via cache/session when network is unavailable).
      */
     suspend fun checkExistingMerchantSession(context: Context): MerchantAccount? {
-        val current = backend.currentUser() ?: return null
-        return when (val res = verifyMerchantIdentity(context, current, reloadBeforeCheck = true)) {
+        return when (val res = checkExistingMerchantSessionResult(context)) {
             is MerchantSignInResult.Success -> res.merchant
             else -> null
         }
@@ -673,7 +908,23 @@ object MerchantAuthManager {
      */
     suspend fun signOutMerchant(context: Context) {
         backend.signOut(context)
-        Log.d(TAG, "Merchant successfully signed out.")
+        safeLogD("Merchant successfully signed out.")
+    }
+
+    private fun safeLogD(msg: String) {
+        runCatching { Log.d(TAG, msg) }
+    }
+
+    private fun safeLogI(msg: String) {
+        runCatching { Log.i(TAG, msg) }
+    }
+
+    private fun safeLogW(msg: String) {
+        runCatching { Log.w(TAG, msg) }
+    }
+
+    private fun safeLogE(msg: String, tr: Throwable? = null) {
+        runCatching { Log.e(TAG, msg, tr) }
     }
 
     private fun mapSignInErrorToArabic(error: Throwable): String {

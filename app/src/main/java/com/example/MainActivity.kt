@@ -116,17 +116,26 @@ class MainActivity : ComponentActivity() {
     const val START_DESTINATION_LOGIN = "login"
   }
 
+  private fun safeCurrentFirebaseUser(): com.google.firebase.auth.FirebaseUser? = try {
+    Firebase.auth.currentUser
+  } catch (e: Exception) {
+    android.util.Log.w("MainActivity", "FirebaseAuth unavailable: ${e.message}")
+    null
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     com.example.splash.SplashSessionState.markCompleted()
-    NetworkHelper.startMonitoring(this)
+    runCatching { NetworkHelper.startMonitoring(this) }
+      .onFailure { android.util.Log.w("MainActivity", "NetworkHelper init warning: ${it.message}") }
     try {
       val settings = firestoreSettings {
         setLocalCacheSettings(persistentCacheSettings {})
       }
       Firebase.firestore.firestoreSettings = settings
     } catch (_: Exception) {}
-    ThemeManager.initialize(this)
+    runCatching { ThemeManager.initialize(this) }
+      .onFailure { android.util.Log.w("MainActivity", "ThemeManager init warning: ${it.message}") }
     enableEdgeToEdge()
     setContent {
       val isDarkMode by ThemeManager.isDarkModeState.collectAsStateWithLifecycle()
@@ -136,7 +145,7 @@ class MainActivity : ComponentActivity() {
         val pushNotification by orderViewModel.pushNotificationState.collectAsStateWithLifecycle()
         val subscriptionStatus by orderViewModel.subscriptionStatus.collectAsStateWithLifecycle()
         val isOnline by NetworkHelper.isOnline.collectAsStateWithLifecycle()
-        val currentUser = Firebase.auth.currentUser
+        val currentUser = safeCurrentFirebaseUser()
         var verifiedMerchantUid by remember {
           mutableStateOf(currentUser?.takeIf { it.isEmailVerified }?.uid)
         }
@@ -145,15 +154,17 @@ class MainActivity : ComponentActivity() {
             val u = auth.currentUser
             verifiedMerchantUid = if (u != null && u.isEmailVerified) u.uid else null
           }
-          Firebase.auth.addAuthStateListener(listener)
+          runCatching { Firebase.auth.addAuthStateListener(listener) }
+            .onFailure { android.util.Log.w("MainActivity", "AuthStateListener add warning: ${it.message}") }
           onDispose {
-            Firebase.auth.removeAuthStateListener(listener)
+            runCatching { Firebase.auth.removeAuthStateListener(listener) }
           }
         }
         LaunchedEffect(verifiedMerchantUid) {
           val uid = verifiedMerchantUid
           if (uid != null) {
-            MerchantMessagingService.syncCurrentFcmTokenForMerchant(uid)
+            runCatching { MerchantMessagingService.syncCurrentFcmTokenForMerchant(uid) }
+              .onFailure { android.util.Log.w("MainActivity", "FCM sync warning: ${it.message}") }
           }
         }
         val lifecycleOwner = LocalLifecycleOwner.current
@@ -171,11 +182,13 @@ class MainActivity : ComponentActivity() {
         }
         val requestedStart = intent?.getStringExtra(EXTRA_START_DESTINATION)
         val initialRoute = remember {
-          val isVerifiedSession = currentUser != null && currentUser.isEmailVerified
+          // Re-evaluate the live Firebase Auth session in MainActivity before forcing LoginRoute
+          // so a transient splash lookup error never hijacks a valid verified merchant session.
+          val liveUser = safeCurrentFirebaseUser() ?: currentUser
+          val isVerifiedSession = liveUser != null && liveUser.isEmailVerified
           when {
-            requestedStart == START_DESTINATION_DASHBOARD && isVerifiedSession -> RestaurantDashboardRoute
-            requestedStart == START_DESTINATION_LOGIN -> LoginRoute
             isVerifiedSession -> RestaurantDashboardRoute
+            requestedStart == START_DESTINATION_LOGIN -> LoginRoute
             else -> LoginRoute
           }
         }
@@ -267,14 +280,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<PaymentsRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  val authUser = Firebase.auth.currentUser
+                  val authUser = safeCurrentFirebaseUser()
                   if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser?.isEmailVerified == true) {
+                if (safeCurrentFirebaseUser()?.isEmailVerified == true) {
                   MerchantPaymentsScreen(
                     onBack = { navController.popBackStack() },
                     orderViewModel = orderViewModel
@@ -283,14 +296,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<VodafoneCashPaymentRoute> { backStackEntry ->
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  val authUser = Firebase.auth.currentUser
+                  val authUser = safeCurrentFirebaseUser()
                   if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser?.isEmailVerified == true) {
+                if (safeCurrentFirebaseUser()?.isEmailVerified == true) {
                   val route: VodafoneCashPaymentRoute = backStackEntry.toRoute()
                   VodafoneCashPaymentScreen(
                     planId = route.planId,
@@ -303,30 +316,54 @@ class MainActivity : ComponentActivity() {
               }
               composable<RestaurantDashboardRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  val authUser = Firebase.auth.currentUser
+                  val authUser = safeCurrentFirebaseUser()
                   if (authUser == null) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   } else {
-                    val sessionMerchant = com.example.auth.MerchantAuthManager.checkExistingMerchantSession(context)
-                    if (sessionMerchant == null) {
-                      android.widget.Toast.makeText(
-                        context,
-                        "لا يمكن الدخول إلا بحساب تاجر مسجل ومؤكد البريد الإلكتروني.",
-                        android.widget.Toast.LENGTH_LONG
-                      ).show()
-                      orderViewModel.clearListeners()
-                      navController.navigate(LoginRoute) {
-                        popUpTo(0) { inclusive = true }
+                    val sessionResult = try {
+                      com.example.auth.MerchantAuthManager.checkExistingMerchantSessionResult(context)
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                      throw ce
+                    } catch (e: Exception) {
+                      android.util.Log.e("MainActivity", "Failed checking existing merchant session: ${e.message}", e)
+                      com.example.auth.MerchantSignInResult.Error(
+                        e.localizedMessage ?: "تعذر التحقق من الجلسة حالياً."
+                      )
+                    }
+                    when (sessionResult) {
+                      is com.example.auth.MerchantSignInResult.Success -> {
+                        orderViewModel.applyAuthenticatedMerchant(sessionResult.merchant)
+                        orderViewModel.listenToFirestore()
                       }
-                    } else {
-                      orderViewModel.applyAuthenticatedMerchant(sessionMerchant)
-                      orderViewModel.listenToFirestore()
+                      is com.example.auth.MerchantSignInResult.EmailNotVerified,
+                      is com.example.auth.MerchantSignInResult.NotRegistered -> {
+                        android.widget.Toast.makeText(
+                          context,
+                          "لا يمكن الدخول إلا بحساب تاجر مسجل ومؤكد البريد الإلكتروني.",
+                          android.widget.Toast.LENGTH_LONG
+                        ).show()
+                        orderViewModel.clearListeners()
+                        navController.navigate(LoginRoute) {
+                          popUpTo(0) { inclusive = true }
+                        }
+                      }
+                      is com.example.auth.MerchantSignInResult.Error -> {
+                        // Surface non-transient verification errors honestly (e.g., PERMISSION_DENIED)
+                        // without falsely signing out or converting the error into fake success.
+                        android.widget.Toast.makeText(
+                          context,
+                          sessionResult.message,
+                          android.widget.Toast.LENGTH_LONG
+                        ).show()
+                        orderViewModel.listenToFirestore()
+                      }
+                      com.example.auth.MerchantSignInResult.Cancelled -> Unit
                     }
                   }
                 }
-                if (Firebase.auth.currentUser != null && Firebase.auth.currentUser?.isEmailVerified == true) {
+                if (safeCurrentFirebaseUser()?.isEmailVerified == true) {
                   RestaurantDashboardScreen(
                     onRequestCaptain = { navController.navigate(OrderCourierRoute) },
                     onViewAllOrders = { navController.navigate(OrderHistoryRoute) },
@@ -359,14 +396,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<RestaurantDetailsRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  val authUser = Firebase.auth.currentUser
+                  val authUser = safeCurrentFirebaseUser()
                   if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser?.isEmailVerified == true) {
+                if (safeCurrentFirebaseUser()?.isEmailVerified == true) {
                   RestaurantDetailsScreen(
                     onBack = { navController.popBackStack() },
                     orderViewModel = orderViewModel
@@ -384,14 +421,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<OrderCourierRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  val authUser = Firebase.auth.currentUser
+                  val authUser = safeCurrentFirebaseUser()
                   if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser?.isEmailVerified == true) {
+                if (safeCurrentFirebaseUser()?.isEmailVerified == true) {
                   OrderCourierScreen(
                     onBack = { navController.popBackStack() },
                     onOrderSubmitted = { navController.navigate(OrderHistoryRoute) },
@@ -402,14 +439,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<OrderHistoryRoute> {
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  val authUser = Firebase.auth.currentUser
+                  val authUser = safeCurrentFirebaseUser()
                   if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser?.isEmailVerified == true) {
+                if (safeCurrentFirebaseUser()?.isEmailVerified == true) {
                   OrderHistoryScreen(
                     onBack = { navController.popBackStack() },
                     onRequestNewOrder = { navController.navigate(OrderCourierRoute) },
@@ -420,14 +457,14 @@ class MainActivity : ComponentActivity() {
               }
               composable<EditOrderRoute> { backStackEntry ->
                 androidx.compose.runtime.LaunchedEffect(Unit) {
-                  val authUser = Firebase.auth.currentUser
+                  val authUser = safeCurrentFirebaseUser()
                   if (authUser == null || !authUser.isEmailVerified) {
                     navController.navigate(LoginRoute) {
                       popUpTo(0) { inclusive = true }
                     }
                   }
                 }
-                if (Firebase.auth.currentUser?.isEmailVerified == true) {
+                if (safeCurrentFirebaseUser()?.isEmailVerified == true) {
                   val route: EditOrderRoute = backStackEntry.toRoute()
                   EditOrderScreen(
                     orderId = route.orderId,

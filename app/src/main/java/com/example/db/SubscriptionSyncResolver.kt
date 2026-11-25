@@ -552,8 +552,8 @@ object SubscriptionSyncResolver {
             ?: extractNestedPlanMap(snapshot.get("package"))
             ?: extractNestedPlanMap(snapshot.get("planDetails"))
             ?: extractNestedPlanMap(snapshot.get("packageDetails"))
-        val isActiveField = snapshot.getBoolean("isActive")
-        val isSubscribedField = snapshot.getBoolean("isSubscribed")
+        val isActiveField = snapshot.safeBoolean("isActive")
+        val isSubscribedField = snapshot.safeBoolean("isSubscribed")
         val limitKeys = listOf(
             "captainLimit", "maxCaptains", "captainsLimit", "captainsCount", "captainCount",
             "captains_count", "captain_limit", "max_captains", "allowedCaptains", "allowed_captains",

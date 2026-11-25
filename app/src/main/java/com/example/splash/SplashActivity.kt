@@ -70,11 +70,15 @@ class SplashActivity : ComponentActivity() {
 
     @OptIn(UnstableApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
-        )
         super.onCreate(savedInstanceState)
+        runCatching {
+            enableEdgeToEdge(
+                statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+                navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
+            )
+        }.onFailure { e ->
+            Log.w(TAG, "Non-fatal enableEdgeToEdge warning on SplashActivity: ${e.message}")
+        }
 
         val savedHasNavigated = savedInstanceState?.getBoolean(KEY_HAS_NAVIGATED, false) == true
         if (SplashSessionState.shouldSkipIntroVideo(SplashSessionState.hasCompletedIntroInSession, savedHasNavigated)) {
@@ -93,37 +97,52 @@ class SplashActivity : ComponentActivity() {
             }
         })
 
-        // Root container uses the exact crimson radial gradient matching frame 00:00 of intro.mp4
-        // so there is never a white or black flash before the video renders or around letterboxing.
-        val rootContainer = FrameLayout(this).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-            setBackgroundResource(R.drawable.splash_video_background)
+        // Guard root container + Media3 PlayerView construction: PlayerView(context) inflates
+        // PlayerControlView, RecyclerView, and fonts inside its 1-arg constructor before
+        // `useController = false` runs. Any OEM inflation/surface error must safely skip to MainActivity.
+        val setupSucceeded = try {
+            val rootContainer = FrameLayout(this).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                try {
+                    setBackgroundResource(R.drawable.splash_video_background)
+                } catch (bgEx: Exception) {
+                    Log.w(TAG, "Failed to apply splash gradient drawable; falling back to solid color: ${bgEx.message}")
+                    setBackgroundColor(Color.parseColor("#B80B06"))
+                }
+            }
+
+            val view = PlayerView(this).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    Gravity.CENTER
+                )
+                useController = false
+                // Preserves original aspect ratio across phones, tablets, foldables, and landscape
+                // without cropping the El-Batal Express logo while blending seamlessly into the crimson canvas.
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                setShutterBackgroundColor(Color.TRANSPARENT)
+                setKeepContentOnPlayerReset(true)
+                keepScreenOn = true
+                isClickable = false
+                isFocusable = false
+                contentDescription = getString(R.string.splash_video_content_description)
+            }
+
+            rootContainer.addView(view)
+            setContentView(rootContainer)
+            playerView = view
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to inflate SplashActivity PlayerView; skipping intro directly to MainActivity.", e)
+            completeIntroAndNavigate(withFade = false)
+            false
         }
 
-        val view = PlayerView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                Gravity.CENTER
-            )
-            useController = false
-            // Preserves original aspect ratio across phones, tablets, foldables, and landscape
-            // without cropping the El-Batal Express logo while blending seamlessly into the crimson canvas.
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-            setShutterBackgroundColor(Color.TRANSPARENT)
-            setKeepContentOnPlayerReset(true)
-            keepScreenOn = true
-            isClickable = false
-            isFocusable = false
-            contentDescription = getString(R.string.splash_video_content_description)
-        }
-
-        rootContainer.addView(view)
-        setContentView(rootContainer)
-        playerView = view
+        if (!setupSucceeded) return
 
         initializeAndStartPlayer()
         startSafetyWatchdog()
@@ -155,8 +174,8 @@ class SplashActivity : ComponentActivity() {
 
             exoPlayer = player
             playerView?.player = player
-        } catch (t: Throwable) {
-            Log.e(TAG, "Failed to initialize Media3 ExoPlayer for intro video; proceeding to auth check.", t)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize Media3 ExoPlayer for intro video; proceeding to auth check.", e)
             completeIntroAndNavigate(withFade = false)
         }
     }
@@ -247,26 +266,35 @@ class SplashActivity : ComponentActivity() {
         watchdogJob = null
         SplashSessionState.markCompleted()
 
+        var authLookupSucceeded = true
         val currentUser = try {
             Firebase.auth.currentUser
         } catch (e: Exception) {
-            Log.w(TAG, "FirebaseAuth lookup failed after splash; routing to Login: ${e.message}")
+            authLookupSucceeded = false
+            Log.w(TAG, "Transient FirebaseAuth lookup failure after splash; deferring route check to MainActivity: ${e.message}")
             null
         }
 
-        val destination = SplashSessionState.resolvePostSplashDestination(
-            hasCurrentUser = currentUser != null,
-            isEmailVerified = currentUser?.isEmailVerified == true
-        )
+        val destination = if (authLookupSucceeded) {
+            SplashSessionState.resolvePostSplashDestination(
+                hasCurrentUser = currentUser != null,
+                isEmailVerified = currentUser?.isEmailVerified == true
+            )
+        } else {
+            null
+        }
 
         val intent = Intent(this, MainActivity::class.java).apply {
-            putExtra(MainActivity.EXTRA_START_DESTINATION, destination)
+            if (destination != null) {
+                putExtra(MainActivity.EXTRA_START_DESTINATION, destination)
+            }
             addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         }
 
         startActivity(intent)
         if (withFade) {
-            applySmoothFadeTransition()
+            runCatching { applySmoothFadeTransition() }
+                .onFailure { Log.w(TAG, "Non-fatal activity transition warning: ${it.message}") }
         }
         finish()
     }
