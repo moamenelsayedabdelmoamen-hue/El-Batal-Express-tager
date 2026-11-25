@@ -1737,22 +1737,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
                     requestedCaptains = 1
                 )
 
-                val serverValidation = subscriptionRepository.validateSubscriptionOnServer(requestedCaptains = 1)
-                if (serverValidation != null) {
-                    latestSubscriptionSnapshot = serverValidation.snapshot
-                    lastServerActiveCaptainsCount = serverValidation.activeCaptainsCount
-                    hasVerifiedServerSubscriptionOnce = true
-                    isInitialSubscriptionCheckInProgress = false
-                    latestSubscriptionServerError = null
-                    recomputeSubscriptionState()
-                    if (!serverValidation.allowed) {
-                        val deniedMsg = serverValidation.message
-                            ?: "تم رفض طلب الكابتن من السيرفر: يرجى التأكد من أن اشتراكك فعال ومتاح."
-                        _snackbarMessage.value = deniedMsg
-                        onError?.invoke(deniedMsg)
-                        return@launch
-                    }
-                }
+                // Do not make a separate subscription-validation network call here.
+                // merchantCreateOrder validates subscription and capacity atomically in its
+                // Firestore transaction; the extra callable added a full round trip and
+                // repeated order queries before the actual create request.
 
                 val serverResult = subscriptionRepository.createMerchantOrder(requestPayload)
                 if (serverResult.isFailure) {
