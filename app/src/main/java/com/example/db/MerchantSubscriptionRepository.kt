@@ -1026,7 +1026,11 @@ class MerchantSubscriptionRepository(
         val candidates = buildList {
             if (canonicalFirestoreSub.exists) add(canonicalFirestoreSub)
             addAll(serverSubQueryDocs)
-            if (callableSnapshot != null && callableSnapshot.exists) add(callableSnapshot)
+            // When the callable supplied canonicalFirestoreSub, do not add the same
+            // snapshot twice. Keep it as an extra candidate only during Firestore fallback.
+            if (serverSubSnap != null && callableSnapshot != null && callableSnapshot.exists) {
+                add(callableSnapshot)
+            }
         }
         val finalSubSnapshot = if (candidates.isNotEmpty()) {
             SubscriptionSyncResolver.selectEffectiveSubscriptionSnapshot(
