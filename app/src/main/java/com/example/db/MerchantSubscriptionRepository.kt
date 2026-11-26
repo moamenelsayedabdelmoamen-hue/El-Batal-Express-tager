@@ -979,11 +979,17 @@ class MerchantSubscriptionRepository(
         var serverSubQueryDocs: List<RawSubscriptionSnapshot> = emptyList()
         var serverMerchSnap: DocumentSnapshot? = null
         try {
-            serverSubSnap = try {
-                Firebase.firestore.collection("subscriptions").document(uid).get(Source.SERVER).await()
-            } catch (e: Exception) {
-                Log.w(TAG, "Source.SERVER read subscriptions/$uid failed: ${e.message}")
-                if (lastError == null) lastError = e.localizedMessage ?: e.message
+            // The callable already reads subscriptions/{uid} from the server. Reuse
+            // that authoritative snapshot instead of paying for the same document twice.
+            serverSubSnap = if (callableSnapshot == null) {
+                try {
+                    Firebase.firestore.collection("subscriptions").document(uid).get(Source.SERVER).await()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Source.SERVER read subscriptions/$uid failed: ${e.message}")
+                    if (lastError == null) lastError = e.localizedMessage ?: e.message
+                    null
+                }
+            } else {
                 null
             }
             serverSubQueryDocs = try {
@@ -1013,9 +1019,9 @@ class MerchantSubscriptionRepository(
             if (lastError == null) lastError = e.localizedMessage ?: e.message
         }
 
-        val canonicalFirestoreSub = serverSubSnap?.let {
-            SubscriptionSyncResolver.fromFirestoreSnapshot(it)
-        } ?: RawSubscriptionSnapshot(exists = false)
+        val canonicalFirestoreSub = callableSnapshot
+            ?: serverSubSnap?.let { SubscriptionSyncResolver.fromFirestoreSnapshot(it) }
+            ?: RawSubscriptionSnapshot(exists = false)
 
         val candidates = buildList {
             if (canonicalFirestoreSub.exists) add(canonicalFirestoreSub)
@@ -1034,7 +1040,11 @@ class MerchantSubscriptionRepository(
         return ServerSubscriptionFetchResult(
             subscriptionSnapshot = finalSubSnapshot,
             subscriptionHistoryDocs = buildList {
-                if (canonicalFirestoreSub.exists) add(canonicalFirestoreSub)
+                // Keep actual Firestore history documents here; callableSnapshot is
+                // used for the authoritative current state above, not as a history row.
+                if (serverSubSnap?.exists() == true) {
+                    add(SubscriptionSyncResolver.fromFirestoreSnapshot(serverSubSnap!!))
+                }
                 addAll(serverSubQueryDocs)
             },
             merchantDocument = serverMerchSnap,
