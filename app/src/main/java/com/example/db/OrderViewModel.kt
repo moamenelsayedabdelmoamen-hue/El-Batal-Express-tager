@@ -124,6 +124,33 @@ fun DocumentSnapshot.safeString(field: String): String? {
     }
 }
 
+
+/**
+ * Safely reads a Firestore boolean without throwing when legacy documents
+ * contain nulls or values with an unexpected type.
+ */
+fun DocumentSnapshot.safeBoolean(field: String): Boolean? {
+    return try {
+        if (!contains(field)) return null
+        when (val value = get(field)) {
+            is Boolean -> value
+            is String -> when (value.trim().lowercase()) {
+                "true", "1", "yes" -> true
+                "false", "0", "no" -> false
+                else -> null
+            }
+            is Number -> when (value.toInt()) {
+                1 -> true
+                0 -> false
+                else -> null
+            }
+            else -> null
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
 fun DocumentSnapshot.getAnyString(vararg fields: String): String? {
     for (f in fields) {
         val s = safeString(f)
