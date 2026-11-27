@@ -282,6 +282,14 @@ object FirebaseStorageManager {
             resolvedStorageUrlCache.remove(cacheKey)
         }
 
+        // Canonical path written by the captain app (and readable by the merchant while that
+        // captain is on one of its orders, per storage.rules). Try it before any folder listing.
+        val canonicalProfilePath = "captains/$cleanId/profile/profile.jpg"
+        resolveFirebaseStorageDownloadUrl(canonicalProfilePath).takeIf { it.isNotBlank() }?.let { url ->
+            resolvedStorageUrlCache[cacheKey] = url
+            return@withContext url
+        }
+
         val storage = Firebase.storage
         val folderPrefixes = listOf(
             "captains/$cleanId",

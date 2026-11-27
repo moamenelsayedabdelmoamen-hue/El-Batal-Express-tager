@@ -1163,7 +1163,7 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun extractCaptainPhotoFromDoc(doc: DocumentSnapshot, vararg lookupIds: String): String {
         val storagePathFields = listOf(
-            "storagePath", "profileStoragePath", "photoPath", "imagePath", "avatarPath", "logoStoragePath"
+            "profileImagePath", "storagePath", "profileStoragePath", "photoPath", "imagePath", "avatarPath", "logoStoragePath"
         )
         val urlFields = listOf(
             "profileImageUrl", "photoUrl", "driverPhotoUrl", "captainPhotoUrl",
