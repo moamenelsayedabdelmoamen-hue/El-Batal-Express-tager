@@ -5588,6 +5588,13 @@ fun OrderManagementSection(
     var activeFilter by remember(showAllFilter) {
         mutableStateOf(if (showAllFilter) OrderStatusFilter.ALL else OrderStatusFilter.IN_PROGRESS)
     }
+    val latestCreatedOrderCode by orderViewModel.latestCreatedOrderCode.collectAsStateWithLifecycle()
+    LaunchedEffect(latestCreatedOrderCode) {
+        if (!latestCreatedOrderCode.isNullOrBlank()) {
+            activeTab = OrderTab.TODAY
+            activeFilter = OrderStatusFilter.IN_PROGRESS
+        }
+    }
 
     var selectedDateString by remember { mutableStateOf("") }
     var showDatePickerDialog by remember { mutableStateOf(false) }
